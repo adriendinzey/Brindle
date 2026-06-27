@@ -22,3 +22,6 @@ CLAUDE.md
 
 # Project-management / orchestration (dev-only, never shipped to production)
 /tasks/
+
+# Architecture/design notes (dev-only for now; remove this line to publish)
+/design/
