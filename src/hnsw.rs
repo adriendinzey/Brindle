@@ -366,6 +366,65 @@ impl Hnsw {
 
         Ok(id)
     }
+
+    /// Approximate k-nearest-neighbor search. Returns up to `k` `(distance, id)`
+    /// pairs, nearest first. `ef_search` is the layer-0 candidate budget (raised to
+    /// at least `k`); larger means higher recall and more work. Distances are in
+    /// the metric's internal form (squared, for `Metric::L2`).
+    pub fn search(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef_search: usize,
+    ) -> Result<Vec<(f32, usize)>, HnswError> {
+        let entry = match self.entry_point {
+            Some(e) => e,
+            None => return Ok(Vec::new()),
+        };
+        if k == 0 {
+            return Ok(Vec::new());
+        }
+        if query.len() != self.dim {
+            return Err(HnswError::DimensionMismatch {
+                expected: self.dim,
+                got: query.len(),
+            });
+        }
+
+        let mut ep_ids = vec![entry];
+        for lc in (1..=self.max_layer).rev() {
+            let w = self.search_layer(query, &ep_ids, 1, lc)?;
+            if let Some(nearest) = w.first() {
+                ep_ids = vec![nearest.id];
+            }
+        }
+
+        let ef = ef_search.max(k);
+        let mut w = self.search_layer(query, &ep_ids, ef, 0)?;
+        w.truncate(k);
+        Ok(w.into_iter().map(|c| (c.dist, c.id)).collect())
+    }
+
+    /// Exact brute-force k-NN over all stored vectors. Used as the recall ceiling
+    /// in tests/benchmarks (and as a correctness oracle).
+    pub fn brute_force(&self, query: &[f32], k: usize) -> Result<Vec<(f32, usize)>, HnswError> {
+        if !self.is_empty() && query.len() != self.dim {
+            return Err(HnswError::DimensionMismatch {
+                expected: self.dim,
+                got: query.len(),
+            });
+        }
+        let mut all: Vec<Cand> = Vec::with_capacity(self.vectors.len());
+        for (id, v) in self.vectors.iter().enumerate() {
+            all.push(Cand {
+                dist: self.metric.distance(query, v)?,
+                id,
+            });
+        }
+        all.sort_unstable();
+        all.truncate(k);
+        Ok(all.into_iter().map(|c| (c.dist, c.id)).collect())
+    }
 }
 
 #[cfg(test)]
@@ -443,5 +502,73 @@ mod tests {
     fn empty_vector_errors() {
         let mut h = Hnsw::new(HnswParams::default());
         assert_eq!(h.insert(vec![]).unwrap_err(), HnswError::EmptyVector);
+    }
+
+    #[test]
+    fn search_on_empty_index_is_empty() {
+        let h = Hnsw::new(HnswParams::default());
+        assert!(h.search(&[1.0, 2.0], 5, 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn search_returns_self_at_rank_zero() {
+        let (h, data) = build(200, 16, 3);
+        for &probe in &[0usize, 50, 199] {
+            let res = h.search(&data[probe], 5, 50).unwrap();
+            assert_eq!(res[0].1, probe, "expected node {probe} at rank 0, got {res:?}");
+            assert!(res[0].0 < 1e-6, "self distance not ~0: {}", res[0].0);
+        }
+    }
+
+    #[test]
+    fn recall_at_10_beats_threshold() {
+        let (dim, n, k, queries) = (24usize, 800usize, 10usize, 40usize);
+        let mut rng = 0x1234_5678u64;
+        let mut h = Hnsw::new(HnswParams {
+            m: 16,
+            ef_construction: 100,
+            metric: Metric::L2,
+            seed: 99,
+        });
+        for _ in 0..n {
+            let v: Vec<f32> = (0..dim).map(|_| next_f64(&mut rng) as f32).collect();
+            h.insert(v).unwrap();
+        }
+
+        let mut hits = 0usize;
+        for _ in 0..queries {
+            let q: Vec<f32> = (0..dim).map(|_| next_f64(&mut rng) as f32).collect();
+            let approx = h.search(&q, k, 64).unwrap();
+            let exact: HashSet<usize> = h.brute_force(&q, k).unwrap().iter().map(|x| x.1).collect();
+            hits += approx.iter().filter(|(_, id)| exact.contains(id)).count();
+        }
+        let recall = hits as f64 / (queries * k) as f64;
+        assert!(recall >= 0.9, "recall@10 too low: {recall:.3}");
+    }
+
+    #[test]
+    fn higher_ef_does_not_reduce_recall() {
+        let (dim, n) = (20usize, 500usize);
+        let mut rng = 0x0000_CAFEu64;
+        let mut h = Hnsw::new(HnswParams {
+            m: 12,
+            ef_construction: 80,
+            metric: Metric::L2,
+            seed: 7,
+        });
+        for _ in 0..n {
+            let v: Vec<f32> = (0..dim).map(|_| next_f64(&mut rng) as f32).collect();
+            h.insert(v).unwrap();
+        }
+        let q: Vec<f32> = (0..dim).map(|_| next_f64(&mut rng) as f32).collect();
+        let exact: HashSet<usize> = h.brute_force(&q, 10).unwrap().iter().map(|x| x.1).collect();
+        let recall = |ef: usize| {
+            h.search(&q, 10, ef)
+                .unwrap()
+                .iter()
+                .filter(|(_, id)| exact.contains(id))
+                .count()
+        };
+        assert!(recall(100) >= recall(10), "more ef_search should not reduce recall");
     }
 }
