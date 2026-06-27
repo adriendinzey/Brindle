@@ -10,6 +10,11 @@ readme = "README.md"
 [lib]
 crate-type = ["cdylib", "lib"]
 
+# Required by pgrx for SQL generation (`cargo pgrx schema`/`install`/`test`).
+[[bin]]
+name = "pgrx_embed_brindle"
+path = "./src/bin/pgrx_embed.rs"
+
 [features]
 default = ["pg17"]
 pg14 = ["pgrx/pg14", "pgrx-tests/pg14"]
