@@ -12,6 +12,7 @@ use pgrx::prelude::*;
 
 mod distance;
 pub mod vector;
+pub mod hnsw;
 
 ::pgrx::pg_module_magic!();
 
