@@ -32,7 +32,10 @@ impl std::fmt::Display for HnswError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             HnswError::DimensionMismatch { expected, got } => {
-                write!(f, "vector dimension mismatch: expected {expected}, got {got}")
+                write!(
+                    f,
+                    "vector dimension mismatch: expected {expected}, got {got}"
+                )
             }
             HnswError::EmptyVector => write!(f, "vector must not be empty"),
             HnswError::UnknownNode { id } => write!(f, "unknown node id: {id}"),
@@ -45,9 +48,10 @@ impl std::error::Error for HnswError {}
 impl From<DistanceError> for HnswError {
     fn from(e: DistanceError) -> Self {
         match e {
-            DistanceError::DimensionMismatch { left, right } => {
-                HnswError::DimensionMismatch { expected: left, got: right }
-            }
+            DistanceError::DimensionMismatch { left, right } => HnswError::DimensionMismatch {
+                expected: left,
+                got: right,
+            },
         }
     }
 }
@@ -87,7 +91,9 @@ struct Cand {
 impl Eq for Cand {}
 impl Ord for Cand {
     fn cmp(&self, other: &Self) -> Ordering {
-        self.dist.total_cmp(&other.dist).then(self.id.cmp(&other.id))
+        self.dist
+            .total_cmp(&other.dist)
+            .then(self.id.cmp(&other.id))
     }
 }
 impl PartialOrd for Cand {
@@ -273,7 +279,9 @@ impl Hnsw {
             }
             let mut keep = true;
             for &r in &selected {
-                let d = self.metric.distance(&self.vectors[cand.id], &self.vectors[r])?;
+                let d = self
+                    .metric
+                    .distance(&self.vectors[cand.id], &self.vectors[r])?;
                 if d < cand.dist {
                     keep = false;
                     break;
@@ -558,7 +566,10 @@ mod tests {
         h.insert(vec![1.0, 2.0, 3.0]).unwrap();
         assert_eq!(
             h.insert(vec![1.0, 2.0]).unwrap_err(),
-            HnswError::DimensionMismatch { expected: 3, got: 2 }
+            HnswError::DimensionMismatch {
+                expected: 3,
+                got: 2
+            }
         );
     }
 
@@ -579,7 +590,10 @@ mod tests {
         let (h, data) = build(200, 16, 3);
         for &probe in &[0usize, 50, 199] {
             let res = h.search(&data[probe], 5, 50).unwrap();
-            assert_eq!(res[0].1, probe, "expected node {probe} at rank 0, got {res:?}");
+            assert_eq!(
+                res[0].1, probe,
+                "expected node {probe} at rank 0, got {res:?}"
+            );
             assert!(res[0].0 < 1e-6, "self distance not ~0: {}", res[0].0);
         }
     }
@@ -625,7 +639,10 @@ mod tests {
     #[test]
     fn delete_unknown_id_errors() {
         let (mut h, _) = build(10, 4, 1);
-        assert_eq!(h.delete(999).unwrap_err(), HnswError::UnknownNode { id: 999 });
+        assert_eq!(
+            h.delete(999).unwrap_err(),
+            HnswError::UnknownNode { id: 999 }
+        );
     }
 
     #[test]
@@ -675,7 +692,10 @@ mod tests {
             hits += approx.iter().filter(|(_, id)| exact.contains(id)).count();
         }
         let recall = hits as f64 / (queries * k) as f64;
-        assert!(recall >= 0.85, "recall under ~20% tombstones too low: {recall:.3}");
+        assert!(
+            recall >= 0.85,
+            "recall under ~20% tombstones too low: {recall:.3}"
+        );
     }
 
     #[test]
@@ -707,7 +727,11 @@ mod tests {
 
         // data[1] survived (1 % 3 != 0); still findable at rank 0 after remap
         let res = h.search(&data[1], 3, 64).unwrap();
-        assert!(res[0].0 < 1e-6, "survivor self-distance not ~0: {}", res[0].0);
+        assert!(
+            res[0].0 < 1e-6,
+            "survivor self-distance not ~0: {}",
+            res[0].0
+        );
     }
 
     #[test]
@@ -733,6 +757,9 @@ mod tests {
                 .filter(|(_, id)| exact.contains(id))
                 .count()
         };
-        assert!(recall(100) >= recall(10), "more ef_search should not reduce recall");
+        assert!(
+            recall(100) >= recall(10),
+            "more ef_search should not reduce recall"
+        );
     }
 }

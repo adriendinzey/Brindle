@@ -11,8 +11,8 @@
 use pgrx::prelude::*;
 
 mod distance;
-pub mod vector;
 pub mod hnsw;
+pub mod vector;
 
 ::pgrx::pg_module_magic!();
 

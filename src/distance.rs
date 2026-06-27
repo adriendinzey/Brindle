@@ -21,10 +21,9 @@ pub enum DistanceError {
 impl fmt::Display for DistanceError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            DistanceError::DimensionMismatch { left, right } => write!(
-                f,
-                "vector dimension mismatch: {left} != {right}"
-            ),
+            DistanceError::DimensionMismatch { left, right } => {
+                write!(f, "vector dimension mismatch: {left} != {right}")
+            }
         }
     }
 }
@@ -152,7 +151,8 @@ mod tests {
     fn inner_product_basic() {
         assert!((inner_product(&[1.0, 2.0, 3.0], &[4.0, 5.0, 6.0]).unwrap() - 32.0).abs() < EPS);
         assert!(
-            (negative_inner_product(&[1.0, 2.0, 3.0], &[4.0, 5.0, 6.0]).unwrap() + 32.0).abs() < EPS
+            (negative_inner_product(&[1.0, 2.0, 3.0], &[4.0, 5.0, 6.0]).unwrap() + 32.0).abs()
+                < EPS
         );
     }
 

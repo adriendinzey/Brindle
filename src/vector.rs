@@ -54,7 +54,9 @@ mod tests {
     #[test]
     fn l2_uses_squared_distance() {
         // squared L2 of [1,2,3] vs [4,5,6] = 9+9+9 = 27 (no sqrt)
-        let d = Metric::L2.distance(&[1.0, 2.0, 3.0], &[4.0, 5.0, 6.0]).unwrap();
+        let d = Metric::L2
+            .distance(&[1.0, 2.0, 3.0], &[4.0, 5.0, 6.0])
+            .unwrap();
         assert!((d - 27.0).abs() < EPS, "got {d}");
     }
 
@@ -67,8 +69,12 @@ mod tests {
     #[test]
     fn inner_product_smaller_is_nearer() {
         // identical vectors (largest dot) must be "nearer" than orthogonal ones
-        let near = Metric::InnerProduct.distance(&[1.0, 1.0], &[1.0, 1.0]).unwrap(); // -2
-        let far = Metric::InnerProduct.distance(&[1.0, 1.0], &[0.0, 0.0]).unwrap(); //  0
+        let near = Metric::InnerProduct
+            .distance(&[1.0, 1.0], &[1.0, 1.0])
+            .unwrap(); // -2
+        let far = Metric::InnerProduct
+            .distance(&[1.0, 1.0], &[0.0, 0.0])
+            .unwrap(); //  0
         assert!(near < far, "near={near} should be < far={far}");
     }
 
