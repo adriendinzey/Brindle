@@ -70,6 +70,13 @@ SELECT brindle_l2_distance(ARRAY[1,2,3]::real[], ARRAY[4,5,6]::real[]);  -- 5.19
 Full setup notes (including the WSL2 + OneDrive gotcha) live in
 [docs/ROADMAP.md](docs/ROADMAP.md#getting-set-up).
 
+## Development
+
+Setup and build: [docs/ROADMAP.md](docs/ROADMAP.md#getting-set-up). Design and
+rationale: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) and
+[docs/FILTERING.md](docs/FILTERING.md). Code conventions:
+[docs/CODING_STANDARDS.md](docs/CODING_STANDARDS.md).
+
 ## License
 
 PostgreSQL License (matches the pgvector ecosystem). See `LICENSE`.
