@@ -24,6 +24,8 @@ pub enum HnswError {
     DimensionMismatch { expected: usize, got: usize },
     /// An empty vector was supplied.
     EmptyVector,
+    /// An operation referenced a node id that doesn't exist.
+    UnknownNode { id: usize },
 }
 
 impl std::fmt::Display for HnswError {
@@ -33,6 +35,7 @@ impl std::fmt::Display for HnswError {
                 write!(f, "vector dimension mismatch: expected {expected}, got {got}")
             }
             HnswError::EmptyVector => write!(f, "vector must not be empty"),
+            HnswError::UnknownNode { id } => write!(f, "unknown node id: {id}"),
         }
     }
 }
@@ -117,8 +120,11 @@ pub struct Hnsw {
     ef_construction: usize,
     ml: f64,
     dim: usize,
+    seed: u64,
     vectors: Vec<Vec<f32>>,
     links: Vec<Vec<Vec<usize>>>,
+    /// Tombstone flags parallel to `vectors`; deleted nodes route but never return.
+    deleted: Vec<bool>,
     entry_point: Option<usize>,
     max_layer: usize,
     rng: u64,
@@ -141,8 +147,10 @@ impl Hnsw {
             ef_construction: params.ef_construction.max(m),
             ml: 1.0 / (m as f64).ln(),
             dim: 0,
+            seed,
             vectors: Vec::new(),
             links: Vec::new(),
+            deleted: Vec::new(),
             entry_point: None,
             max_layer: 0,
             rng: seed,
@@ -207,10 +215,12 @@ impl Hnsw {
             if visited.insert(ep) {
                 let d = self.metric.distance(query, &self.vectors[ep])?;
                 let c = Cand { dist: d, id: ep };
-                frontier.push(Reverse(c));
-                results.push(c);
-                if results.len() > ef {
-                    results.pop();
+                frontier.push(Reverse(c)); // route through any node, incl. tombstoned
+                if !self.deleted[ep] {
+                    results.push(c);
+                    if results.len() > ef {
+                        results.pop();
+                    }
                 }
             }
         }
@@ -228,10 +238,12 @@ impl Hnsw {
                     let farthest = results.peek().map(|x| x.dist).unwrap_or(f32::INFINITY);
                     if results.len() < ef || d < farthest {
                         let nc = Cand { dist: d, id: n };
-                        frontier.push(Reverse(nc));
-                        results.push(nc);
-                        if results.len() > ef {
-                            results.pop();
+                        frontier.push(Reverse(nc)); // route through tombstoned nodes
+                        if !self.deleted[n] {
+                            results.push(nc);
+                            if results.len() > ef {
+                                results.pop();
+                            }
                         }
                     }
                 }
@@ -305,6 +317,7 @@ impl Hnsw {
         let level = self.random_level();
 
         self.vectors.push(vector);
+        self.deleted.push(false);
         let mut node_links: Vec<Vec<usize>> = Vec::with_capacity(level + 1);
         node_links.resize_with(level + 1, Vec::new);
         self.links.push(node_links);
@@ -416,6 +429,9 @@ impl Hnsw {
         }
         let mut all: Vec<Cand> = Vec::with_capacity(self.vectors.len());
         for (id, v) in self.vectors.iter().enumerate() {
+            if self.deleted[id] {
+                continue;
+            }
             all.push(Cand {
                 dist: self.metric.distance(query, v)?,
                 id,
@@ -424,6 +440,54 @@ impl Hnsw {
         all.sort_unstable();
         all.truncate(k);
         Ok(all.into_iter().map(|c| (c.dist, c.id)).collect())
+    }
+
+    /// Number of tombstoned (soft-deleted) nodes.
+    pub fn deleted_count(&self) -> usize {
+        self.deleted.iter().filter(|&&d| d).count()
+    }
+
+    /// Number of live (non-deleted) nodes.
+    pub fn live_len(&self) -> usize {
+        self.len() - self.deleted_count()
+    }
+
+    /// Soft-delete a node: it stays in the graph as a routing-only stepping stone
+    /// but is never returned by [`Hnsw::search`] / [`Hnsw::brute_force`].
+    /// Idempotent. Errors (never panics) on an unknown id. Reclaim space later
+    /// with [`Hnsw::compact`].
+    pub fn delete(&mut self, id: usize) -> Result<(), HnswError> {
+        if id >= self.deleted.len() {
+            return Err(HnswError::UnknownNode { id });
+        }
+        self.deleted[id] = true;
+        Ok(())
+    }
+
+    /// Rebuild the graph from the live nodes only, dropping all tombstones, and
+    /// return the new node count. Node ids are **not** stable across compaction
+    /// (they're reassigned densely); a caller holding an external id↔node mapping
+    /// must rebuild it afterwards.
+    pub fn compact(&mut self) -> Result<usize, HnswError> {
+        let live: Vec<Vec<f32>> = self
+            .vectors
+            .iter()
+            .zip(self.deleted.iter())
+            .filter(|(_, &deleted)| !deleted)
+            .map(|(v, _)| v.clone())
+            .collect();
+        let mut fresh = Hnsw::new(HnswParams {
+            m: self.m,
+            ef_construction: self.ef_construction,
+            metric: self.metric,
+            seed: self.seed,
+        });
+        for v in live {
+            fresh.insert(v)?;
+        }
+        let n = fresh.len();
+        *self = fresh;
+        Ok(n)
     }
 }
 
@@ -544,6 +608,106 @@ mod tests {
         }
         let recall = hits as f64 / (queries * k) as f64;
         assert!(recall >= 0.9, "recall@10 too low: {recall:.3}");
+    }
+
+    #[test]
+    fn delete_excludes_from_results() {
+        let (mut h, data) = build(200, 16, 5);
+        let target = 42usize;
+        h.delete(target).unwrap();
+        let res = h.search(&data[target], 5, 50).unwrap();
+        assert!(
+            res.iter().all(|(_, id)| *id != target),
+            "deleted node was returned: {res:?}"
+        );
+    }
+
+    #[test]
+    fn delete_unknown_id_errors() {
+        let (mut h, _) = build(10, 4, 1);
+        assert_eq!(h.delete(999).unwrap_err(), HnswError::UnknownNode { id: 999 });
+    }
+
+    #[test]
+    fn delete_all_but_one() {
+        let (mut h, data) = build(60, 8, 2);
+        for id in 0..h.len() {
+            if id != 7 {
+                h.delete(id).unwrap();
+            }
+        }
+        let res = h.search(&data[7], 3, 64).unwrap();
+        assert_eq!(res.len(), 1);
+        assert_eq!(res[0].1, 7);
+    }
+
+    #[test]
+    fn recall_holds_under_tombstones() {
+        let (dim, n, k, queries) = (24usize, 800usize, 10usize, 30usize);
+        let mut rng = 0xBEEF_0001u64;
+        let mut h = Hnsw::new(HnswParams {
+            m: 16,
+            ef_construction: 100,
+            metric: Metric::L2,
+            seed: 11,
+        });
+        for _ in 0..n {
+            let v: Vec<f32> = (0..dim).map(|_| next_f64(&mut rng) as f32).collect();
+            h.insert(v).unwrap();
+        }
+        let mut del_rng = 0x0BAD_F00Du64;
+        for id in 0..h.len() {
+            if next_f64(&mut del_rng) < 0.2 {
+                h.delete(id).unwrap();
+            }
+        }
+        assert!(h.deleted_count() > 0);
+
+        let mut hits = 0usize;
+        for _ in 0..queries {
+            let q: Vec<f32> = (0..dim).map(|_| next_f64(&mut rng) as f32).collect();
+            let approx = h.search(&q, k, 96).unwrap();
+            assert!(
+                approx.iter().all(|(_, id)| !h.deleted[*id]),
+                "search returned a tombstoned node"
+            );
+            let exact: HashSet<usize> = h.brute_force(&q, k).unwrap().iter().map(|x| x.1).collect();
+            hits += approx.iter().filter(|(_, id)| exact.contains(id)).count();
+        }
+        let recall = hits as f64 / (queries * k) as f64;
+        assert!(recall >= 0.85, "recall under ~20% tombstones too low: {recall:.3}");
+    }
+
+    #[test]
+    fn compact_removes_tombstones_preserving_recall() {
+        let (dim, n) = (20usize, 500usize);
+        let mut rng = 0x1111_2222u64;
+        let mut h = Hnsw::new(HnswParams {
+            m: 16,
+            ef_construction: 100,
+            metric: Metric::L2,
+            seed: 3,
+        });
+        let mut data = Vec::new();
+        for _ in 0..n {
+            let v: Vec<f32> = (0..dim).map(|_| next_f64(&mut rng) as f32).collect();
+            h.insert(v.clone()).unwrap();
+            data.push(v);
+        }
+        for id in (0..h.len()).step_by(3) {
+            h.delete(id).unwrap();
+        }
+        let live_before = h.live_len();
+        assert!(h.deleted_count() > 0);
+
+        let new_n = h.compact().unwrap();
+        assert_eq!(new_n, live_before);
+        assert_eq!(h.deleted_count(), 0);
+        assert_eq!(h.len(), live_before);
+
+        // data[1] survived (1 % 3 != 0); still findable at rank 0 after remap
+        let res = h.search(&data[1], 3, 64).unwrap();
+        assert!(res[0].0 < 1e-6, "survivor self-distance not ~0: {}", res[0].0);
     }
 
     #[test]
