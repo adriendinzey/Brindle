@@ -1,7 +1,7 @@
 //! Criterion micro-benchmarks for the distance kernels.
 //!
-//! Establishes a repeatable baseline for the distance hot loop so the Phase 5
-//! SIMD work (T-060+) can be *measured*, not guessed (see `docs/ARCHITECTURE.md`
+//! Establishes a repeatable baseline for the distance hot loop so the later
+//! SIMD work can be *measured*, not guessed (see `docs/ARCHITECTURE.md`
 //! § Testing & validation strategy). We bench L2², cosine, and inner product at
 //! embedding dimensions that match real workloads:
 //!
@@ -15,7 +15,7 @@
 //!
 //! Because Brindle is a single pgrx crate, this bench links the extension crate
 //! and therefore needs a `pg*` feature to compile. Run it inside WSL with the
-//! toolchain from T-003:
+//! pgrx toolchain:
 //!
 //! ```bash
 //! cargo bench --no-default-features --features pg17
