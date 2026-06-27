@@ -1,0 +1,5 @@
+comment = 'Brindle: filter-aware, hybrid vector search for PostgreSQL'
+default_version = '@CARGO_VERSION@'
+module_pathname = '$libdir/brindle'
+relocatable = false
+superuser = false

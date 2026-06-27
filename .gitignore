@@ -1,0 +1,23 @@
+# Rust / Cargo
+/target
+**/*.rs.bk
+Cargo.lock        # library crate: don't pin; remove this line if you ship a binary
+
+# pgrx
+*.so
+*.dylib
+/sql/*--*.sql     # generated extension SQL (cargo pgrx generates these)
+.pgrx/
+
+# Editors / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Keep AI working instructions out of the public repo
+CLAUDE.md
+
+# Project-management / orchestration (dev-only, never shipped to production)
+/tasks/

@@ -1,0 +1,8 @@
+# Normalize line endings to LF in the repo (critical: this project builds on
+# Linux/WSL where CRLF breaks shell scripts and pgrx tooling).
+* text=auto eol=lf
+
+# Binary-ish files we never want munged
+*.png binary
+*.jpg binary
+*.gz binary
