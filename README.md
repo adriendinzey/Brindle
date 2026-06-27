@@ -26,6 +26,13 @@ Reciprocal Rank Fusion.
 > in the open. It is *not* production-ready and makes no performance claims yet.
 > See [docs/ROADMAP.md](docs/ROADMAP.md) for what works today.
 
+> ⚠️ **Build in WSL2 — not inside this OneDrive folder.** Clone to the WSL native
+> filesystem (e.g. `~/code/brindle`) and develop there. Do **not** build from a
+> OneDrive-synced directory: OneDrive syncs `.git` and the large, constantly
+> changing `target/`, which has already rolled back a commit once and can corrupt
+> or revert refs. Full setup notes:
+> [docs/ROADMAP.md](docs/ROADMAP.md#getting-set-up).
+
 ## Why another Postgres vector extension?
 
 The space is mature — [pgvector](https://github.com/pgvector/pgvector),
