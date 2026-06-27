@@ -10,7 +10,7 @@
 
 use pgrx::prelude::*;
 
-mod distance;
+pub mod distance;
 pub mod hnsw;
 pub mod vector;
 

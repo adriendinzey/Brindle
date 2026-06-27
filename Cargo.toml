@@ -7,6 +7,12 @@ license = "PostgreSQL"
 repository = "https://github.com/your-username/brindle"
 readme = "README.md"
 
+[lints.rust]
+# pgrx 0.12.9 emits an internal `cfg(pgrx_embed)` that newer rustc's check-cfg
+# doesn't know about; declare it so `clippy -D warnings` stays clean. Revisit on a
+# pgrx upgrade.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(pgrx_embed)'] }
+
 [lib]
 crate-type = ["cdylib", "lib"]
 
@@ -17,6 +23,10 @@ path = "./src/bin/pgrx_embed.rs"
 
 [features]
 default = ["pg17"]
+# pg12/pg13 are declared because pgrx's pg_module_magic! references them; they're
+# not in the CI matrix (supported majors are pg14-pg17).
+pg12 = ["pgrx/pg12", "pgrx-tests/pg12"]
+pg13 = ["pgrx/pg13", "pgrx-tests/pg13"]
 pg14 = ["pgrx/pg14", "pgrx-tests/pg14"]
 pg15 = ["pgrx/pg15", "pgrx-tests/pg15"]
 pg16 = ["pgrx/pg16", "pgrx-tests/pg16"]
@@ -29,6 +39,16 @@ pgrx = "=0.12.9"
 
 [dev-dependencies]
 pgrx-tests = "=0.12.9"
+# `cargo_bench_support` is required for the harness to run under `cargo bench`;
+# it is part of criterion's default features, which we otherwise drop to avoid
+# pulling in `plotters`/`rayon` for these tiny kernels.
+criterion = { version = "0.5", default-features = false, features = [
+    "cargo_bench_support",
+] }
+
+[[bench]]
+name = "distance"
+harness = false
 
 [profile.dev]
 panic = "unwind"
