@@ -63,6 +63,14 @@ jobs:
       - name: pgrx init (system Postgres)
         run: cargo pgrx init --pg${{ matrix.pg }} /usr/lib/postgresql/${{ matrix.pg }}/bin/pg_config
 
+      # `cargo pgrx test` installs the extension into Postgres's pkglib/share dirs,
+      # which are root-owned for the apt package. Give the runner user write access
+      # so the install step doesn't hit "Permission denied".
+      - name: Make Postgres extension dirs writable
+        run: |
+          PG_CONFIG=/usr/lib/postgresql/${{ matrix.pg }}/bin/pg_config
+          sudo chown -R "$(id -un)" "$($PG_CONFIG --pkglibdir)" "$($PG_CONFIG --sharedir)/extension"
+
       - name: Clippy
         run: cargo clippy --no-default-features --features pg${{ matrix.pg }} -- -D warnings
 
