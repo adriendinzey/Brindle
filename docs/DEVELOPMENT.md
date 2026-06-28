@@ -104,6 +104,10 @@ This is self-service: the person (or agent) doing a task runs `new` themselves a
 their first step and works in the sandbox it prints — there's no separate setup
 hand-off. `rm` tears the whole thing down (stops Postgres, removes worktree + branch).
 
+Any git-ignored local docs in the main clone (e.g. `tasks/`, `design/`, `CLAUDE.md`)
+are symlinked into each worktree, so those references resolve by their normal paths
+and a shared board (like a task tracker) stays one source of truth across worktrees.
+
 ### Branch → PR → merge (conflicts are approved by a human)
 
 Each task is developed on its own branch and merged to `main` via a pull request

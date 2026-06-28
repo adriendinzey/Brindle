@@ -100,6 +100,16 @@ EOF
     [[ $shared_pg -eq 0 ]] && echo "export PGRX_HOME=\"$pgrx_home\""
   } > "$wt_dir/.cargo/worktree-env"
 
+  # The git-ignored local docs (orchestration board + design notes + coding standards)
+  # live only in the main clone, so a fresh worktree wouldn't have them. Symlink them in
+  # so the worker can read its card / CLAUDE.md, and the task board stays one shared
+  # source of truth across all worktrees. (These names are git-ignored, so the symlinks
+  # never get committed.)
+  local main_clone; main_clone="$(main_worktree)"
+  for doc in tasks design CLAUDE.md; do
+    [[ -e "$main_clone/$doc" && ! -e "$wt_dir/$doc" ]] && ln -s "$main_clone/$doc" "$wt_dir/$doc"
+  done
+
   local msg_pg="shared ($SHARED_PGRX_HOME — serialize pgrx tests)"
   if [[ $shared_pg -eq 0 ]]; then
     local p_run p_test
@@ -123,6 +133,7 @@ EOF
   echo "  branch:    $branch  (off $base)"
   echo "  build dir: $target_dir"
   echo "  postgres:  $msg_pg"
+  echo "  local docs: tasks/ design/ CLAUDE.md (symlinked from the main clone)"
   echo
   echo "next:"
   echo "  cd $wt_dir"
@@ -165,6 +176,8 @@ cmd_rm() {
   fi
 
   if [[ -d "$wt_dir" ]]; then
+    # Drop the doc symlinks first so they neither block removal nor get followed.
+    find "$wt_dir" -maxdepth 1 -type l -delete 2>/dev/null || true
     git worktree remove "$wt_dir" \
       || die "worktree has uncommitted changes; commit/push or: git worktree remove --force '$wt_dir'"
     echo "removed worktree: $wt_dir"

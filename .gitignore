@@ -24,11 +24,13 @@ Thumbs.db
 # Keep AI working instructions out of the public repo
 CLAUDE.md
 
-# Project-management / orchestration (dev-only, never shipped to production)
-/tasks/
+# Project-management / orchestration (dev-only, never shipped to production).
+# No trailing slash, so these also match the symlinks worktrees create back to the
+# main clone (see scripts/worktree.sh) — a trailing slash would match only a real dir.
+/tasks
 
 # Architecture/design notes (dev-only for now; remove this line to publish)
-/design/
+/design
 
 # Career / résumé / interview prep (personal — never publish)
-/career/
+/career
