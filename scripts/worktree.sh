@@ -2,119 +2,173 @@
 #
 # Per-task isolated sandboxes for parallel development.
 #
-# Each task gets its own git worktree (separate directory + branch) plus an
-# isolated Cargo build directory, so several branches can be built and tested at
-# the same time without clobbering one another's files or build output.
+# `new` gives a task its own git worktree (separate directory + branch), its own
+# Cargo build directory, and — by default — its own Postgres instance on a free
+# port. Several tasks can therefore build AND run `pgrx` tests at the same time
+# without colliding. The isolated Postgres shares the already-compiled install
+# (no recompile); only a ~40 MB data dir is created per task, lazily on first use.
+#
+# Run pgrx commands inside a worktree via `scripts/pgx.sh` (it loads the isolated
+# env). Plain `cargo build/test/bench/clippy` are isolated automatically by the
+# generated .cargo/config.toml.
 #
 # Usage:
-#   scripts/worktree.sh new <slug> [--pg-port N]   create branch task/<slug> + worktree
-#   scripts/worktree.sh ls                          list active task worktrees
-#   scripts/worktree.sh rm  <slug>                  remove the worktree + delete its branch
+#   scripts/worktree.sh new <slug> [--shared-pg]   create branch task/<slug> + sandbox
+#   scripts/worktree.sh ls                          list active sandboxes (+ pg ports)
+#   scripts/worktree.sh rm  <slug>                  stop pg, remove worktree, delete branch
 #
-# Run from anywhere inside the main clone. Worktrees are created as siblings of the
-# main clone under <parent>/brindle-wt/<slug>, on the Linux-native filesystem.
-#
-# See docs/DEVELOPMENT.md § "Parallel development with git worktrees".
+# Worktrees are created as siblings of the main clone, under
+# <parent>/brindle-wt/<slug>, on the Linux-native filesystem.
+# See docs/DEVELOPMENT.md § "Parallel development".
 
 set -euo pipefail
 
+SHARED_PGRX_HOME="$HOME/.pgrx"                 # the already-built pgrx home (install source)
+PG_MAJOR=17                                    # major used for port math / start / stop
+
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
 
-usage() {
-  sed -n '3,17p' "$0" | sed 's/^# \{0,1\}//'
-  exit "${1:-0}"
-}
+usage() { sed -n '3,24p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
 
-# Anchor everything on the *main* worktree (first entry of `git worktree list`),
-# so the commands behave the same whether run from the main clone or a worktree.
-main_worktree() {
-  git worktree list --porcelain | sed -n 's/^worktree //p' | head -1
-}
+main_worktree() { git worktree list --porcelain | sed -n 's/^worktree //p' | head -1; }
 
 valid_slug() {
-  [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die "invalid slug '$1' (use letters, digits, . _ -)"
+  [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die "invalid slug '$1' (letters, digits, . _ -)"
+}
+
+# Two distinct, currently-free TCP ports.
+free_port_pair() {
+  python3 - <<'PY'
+import socket
+socks, ports = [], []
+for _ in range(2):
+    s = socket.socket(); s.bind(('127.0.0.1', 0)); ports.append(s.getsockname()[1]); socks.append(s)
+for s in socks: s.close()
+print(ports[0], ports[1])
+PY
 }
 
 cmd_new() {
-  local slug="" pg_port=""
+  local slug="" shared_pg=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --pg-port) pg_port="${2:-}"; shift 2 || die "--pg-port needs a number" ;;
-      --pg-port=*) pg_port="${1#*=}"; shift ;;
+      --shared-pg) shared_pg=1; shift ;;
       -*) die "unknown option '$1'" ;;
       *) [[ -z "$slug" ]] && slug="$1" || die "unexpected argument '$1'"; shift ;;
     esac
   done
   [[ -n "$slug" ]] || usage 1
   valid_slug "$slug"
-  [[ -z "$pg_port" || "$pg_port" =~ ^[0-9]+$ ]] || die "--pg-port must be a number"
 
-  local branch="task/$slug"
-  local base_dir wt_dir target_dir
+  local branch="task/$slug" base_dir wt_dir target_dir pgrx_home
   base_dir="$(dirname "$(main_worktree)")"
   wt_dir="$base_dir/brindle-wt/$slug"
   target_dir="$HOME/.cargo-target/$slug"
+  pgrx_home="$HOME/.pgrx-$slug"
 
   git show-ref --verify --quiet "refs/heads/$branch" && die "branch $branch already exists"
   [[ -e "$wt_dir" ]] && die "$wt_dir already exists"
 
-  # Base the new branch on the freshest main we can reach (offline-safe).
   git fetch --quiet origin 2>/dev/null || echo "note: could not fetch origin; basing on local main"
   local base="main"
   git show-ref --verify --quiet refs/remotes/origin/main && base="origin/main"
 
-  git worktree add -b "$branch" "$wt_dir" "$base"
+  # `git worktree add` briefly locks refs; retry so concurrent `new` calls don't fail.
+  local tries=0
+  until git worktree add -b "$branch" "$wt_dir" "$base" 2>/tmp/wt-add.$$; do
+    tries=$((tries + 1))
+    [[ $tries -ge 5 ]] && { cat /tmp/wt-add.$$ >&2; rm -f /tmp/wt-add.$$; die "git worktree add failed"; }
+    sleep 0.5
+  done
+  rm -f /tmp/wt-add.$$
+
   mkdir -p "$target_dir" "$wt_dir/.cargo"
 
+  # Isolate plain `cargo` (build/test/bench/clippy) via the worktree's cargo config.
+  cat > "$wt_dir/.cargo/config.toml" <<EOF
+# Auto-generated by scripts/worktree.sh — isolates this worktree's build output.
+# Not committed (.cargo/ is git-ignored); removed with the worktree.
+[build]
+target-dir = "$target_dir"
+EOF
+
+  # Env loaded by scripts/pgx.sh (cargo's [env] does NOT reach the cargo-pgrx
+  # subcommand, and shell exports don't persist across tool calls — so the wrapper
+  # re-loads this on every invocation).
   {
-    echo "# Auto-generated by scripts/worktree.sh — isolates this worktree's build."
-    echo "# Not committed (.cargo/ is git-ignored); safe to delete with the worktree."
-    echo "[build]"
-    echo "target-dir = \"$target_dir\""
-    if [[ -n "$pg_port" ]]; then
+    echo "export CARGO_TARGET_DIR=\"$target_dir\""
+    [[ $shared_pg -eq 0 ]] && echo "export PGRX_HOME=\"$pgrx_home\""
+  } > "$wt_dir/.cargo/worktree-env"
+
+  local msg_pg="shared ($SHARED_PGRX_HOME — serialize pgrx tests)"
+  if [[ $shared_pg -eq 0 ]]; then
+    local p_run p_test
+    read -r p_run p_test < <(free_port_pair)
+    rm -rf "$pgrx_home"; mkdir -p "$pgrx_home"
+    # base_port + major = run port; base_testing_port + major = test port. The
+    # absolute pg_config in [configs] is copied as-is, so the compiled install is
+    # shared (no recompile); only data-$major is created here, lazily on first use.
+    {
+      echo "base_port = $((p_run - PG_MAJOR))"
+      echo "base_testing_port = $((p_test - PG_MAJOR))"
       echo
-      echo "[env]"
-      echo "PGRX_HOME = \"$HOME/.pgrx-$slug\""
-    fi
-  } > "$wt_dir/.cargo/config.toml"
+      cat "$SHARED_PGRX_HOME/config.toml"
+    } > "$pgrx_home/config.toml"
+    msg_pg="$pgrx_home  (run :$p_run, test :$p_test)"
+  fi
 
   echo
-  echo "created worktree:  $wt_dir"
-  echo "        branch:    $branch  (off $base)"
-  echo "        build dir: $target_dir"
-  if [[ -n "$pg_port" ]]; then
-    echo
-    echo "isolated Postgres requested. Initialize it once (downloads/builds pg17):"
-    echo "  PGRX_HOME=$HOME/.pgrx-$slug cargo pgrx init"
-    echo "then set its port to $pg_port in:  $HOME/.pgrx-$slug/config.toml"
-  fi
+  echo "created sandbox:"
+  echo "  worktree:  $wt_dir"
+  echo "  branch:    $branch  (off $base)"
+  echo "  build dir: $target_dir"
+  echo "  postgres:  $msg_pg"
   echo
-  echo "next:  cd $wt_dir   (open your editor/session here; cargo auto-isolates)"
+  echo "next:"
+  echo "  cd $wt_dir"
+  echo "  cargo test                 # pure-core, isolated build dir"
+  echo "  scripts/pgx.sh test pg$PG_MAJOR   # pgrx tests, isolated Postgres"
 }
 
 cmd_ls() {
   echo "Active worktrees:"
   git worktree list
   echo
-  echo "Task branches:"
-  git for-each-ref --format='  %(refname:short)' refs/heads/task/ || true
+  echo "Task branches + isolated Postgres ports:"
+  local b slug home prun ptest
+  while read -r b; do
+    slug="${b#task/}"
+    home="$HOME/.pgrx-$slug"
+    if [[ -f "$home/config.toml" ]]; then
+      prun=$(( $(sed -n 's/^base_port *= *//p' "$home/config.toml") + PG_MAJOR ))
+      ptest=$(( $(sed -n 's/^base_testing_port *= *//p' "$home/config.toml") + PG_MAJOR ))
+      printf '  %-28s run :%s  test :%s\n' "$b" "$prun" "$ptest"
+    else
+      printf '  %-28s (shared Postgres)\n' "$b"
+    fi
+  done < <(git for-each-ref --format='%(refname:short)' refs/heads/task/)
 }
 
 cmd_rm() {
   local slug="${1:-}"
   [[ -n "$slug" ]] || usage 1
   valid_slug "$slug"
-  local branch="task/$slug"
-  local base_dir wt_dir
+  local branch="task/$slug" base_dir wt_dir pgrx_home
   base_dir="$(dirname "$(main_worktree)")"
   wt_dir="$base_dir/brindle-wt/$slug"
+  pgrx_home="$HOME/.pgrx-$slug"
+
+  if [[ -d "$pgrx_home" ]]; then
+    PGRX_HOME="$pgrx_home" cargo pgrx stop "pg$PG_MAJOR" >/dev/null 2>&1 || true
+    rm -rf "$pgrx_home"
+    echo "removed isolated Postgres: $pgrx_home"
+  fi
 
   if [[ -d "$wt_dir" ]]; then
     git worktree remove "$wt_dir" \
-      || die "worktree has uncommitted changes; commit/push or rerun with: git worktree remove --force '$wt_dir'"
+      || die "worktree has uncommitted changes; commit/push or: git worktree remove --force '$wt_dir'"
     echo "removed worktree: $wt_dir"
   else
-    echo "note: $wt_dir not found (already removed?)"
     git worktree prune
   fi
 

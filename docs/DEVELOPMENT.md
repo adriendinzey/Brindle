@@ -64,40 +64,45 @@ directory would stomp on each other's uncommitted files and can't sit on differe
 branches at once. The fix is a **git worktree per task**: the same repository and
 history, but a separate directory + branch + build sandbox.
 
-A helper script automates the setup:
+One command gives a task a fully isolated sandbox:
 
 ```bash
-scripts/worktree.sh new <slug>   # branch task/<slug> + worktree at ~/code/brindle-wt/<slug>
-scripts/worktree.sh ls           # list active task worktrees
-scripts/worktree.sh rm  <slug>   # remove the worktree and delete its branch (after merge)
+scripts/worktree.sh new <slug>   # branch task/<slug> + worktree + build dir + its own Postgres
+scripts/worktree.sh ls           # list active sandboxes and their Postgres ports
+scripts/worktree.sh rm  <slug>   # stop pg, remove the worktree, delete the branch (after merge)
 ```
 
-`new` branches off the latest `origin/main`, creates the worktree on ext4, and
-writes a per-worktree `.cargo/config.toml` so every `cargo` command there builds
-into its own target directory (`~/.cargo-target/<slug>`). Open your editor/session
-*in that directory* and work only on that branch.
+`new` branches off the latest `origin/main`, creates the worktree on ext4, and sets
+up **three** layers of isolation automatically. Then just work in that directory:
+
+```bash
+cd ~/code/brindle-wt/<slug>
+cargo test                  # pure-core — isolated build dir, parallel-safe
+scripts/pgx.sh test pg17    # pgrx/SQL tests — isolated Postgres, parallel-safe
+```
+
+Use `scripts/pgx.sh` in place of `cargo pgrx` inside a worktree: it loads that
+worktree's isolated environment first (cargo's own `[env]` table does not reach the
+`cargo pgrx` subcommand, so the wrapper does it). Plain `cargo` commands need no
+wrapper — the generated `.cargo/config.toml` already redirects their build output.
 
 ### Isolation, layer by layer
 
 | Resource | Isolation | How |
 |---|---|---|
 | Files + branch | ✅ automatic | the worktree (`scripts/worktree.sh new`) |
-| Build artifacts | ✅ automatic | per-worktree `~/.cargo-target/<slug>` (a shared `target/` corrupts under concurrent `cargo`) |
-| Postgres test instance | ⚠️ shared by default | see below |
+| Build artifacts | ✅ automatic | per-worktree `~/.cargo-target/<slug>` via generated `.cargo/config.toml` (a shared `target/` corrupts under concurrent `cargo`) |
+| Postgres instance | ✅ automatic | per-worktree `PGRX_HOME=~/.pgrx-<slug>` on an auto-allocated free port; run pgrx via `scripts/pgx.sh` |
 
-`cargo pgrx test` boots a managed Postgres from `PGRX_HOME` (`~/.pgrx`) on a fixed
-per-version port, so **two concurrent `cargo pgrx test` of the same major collide.**
-Options, cheapest first:
+The isolated Postgres is **cheap**: it reuses the already-compiled install (no
+recompile) and only creates a ~40 MB data directory per worktree, lazily on first
+`pgx.sh` use. So `cargo pgrx test` of the same major can run in many worktrees at
+once without the usual fixed-port collision. If you don't need it (pure-core task,
+or you'll serialize pgrx tests), pass `--shared-pg` to skip it.
 
-- **(a) Serialize pgrx tests** — run only one `cargo pgrx test` at a time. Pure-core
-  `cargo test` work parallelizes freely and is most of the early parallel work, so
-  this is usually enough.
-- **(b) Per-worktree `PGRX_HOME` + a unique port** — for heavy parallelism, pass
-  `--pg-port <N>` to `scripts/worktree.sh new`; it wires a separate
-  `PGRX_HOME=~/.pgrx-<slug>` into the worktree's cargo env. Initialize it once with
-  `PGRX_HOME=~/.pgrx-<slug> cargo pgrx init` (the script prints the exact command).
-- **(c) A Docker dev-container per worktree** (its own Postgres) — full isolation,
-  heaviest.
+This is self-service: the person (or agent) doing a task runs `new` themselves as
+their first step and works in the sandbox it prints — there's no separate setup
+hand-off. `rm` tears the whole thing down (stops Postgres, removes worktree + branch).
 
 ### Branch → PR → merge (conflicts are approved by a human)
 
