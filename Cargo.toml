@@ -4,7 +4,7 @@ version = "0.0.1"
 edition = "2021"
 description = "Filter-aware, hybrid vector search for PostgreSQL"
 license = "PostgreSQL"
-repository = "https://github.com/your-username/brindle"
+repository = "https://github.com/adriendinzey/Brindle"
 readme = "README.md"
 
 [lints.rust]

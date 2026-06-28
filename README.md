@@ -26,12 +26,12 @@ Reciprocal Rank Fusion.
 > in the open. It is *not* production-ready and makes no performance claims yet.
 > See [docs/ROADMAP.md](docs/ROADMAP.md) for what works today.
 
-> ⚠️ **Build in WSL2 — not inside this OneDrive folder.** Clone to the WSL native
-> filesystem (e.g. `~/code/brindle`) and develop there. Do **not** build from a
-> OneDrive-synced directory: OneDrive syncs `.git` and the large, constantly
-> changing `target/`, which has already rolled back a commit once and can corrupt
-> or revert refs. Full setup notes:
-> [docs/ROADMAP.md](docs/ROADMAP.md#getting-set-up).
+> ⚠️ **On Windows, build inside WSL2 on the Linux-native filesystem.** Clone to
+> `~/code/brindle` (ext4) and develop there — not under `/mnt/c` or `/mnt/d`.
+> `cargo`/`rustc` touch thousands of small files, and Windows drives are reached
+> from WSL over the slow 9P protocol, so builds on `/mnt/*` are commonly 5–10×
+> slower than on the native filesystem. Full setup:
+> [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md).
 
 ## Why another Postgres vector extension?
 
@@ -74,12 +74,12 @@ CREATE EXTENSION brindle;
 SELECT brindle_l2_distance(ARRAY[1,2,3]::real[], ARRAY[4,5,6]::real[]);  -- 5.196...
 ```
 
-Full setup notes (including the WSL2 + OneDrive gotcha) live in
-[docs/ROADMAP.md](docs/ROADMAP.md#getting-set-up).
+Full setup notes (toolchain, the WSL2 native-filesystem loop, and parallel
+development) live in [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md).
 
 ## Development
 
-Setup and build: [docs/ROADMAP.md](docs/ROADMAP.md#getting-set-up). Design and
+Setup and build: [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md). Design and
 rationale: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) and
 [docs/FILTERING.md](docs/FILTERING.md). Code conventions:
 [docs/CODING_STANDARDS.md](docs/CODING_STANDARDS.md).

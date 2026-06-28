@@ -60,53 +60,11 @@ Legend: ✅ done · 🚧 in progress · ⬜ planned
 
 ## Getting set up
 
-> **TL;DR:** build in WSL2/Linux/macOS, *not* native Windows, and *not* inside the
-> OneDrive folder.
+The toolchain install, the WSL2 native-filesystem build loop, editing via VS Code
+Remote-WSL, and parallel development with git worktrees are documented in one
+place: **[DEVELOPMENT.md](DEVELOPMENT.md)**.
 
-### Why not native Windows / OneDrive?
-
-- `pgrx` (and Postgres extension building generally) is well-supported on
-  Linux/macOS and rough on native Windows. Use **WSL2**.
-- `cargo` produces a large, constantly-changing `target/` directory. If that lives
-  in a OneDrive-synced folder, OneDrive will thrash trying to sync it and can
-  corrupt builds. Keep the working copy on the **WSL native filesystem**
-  (e.g. `~/code/brindle`), not under `/mnt/c` or `/mnt/d`.
-
-### One-time WSL2 setup
-
-```bash
-# inside Ubuntu on WSL2
-sudo apt-get update
-sudo apt-get install -y build-essential libreadline-dev zlib1g-dev flex bison \
-  libxml2-dev libxslt-dev libssl-dev libxml2-utils xsltproc ccache pkg-config clang
-
-# Rust
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-source "$HOME/.cargo/env"
-
-# pgrx
-cargo install --locked cargo-pgrx
-cargo pgrx init        # downloads & compiles supported Postgres versions (slow, one-time)
-```
-
-### Daily loop
-
-```bash
-git clone <your-repo-url> ~/code/brindle      # native FS, not /mnt/*
-cd ~/code/brindle
-
-cargo test                  # fast: pure-Rust core logic (no Postgres)
-cargo pgrx test pg17        # integration tests against a managed Postgres
-cargo pgrx run  pg17        # build + install + open psql with brindle loaded
-```
-
-```sql
-CREATE EXTENSION brindle;
-SELECT brindle_l2_distance(ARRAY[1,2,3]::real[], ARRAY[4,5,6]::real[]);
-```
-
-### Editing from Windows
-
-You can edit files in VS Code on Windows via the **WSL remote** extension (open the
-`~/code/brindle` folder *inside* WSL), which avoids the `/mnt` performance penalty
-while keeping a familiar editor.
+> **TL;DR:** on Windows, build inside WSL2 on the Linux-native filesystem
+> (`~/code/brindle`), not under `/mnt/*` — `cargo` over the 9P mount is 5–10×
+> slower. `cargo-pgrx` needs the Linux toolchain, so there is no native-Windows
+> build path anyway.

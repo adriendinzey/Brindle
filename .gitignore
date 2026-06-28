@@ -10,6 +10,10 @@
 /sql/*--*.sql     # generated extension SQL (cargo pgrx generates these)
 .pgrx/
 
+# Per-worktree cargo config (machine-local build-dir/env override; see
+# scripts/worktree.sh). Holds absolute paths, so it must never be committed.
+.cargo/
+
 # Editors / OS
 .idea/
 .vscode/
