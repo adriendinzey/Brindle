@@ -1,6 +1,6 @@
 # Brindle
 
-**Filter-aware, hybrid vector search for PostgreSQL — written in Rust.**
+**Filter-aware, hybrid vector search for PostgreSQL — written in Rust & fully vibe-coded from scratch.**
 
 Brindle is a PostgreSQL extension for approximate nearest-neighbor (ANN) vector
 search whose design goal is the query production RAG and search systems actually
