@@ -36,6 +36,16 @@ valid_slug() {
   [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die "invalid slug '$1' (letters, digits, . _ -)"
 }
 
+# True if a PR for branch $1 has already been merged. Squash/rebase merges rewrite the
+# commits, so `git branch -d` still sees the local branch as "unmerged" — this catches
+# that case. Needs `gh`; without it, returns false so the caller keeps the safe error.
+branch_merged_via_pr() {
+  command -v gh >/dev/null 2>&1 || return 1
+  local n
+  n=$(gh pr list --head "$1" --state merged --json number --jq 'length' 2>/dev/null) || return 1
+  [[ "${n:-0}" -gt 0 ]]
+}
+
 # Two distinct, currently-free TCP ports.
 free_port_pair() {
   python3 - <<'PY'
@@ -145,17 +155,21 @@ cmd_ls() {
   echo "Active worktrees:"
   git worktree list
   echo
-  echo "Task branches + isolated Postgres ports:"
-  local b slug home prun ptest
+  echo "Task branches + isolated Postgres ports (last commit age; flagged if no worktree):"
+  local b slug home prun ptest age wt base_dir flag
+  base_dir="$(dirname "$(main_worktree)")"
   while read -r b; do
     slug="${b#task/}"
     home="$HOME/.pgrx-$slug"
+    age=$(git log -1 --format='%cr' "$b" 2>/dev/null || echo '?')
+    wt="$base_dir/brindle-wt/$slug"
+    flag=""; [[ -d "$wt" ]] || flag="  ⚠ no worktree (stale?)"
     if [[ -f "$home/config.toml" ]]; then
       prun=$(( $(sed -n 's/^base_port *= *//p' "$home/config.toml") + PG_MAJOR ))
       ptest=$(( $(sed -n 's/^base_testing_port *= *//p' "$home/config.toml") + PG_MAJOR ))
-      printf '  %-28s run :%s  test :%s\n' "$b" "$prun" "$ptest"
+      printf '  %-28s run :%s  test :%s   %s%s\n' "$b" "$prun" "$ptest" "$age" "$flag"
     else
-      printf '  %-28s (shared Postgres)\n' "$b"
+      printf '  %-28s (shared Postgres)   %s%s\n' "$b" "$age" "$flag"
     fi
   done < <(git for-each-ref --format='%(refname:short)' refs/heads/task/)
 }
@@ -186,9 +200,15 @@ cmd_rm() {
   fi
 
   if git show-ref --verify --quiet "refs/heads/$branch"; then
-    git branch -d "$branch" \
-      || die "branch $branch not fully merged; if intentional: git branch -D '$branch'"
-    echo "deleted branch:   $branch"
+    if git branch -d "$branch" 2>/dev/null; then
+      echo "deleted branch:   $branch"
+    elif branch_merged_via_pr "$branch"; then
+      # Squash/rebase-merged: the work is on main even though `git branch -d` can't tell.
+      git branch -D "$branch"
+      echo "deleted branch:   $branch  (squash/rebase-merged via PR)"
+    else
+      die "branch $branch isn't merged (no merged PR found); if intentional: git branch -D '$branch'"
+    fi
   fi
   echo "(build cache at \$HOME/.cargo-target/$slug left in place — rm -rf it to reclaim disk)"
 }
