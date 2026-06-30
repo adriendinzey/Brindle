@@ -123,14 +123,28 @@ that CI and review gate:
    maintainer reviews and resolves (or asks for a rebase) before merging.
 5. After merge: `scripts/worktree.sh rm <slug>`.
 
-To enforce step 4 on GitHub (require a PR + passing CI, block direct pushes to
-`main`):
+To enforce step 4 on GitHub (require a PR + passing CI + up-to-date branch, and block
+force-push/deletion of `main`) — **already applied on this repo**:
 
 ```bash
 gh api -X PUT repos/adriendinzey/Brindle/branches/main/protection \
-  -H "Accept: application/vnd.github+json" \
-  -f 'required_status_checks[strict]=true' \
-  -F 'enforce_admins=false' \
-  -f 'required_pull_request_reviews[required_approving_review_count]=1' \
-  -f 'restrictions=null'
+  -H "Accept: application/vnd.github+json" --input - <<'JSON'
+{
+  "required_status_checks": { "strict": true,
+    "contexts": ["rustfmt", "clippy + test (pg16)", "clippy + test (pg17)"] },
+  "enforce_admins": false,
+  "required_pull_request_reviews": { "required_approving_review_count": 0 },
+  "restrictions": null,
+  "allow_force_pushes": false,
+  "allow_deletions": false,
+  "required_linear_history": true
+}
+JSON
 ```
+
+> **Solo note:** `required_approving_review_count` is **0**, not 1 — GitHub won't let you
+> approve your *own* PR, so requiring 1 makes every PR unmergeable for a single
+> maintainer. CI-green + up-to-date is the real gate. `enforce_admins:false` keeps an
+> owner escape hatch if a required check name ever drifts; set it to `true` to force
+> *everyone* (you included) through the PR path. Required checks must match the CI job
+> names exactly: `rustfmt`, `clippy + test (pg16)`, `clippy + test (pg17)`.
