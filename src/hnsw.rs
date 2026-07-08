@@ -152,6 +152,11 @@ pub struct Hnsw {
     ml: f64,
     dim: usize,
     seed: u64,
+    // Invariant: `vectors`, `links`, and `deleted` are parallel arrays indexed by
+    // node id, and nodes are never removed (delete only tombstones), so every id
+    // stored in `links` or `entry_point` remains a valid index for all three.
+    // This is what makes the raw `[id]` indexing on the search/insert paths
+    // panic-free.
     vectors: Vec<Vec<f32>>,
     links: Vec<Vec<Vec<usize>>>,
     /// Tombstone flags parallel to `vectors`; deleted nodes route but never return.
@@ -279,9 +284,7 @@ impl Hnsw {
             if c.dist > farthest {
                 break;
             }
-            let degree = self.neighbors(c.id, layer).len();
-            for idx in 0..degree {
-                let n = self.neighbors(c.id, layer)[idx];
+            for &n in self.neighbors(c.id, layer) {
                 if visited.insert(n) {
                     let d = self.metric.distance(query, &self.vectors[n])?;
                     let farthest = results.peek().map(|x| x.dist).unwrap_or(f32::INFINITY);
