@@ -1,0 +1,110 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  PGRX_VERSION: "0.12.9"
+
+jobs:
+  # Fail fast if the tag doesn't match Cargo.toml, before spending matrix build time.
+  check-version:
+    name: Verify tag matches Cargo.toml version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.check.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - id: check
+        run: |
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          PKG_VERSION="$(cargo pkgid | sed -E 's/.*[#@]//')"
+          if [ "$TAG_VERSION" != "$PKG_VERSION" ]; then
+            echo "::error::tag v$TAG_VERSION does not match Cargo.toml version $PKG_VERSION"
+            exit 1
+          fi
+          echo "version=$PKG_VERSION" >> "$GITHUB_OUTPUT"
+
+  package:
+    name: Package pg${{ matrix.pg }}
+    needs: check-version
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        pg: [16, 17]
+    steps:
+      - uses: actions/checkout@v4
+
+      # Duplicated from ci.yml rather than factored into a composite action (this
+      # workflow only runs on tags, so the duplication cost is low); keep both in
+      # sync if the PGDG setup ever changes.
+      - name: Install PostgreSQL ${{ matrix.pg }} + build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends curl ca-certificates gnupg lsb-release
+          curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+            | sudo gpg --dearmor -o /usr/share/keyrings/pgdg.gpg
+          echo "deb [signed-by=/usr/share/keyrings/pgdg.gpg] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
+            | sudo tee /etc/apt/sources.list.d/pgdg.list
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            postgresql-${{ matrix.pg }} postgresql-server-dev-${{ matrix.pg }} \
+            build-essential clang libclang-dev pkg-config libssl-dev libreadline-dev zlib1g-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: pg${{ matrix.pg }}-release
+
+      - name: Install cargo-pgrx ${{ env.PGRX_VERSION }}
+        run: cargo install --locked cargo-pgrx --version ${{ env.PGRX_VERSION }}
+
+      - name: pgrx init (system Postgres)
+        run: cargo pgrx init --pg${{ matrix.pg }} /usr/lib/postgresql/${{ matrix.pg }}/bin/pg_config
+
+      # Output mirrors pg_config's real install paths (e.g. /usr/lib/postgresql/<ver>/...),
+      # so the tarball extracts at `/` to reinstall in place. Not relocatable.
+      - name: Package extension
+        run: |
+          cargo pgrx package \
+            --pg-config /usr/lib/postgresql/${{ matrix.pg }}/bin/pg_config \
+            --no-default-features --features pg${{ matrix.pg }}
+
+      - name: Tar artifact
+        id: tar
+        run: |
+          ARCH="$(uname -m)"
+          NAME="brindle-${{ needs.check-version.outputs.version }}-pg${{ matrix.pg }}-linux-${ARCH}"
+          tar -C "target/release/brindle-pg${{ matrix.pg }}" -czf "${NAME}.tar.gz" .
+          echo "name=${NAME}.tar.gz" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.tar.outputs.name }}
+          path: ${{ steps.tar.outputs.name }}
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    needs: [check-version, package]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*.tar.gz
+          generate_release_notes: true
+          prerelease: ${{ contains(github.ref_name, '-') }}
