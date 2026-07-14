@@ -1,0 +1,52 @@
+name: Bug report
+description: Something is broken or behaves incorrectly
+labels: ["bug"]
+body:
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What went wrong, and what did you expect instead?
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to reproduce
+      description: Minimal SQL (and data shape) that triggers the problem.
+      placeholder: |
+        CREATE EXTENSION brindle;
+        SELECT brindle_l2_distance(ARRAY[1,2,3]::real[], ARRAY[4,5,6]::real[]);
+      render: sql
+    validations:
+      required: true
+
+  - type: input
+    id: brindle-version
+    attributes:
+      label: Brindle version / commit
+      placeholder: 0.0.1, or a git SHA
+    validations:
+      required: true
+
+  - type: input
+    id: postgres-version
+    attributes:
+      label: PostgreSQL version
+      placeholder: "17.2"
+    validations:
+      required: true
+
+  - type: input
+    id: environment
+    attributes:
+      label: OS / environment
+      placeholder: Ubuntu 24.04 (WSL2), x86_64
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant log output
+      description: Server log lines, error messages, or backtraces.
+      render: shell

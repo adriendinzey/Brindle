@@ -1,0 +1,18 @@
+version: 2
+updates:
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    groups:
+      # pgrx and pgrx-tests are pinned to the same exact version and must be
+      # bumped together (CI installs the matching cargo-pgrx).
+      pgrx:
+        patterns:
+          - "pgrx"
+          - "pgrx-tests"
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
