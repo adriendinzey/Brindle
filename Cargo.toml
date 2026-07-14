@@ -42,7 +42,7 @@ pgrx-tests = "=0.12.9"
 # `cargo_bench_support` is required for the harness to run under `cargo bench`;
 # it is part of criterion's default features, which we otherwise drop to avoid
 # pulling in `plotters`/`rayon` for these tiny kernels.
-criterion = { version = "0.5", default-features = false, features = [
+criterion = { version = "0.8", default-features = false, features = [
     "cargo_bench_support",
 ] }
 
