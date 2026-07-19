@@ -11,6 +11,7 @@
 use pgrx::prelude::*;
 
 pub mod distance;
+pub mod fusion;
 pub mod hnsw;
 pub mod vector;
 
