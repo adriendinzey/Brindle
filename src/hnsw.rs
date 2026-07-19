@@ -10,6 +10,11 @@
 //! heuristic for neighbor selection. Pruning maintains a per-layer degree cap, so
 //! edges are bidirectional *at insertion* but a later prune may drop one side —
 //! the maintained invariant is the degree cap, not strict symmetry.
+//!
+//! The degree caps scale with an edge-density multiplier `gamma` (γ) following
+//! ACORN (<https://arxiv.org/abs/2403.04871>): a graph built with γ > 1 keeps
+//! ~`m·γ` neighbors per node, so the subgraph of nodes surviving a selective
+//! predicate stays navigable. γ = 1 is a standard HNSW.
 
 use std::cmp::{Ordering, Reverse};
 use std::collections::{BinaryHeap, HashSet};
@@ -59,14 +64,29 @@ impl From<DistanceError> for HnswError {
 /// Build/query parameters.
 #[derive(Debug, Clone, Copy)]
 pub struct HnswParams {
-    /// Neighbors per node on upper layers (layer 0 uses `2*m`).
+    /// Neighbors per node on upper layers before γ scaling (layer 0 uses `2*m`;
+    /// [`HnswParams::gamma`] multiplies both caps).
     pub m: usize,
     /// Candidate-pool size during build (larger = better graph, slower build).
     pub ef_construction: usize,
+    /// Edge-density multiplier (ACORN's γ): degree caps scale to `m·γ` (layer 0
+    /// to `2m·γ`) so the graph stays navigable for predicates down to selectivity
+    /// ~`1/γ`. `1.0` builds a standard HNSW; non-finite values are treated as 1,
+    /// finite values clamp to `[1, MAX_GAMMA]`. Density costs ~γ× link memory
+    /// and superlinearly more build time (neighbor selection compares a γ-sized
+    /// candidate pool against γ-sized neighbor lists).
+    pub gamma: f32,
     /// Distance metric.
     pub metric: Metric,
     /// PRNG seed for reproducible level assignment.
     pub seed: u64,
+}
+
+impl HnswParams {
+    /// Upper bound for [`HnswParams::gamma`]. Selectivity down to 0.1% needs
+    /// γ ≈ 1000, so 1024 covers the documented use cases while keeping the
+    /// γ-scaled degree caps (and the allocations sized from them) bounded.
+    pub const MAX_GAMMA: f32 = 1024.0;
 }
 
 impl Default for HnswParams {
@@ -74,6 +94,7 @@ impl Default for HnswParams {
         Self {
             m: 16,
             ef_construction: 64,
+            gamma: 1.0,
             metric: Metric::L2,
             seed: 0x9E37_79B9_7F4A_7C15,
         }
@@ -122,7 +143,11 @@ fn next_f64(state: &mut u64) -> f64 {
 pub struct Hnsw {
     metric: Metric,
     m: usize,
-    m0: usize,
+    gamma: f32,
+    /// γ-scaled degree cap for upper layers (γ = 1 ⇒ `m`).
+    m_cap: usize,
+    /// γ-scaled degree cap for layer 0 (γ = 1 ⇒ `2m`).
+    m0_cap: usize,
     ef_construction: usize,
     ml: f64,
     dim: usize,
@@ -137,10 +162,24 @@ pub struct Hnsw {
 }
 
 impl Hnsw {
-    /// Create an empty index. `m` is clamped to ≥ 2; dimensionality is fixed by
-    /// the first inserted vector.
+    /// Create an empty index. `m` is clamped to ≥ 2 and `gamma` to ≥ 1;
+    /// dimensionality is fixed by the first inserted vector.
     pub fn new(params: HnswParams) -> Self {
         let m = params.m.max(2);
+        // γ below 1 would only thin the graph (defeating its purpose) and an
+        // unbounded γ would blow the degree caps up into absurd allocation sizes,
+        // so non-finite values mean "no densification" and finite ones clamp.
+        let gamma = if params.gamma.is_finite() {
+            params.gamma.clamp(1.0, HnswParams::MAX_GAMMA)
+        } else {
+            1.0
+        };
+        let m_cap = (m as f32 * gamma).round() as usize;
+        let m0_cap = ((m * 2) as f32 * gamma).round() as usize;
+        // A γ-dense layer-0 list only fills if the build pool supplies that many
+        // candidates; without densification keep the historical `m` floor so
+        // existing builds reproduce exactly.
+        let ef_floor = if gamma > 1.0 { m0_cap } else { m };
         let seed = if params.seed == 0 {
             0x9E37_79B9_7F4A_7C15
         } else {
@@ -149,8 +188,12 @@ impl Hnsw {
         Self {
             metric: params.metric,
             m,
-            m0: m * 2,
-            ef_construction: params.ef_construction.max(m),
+            gamma,
+            m_cap,
+            m0_cap,
+            ef_construction: params.ef_construction.max(ef_floor),
+            // Level assignment stays tied to the base `m`: γ densifies within
+            // layers without reshaping the hierarchy.
             ml: 1.0 / (m as f64).ln(),
             dim: 0,
             seed,
@@ -182,9 +225,9 @@ impl Hnsw {
     #[inline]
     fn max_degree(&self, layer: usize) -> usize {
         if layer == 0 {
-            self.m0
+            self.m0_cap
         } else {
-            self.m
+            self.m_cap
         }
     }
 
@@ -487,6 +530,7 @@ impl Hnsw {
         let mut fresh = Hnsw::new(HnswParams {
             m: self.m,
             ef_construction: self.ef_construction,
+            gamma: self.gamma,
             metric: self.metric,
             seed: self.seed,
         });
@@ -505,10 +549,16 @@ mod tests {
 
     /// Build an index over `n` deterministic random vectors of dimension `dim`.
     fn build(n: usize, dim: usize, seed: u64) -> (Hnsw, Vec<Vec<f32>>) {
+        build_gamma(n, dim, seed, 1.0)
+    }
+
+    /// Like [`build`], with an explicit edge-density multiplier.
+    fn build_gamma(n: usize, dim: usize, seed: u64, gamma: f32) -> (Hnsw, Vec<Vec<f32>>) {
         let mut data_rng = seed ^ 0xABCD_EF01;
         let mut h = Hnsw::new(HnswParams {
             m: 8,
             ef_construction: 50,
+            gamma,
             metric: Metric::L2,
             seed,
         });
@@ -521,6 +571,60 @@ mod tests {
         (h, data)
     }
 
+    /// FNV-1a over the full graph structure (links, entry point, max layer).
+    /// Stable across platforms and std versions, unlike `DefaultHasher`.
+    fn graph_fingerprint(h: &Hnsw) -> u64 {
+        const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+        const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+        let mut hash = FNV_OFFSET;
+        let mut mix = |x: u64| {
+            for b in x.to_le_bytes() {
+                hash ^= b as u64;
+                hash = hash.wrapping_mul(FNV_PRIME);
+            }
+        };
+        for layers in &h.links {
+            mix(layers.len() as u64);
+            for nbrs in layers {
+                mix(nbrs.len() as u64);
+                for &n in nbrs {
+                    mix(n as u64);
+                }
+            }
+        }
+        mix(h.entry_point.map(|e| e as u64 + 1).unwrap_or(0));
+        mix(h.max_layer as u64);
+        hash
+    }
+
+    /// Fingerprint of `build(200, 16, 42)` captured from the build code as it was
+    /// before `gamma` existed. Guards the promise that γ = 1 reproduces that
+    /// graph byte-for-byte; a deliberate algorithm change must update the
+    /// constant and say so in the commit message.
+    const REFERENCE_FINGERPRINT: u64 = 0xD0A7_2FC5_93B4_C94B;
+
+    #[test]
+    fn gamma_one_reproduces_pre_gamma_graph() {
+        let (h, _) = build(200, 16, 42);
+        assert_eq!(
+            graph_fingerprint(&h),
+            REFERENCE_FINGERPRINT,
+            "graph structure drifted from the pre-gamma build"
+        );
+    }
+
+    #[test]
+    fn invalid_gamma_treated_as_one() {
+        for gamma in [0.5, 0.0, -3.0, f32::NAN, f32::INFINITY] {
+            let (h, _) = build_gamma(200, 16, 42, gamma);
+            assert_eq!(
+                graph_fingerprint(&h),
+                REFERENCE_FINGERPRINT,
+                "gamma = {gamma} did not clamp to 1"
+            );
+        }
+    }
+
     #[test]
     fn len_and_dim() {
         let (h, _) = build(100, 8, 1);
@@ -529,9 +633,7 @@ mod tests {
         assert!(!h.is_empty());
     }
 
-    #[test]
-    fn degree_cap_respected() {
-        let (h, _) = build(300, 12, 7);
+    fn assert_degree_caps(h: &Hnsw) {
         for id in 0..h.len() {
             for (lc, nbrs) in h.links[id].iter().enumerate() {
                 assert!(
@@ -545,12 +647,40 @@ mod tests {
     }
 
     #[test]
+    fn degree_cap_respected() {
+        let (h, _) = build(300, 12, 7);
+        assert_degree_caps(&h);
+    }
+
+    #[test]
     fn deterministic_for_seed() {
-        let (h1, _) = build(150, 10, 42);
-        let (h2, _) = build(150, 10, 42);
-        assert_eq!(h1.links, h2.links);
-        assert_eq!(h1.entry_point, h2.entry_point);
-        assert_eq!(h1.max_layer, h2.max_layer);
+        for gamma in [1.0, 2.0] {
+            let (h1, _) = build_gamma(150, 10, 42, gamma);
+            let (h2, _) = build_gamma(150, 10, 42, gamma);
+            assert_eq!(h1.links, h2.links, "gamma = {gamma}");
+            assert_eq!(h1.entry_point, h2.entry_point);
+            assert_eq!(h1.max_layer, h2.max_layer);
+        }
+    }
+
+    #[test]
+    fn degree_scales_with_gamma() {
+        let avg_layer0_degree = |h: &Hnsw| {
+            let total: usize = (0..h.len()).map(|id| h.neighbors(id, 0).len()).sum();
+            total as f64 / h.len() as f64
+        };
+        let (h1, _) = build_gamma(400, 12, 21, 1.0);
+        let (h2, _) = build_gamma(400, 12, 21, 2.0);
+
+        // Doubling γ doubles the degree caps; realized average degree (and with it
+        // link memory) should grow by well over half that headroom.
+        let (d1, d2) = (avg_layer0_degree(&h1), avg_layer0_degree(&h2));
+        assert!(
+            d2 >= 1.5 * d1,
+            "γ=2 avg layer-0 degree {d2:.2} not ≥ 1.5× γ=1's {d1:.2}"
+        );
+
+        assert_degree_caps(&h2);
     }
 
     #[test]
@@ -598,13 +728,15 @@ mod tests {
         }
     }
 
-    #[test]
-    fn recall_at_10_beats_threshold() {
+    /// Unfiltered recall@10 over 40 queries against an 800-vector build with the
+    /// given edge density.
+    fn recall_at_10(gamma: f32) -> f64 {
         let (dim, n, k, queries) = (24usize, 800usize, 10usize, 40usize);
         let mut rng = 0x1234_5678u64;
         let mut h = Hnsw::new(HnswParams {
             m: 16,
             ef_construction: 100,
+            gamma,
             metric: Metric::L2,
             seed: 99,
         });
@@ -620,8 +752,37 @@ mod tests {
             let exact: HashSet<usize> = h.brute_force(&q, k).unwrap().iter().map(|x| x.1).collect();
             hits += approx.iter().filter(|(_, id)| exact.contains(id)).count();
         }
-        let recall = hits as f64 / (queries * k) as f64;
+        hits as f64 / (queries * k) as f64
+    }
+
+    #[test]
+    fn recall_at_10_beats_threshold() {
+        let recall = recall_at_10(1.0);
         assert!(recall >= 0.9, "recall@10 too low: {recall:.3}");
+    }
+
+    #[test]
+    fn gamma_dense_recall_not_below_baseline() {
+        // Densification is for filtered search; it must not cost unfiltered
+        // recall. Same 0.9 bar the γ=1 build is held to above.
+        let recall = recall_at_10(2.0);
+        assert!(recall >= 0.9, "recall@10 at γ=2 too low: {recall:.3}");
+    }
+
+    #[test]
+    fn huge_gamma_clamps_to_bound() {
+        let mut h = Hnsw::new(HnswParams {
+            m: 2,
+            ef_construction: 4,
+            gamma: f32::MAX,
+            metric: Metric::L2,
+            seed: 1,
+        });
+        assert_eq!(h.m0_cap, (4.0 * HnswParams::MAX_GAMMA) as usize);
+        // Inserting must allocate from the clamped caps, not panic.
+        for i in 0..5 {
+            h.insert(vec![i as f32, 0.0]).expect("insert");
+        }
     }
 
     #[test]
@@ -665,6 +826,7 @@ mod tests {
         let mut h = Hnsw::new(HnswParams {
             m: 16,
             ef_construction: 100,
+            gamma: 1.0,
             metric: Metric::L2,
             seed: 11,
         });
@@ -705,6 +867,7 @@ mod tests {
         let mut h = Hnsw::new(HnswParams {
             m: 16,
             ef_construction: 100,
+            gamma: 1.0,
             metric: Metric::L2,
             seed: 3,
         });
@@ -741,6 +904,7 @@ mod tests {
         let mut h = Hnsw::new(HnswParams {
             m: 12,
             ef_construction: 80,
+            gamma: 1.0,
             metric: Metric::L2,
             seed: 7,
         });
