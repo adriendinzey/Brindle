@@ -12,7 +12,11 @@ use std::collections::HashMap;
 use std::fmt;
 
 /// Error returned by fusion for malformed parameters.
-#[derive(Debug, Clone, Copy, PartialEq)]
+///
+/// No `PartialEq`: `InvalidK` carries the offending `f64` (possibly NaN, the
+/// very value it rejects), and NaN makes derived equality non-reflexive.
+/// Assert on it with `matches!` instead.
+#[derive(Debug, Clone, Copy)]
 pub enum FusionError {
     /// RRF's `k` must be finite and non-negative so every `1 / (k + rank)`
     /// contribution is finite and positive.
@@ -73,6 +77,10 @@ impl FusionStrategy for Rrf {
 /// some lists; a duplicate id within one list counts once, at its best (first)
 /// rank. A non-finite or negative `k` is rejected: it would make some
 /// contributions infinite or negative and silently invert the ranking.
+///
+/// Ids are opaque to fusion: every ranking must draw from one shared id
+/// space, and the caller owns the encoding (fusing lists keyed by different
+/// id schemes silently coalesces unrelated items).
 ///
 /// Allocates only the accumulator map and the output vector.
 pub fn rrf(rankings: &[&[u64]], k: f64) -> Result<Vec<(u64, f64)>, FusionError> {
@@ -173,17 +181,17 @@ mod tests {
 
     #[test]
     fn strategy_default_is_k_60() {
-        let via_strategy = Rrf::default().fuse(&[&[10, 20], &[20, 10]]);
-        let direct = rrf(&[&[10, 20], &[20, 10]], 60.0);
+        let via_strategy = Rrf::default().fuse(&[&[10, 20], &[20, 10]]).unwrap();
+        let direct = rrf(&[&[10, 20], &[20, 10]], 60.0).unwrap();
         assert_eq!(via_strategy, direct);
     }
 
     #[test]
     fn invalid_k_is_rejected() {
-        assert_eq!(
+        assert!(matches!(
             rrf(&[&[1, 2]], -3.0),
-            Err(FusionError::InvalidK { k: -3.0 })
-        );
+            Err(FusionError::InvalidK { k }) if k == -3.0
+        ));
         assert!(rrf(&[&[1]], f64::NAN).is_err());
         assert!(rrf(&[&[1]], f64::INFINITY).is_err());
         assert!(Rrf { k: -1.0 }.fuse(&[&[1]]).is_err());
