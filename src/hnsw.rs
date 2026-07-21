@@ -20,6 +20,7 @@ use std::cmp::{Ordering, Reverse};
 use std::collections::{BinaryHeap, HashSet};
 
 use crate::distance::DistanceError;
+use crate::filter::AttrValue;
 use crate::vector::Metric;
 
 /// Errors from index operations.
@@ -154,6 +155,10 @@ pub struct Hnsw {
     seed: u64,
     vectors: Vec<Vec<f32>>,
     links: Vec<Vec<Vec<usize>>>,
+    /// Filterable attribute rows parallel to `vectors`, keyed by node id and set
+    /// at insert time. Empty for nodes inserted without attributes; consulted by
+    /// predicate-aware traversal, never by graph construction.
+    attrs: Vec<Vec<AttrValue>>,
     /// Tombstone flags parallel to `vectors`; deleted nodes route but never return.
     deleted: Vec<bool>,
     entry_point: Option<usize>,
@@ -199,6 +204,7 @@ impl Hnsw {
             seed,
             vectors: Vec::new(),
             links: Vec::new(),
+            attrs: Vec::new(),
             deleted: Vec::new(),
             entry_point: None,
             max_layer: 0,
@@ -220,6 +226,14 @@ impl Hnsw {
 
     pub fn metric(&self) -> Metric {
         self.metric
+    }
+
+    /// Filterable attribute row stored for `id`, in the order it was inserted.
+    /// An unknown id or an attribute-free node yields an empty slice (so a
+    /// predicate over a missing column simply doesn't match — never panics).
+    #[inline]
+    pub fn attrs(&self, id: usize) -> &[AttrValue] {
+        self.attrs.get(id).map(Vec::as_slice).unwrap_or(&[])
     }
 
     #[inline]
@@ -349,9 +363,22 @@ impl Hnsw {
         Ok(selected)
     }
 
-    /// Insert a vector, returning its node id. Dimensionality is fixed by the first
-    /// insert; later mismatches error rather than panic.
+    /// Insert a vector with no filterable attributes, returning its node id.
+    /// Equivalent to [`Hnsw::insert_with_attrs`] with an empty row.
     pub fn insert(&mut self, vector: Vec<f32>) -> Result<usize, HnswError> {
+        self.insert_with_attrs(vector, Vec::new())
+    }
+
+    /// Insert a vector and its filterable attribute row, returning its node id.
+    /// The row is stored verbatim, keyed by the id, for predicate-aware
+    /// traversal; it does not influence graph construction, so a graph built with
+    /// or without attributes is byte-identical. Dimensionality is fixed by the
+    /// first insert; later mismatches error rather than panic.
+    pub fn insert_with_attrs(
+        &mut self,
+        vector: Vec<f32>,
+        attrs: Vec<AttrValue>,
+    ) -> Result<usize, HnswError> {
         if vector.is_empty() {
             return Err(HnswError::EmptyVector);
         }
@@ -368,6 +395,7 @@ impl Hnsw {
         let level = self.random_level();
 
         self.vectors.push(vector);
+        self.attrs.push(attrs);
         self.deleted.push(false);
         let mut node_links: Vec<Vec<usize>> = Vec::with_capacity(level + 1);
         node_links.resize_with(level + 1, Vec::new);
@@ -518,15 +546,14 @@ impl Hnsw {
     /// Rebuild the graph from the live nodes only, dropping all tombstones, and
     /// return the new node count. Node ids are **not** stable across compaction
     /// (they're reassigned densely); a caller holding an external id↔node mapping
-    /// must rebuild it afterwards.
+    /// must rebuild it afterwards. Each live node's attribute row moves with it.
     pub fn compact(&mut self) -> Result<usize, HnswError> {
-        let live: Vec<Vec<f32>> = self
-            .vectors
-            .iter()
-            .zip(self.deleted.iter())
-            .filter(|(_, &deleted)| !deleted)
-            .map(|(v, _)| v.clone())
-            .collect();
+        let mut live: Vec<(Vec<f32>, Vec<AttrValue>)> = Vec::with_capacity(self.live_len());
+        for (id, &deleted) in self.deleted.iter().enumerate() {
+            if !deleted {
+                live.push((self.vectors[id].clone(), self.attrs[id].clone()));
+            }
+        }
         let mut fresh = Hnsw::new(HnswParams {
             m: self.m,
             ef_construction: self.ef_construction,
@@ -534,8 +561,8 @@ impl Hnsw {
             metric: self.metric,
             seed: self.seed,
         });
-        for v in live {
-            fresh.insert(v)?;
+        for (vector, attrs) in live {
+            fresh.insert_with_attrs(vector, attrs)?;
         }
         let n = fresh.len();
         *self = fresh;
@@ -895,6 +922,56 @@ mod tests {
             "survivor self-distance not ~0: {}",
             res[0].0
         );
+    }
+
+    #[test]
+    fn attributes_stored_and_survive_build() {
+        let mut h = Hnsw::new(HnswParams::default());
+        let a = h
+            .insert_with_attrs(
+                vec![1.0, 2.0],
+                vec![AttrValue::Int(42), AttrValue::Float(9.5)],
+            )
+            .unwrap();
+        let b = h
+            .insert_with_attrs(vec![3.0, 4.0], vec![AttrValue::Null])
+            .unwrap();
+        let c = h.insert(vec![5.0, 6.0]).unwrap(); // no attributes
+
+        assert_eq!(h.attrs(a), &[AttrValue::Int(42), AttrValue::Float(9.5)]);
+        assert_eq!(h.attrs(b), &[AttrValue::Null]);
+        assert!(h.attrs(c).is_empty());
+        // Unknown id is empty, not a panic.
+        assert!(h.attrs(999).is_empty());
+    }
+
+    #[test]
+    fn attributes_follow_nodes_through_compaction() {
+        // Each vector is tagged with an attribute encoding its identity, so we can
+        // confirm the row stayed paired with the right vector after the id remap.
+        let mut h = Hnsw::new(HnswParams::default());
+        let survivors = 0..40usize;
+        for i in survivors.clone() {
+            h.insert_with_attrs(vec![i as f32, 0.0], vec![AttrValue::Int(i as i64)])
+                .unwrap();
+        }
+        // Tombstone the even-numbered nodes.
+        for id in (0..h.len()).step_by(2) {
+            h.delete(id).unwrap();
+        }
+        h.compact().unwrap();
+
+        // For every odd marker that survived, find its new id and check the tag.
+        for i in survivors.filter(|i| i % 2 == 1) {
+            let res = h.search(&[i as f32, 0.0], 1, 32).unwrap();
+            assert_eq!(res.len(), 1);
+            let new_id = res[0].1;
+            assert_eq!(
+                h.attrs(new_id),
+                &[AttrValue::Int(i as i64)],
+                "vector {i} lost or mismatched its attribute after compaction"
+            );
+        }
     }
 
     #[test]
