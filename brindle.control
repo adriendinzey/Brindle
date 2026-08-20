@@ -2,4 +2,8 @@ comment = 'Brindle: filter-aware, hybrid vector search for PostgreSQL'
 default_version = '@CARGO_VERSION@'
 module_pathname = '$libdir/brindle'
 relocatable = false
-superuser = false
+# The install script runs CREATE ACCESS METHOD, which needs superuser rights.
+# trusted lets database owners install anyway: the script then runs as the
+# bootstrap superuser (same approach as pgvector).
+superuser = true
+trusted = true

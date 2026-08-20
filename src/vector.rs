@@ -31,6 +31,26 @@ impl Metric {
             Metric::InnerProduct => distance::negative_inner_product(a, b),
         }
     }
+
+    /// Stable on-disk discriminant for serialized indexes. Existing codes must
+    /// never be renumbered — persisted graphs decode through them.
+    pub fn code(self) -> u8 {
+        match self {
+            Metric::L2 => 0,
+            Metric::Cosine => 1,
+            Metric::InnerProduct => 2,
+        }
+    }
+
+    /// Inverse of [`Metric::code`]; `None` for an unknown discriminant.
+    pub fn from_code(code: u8) -> Option<Metric> {
+        match code {
+            0 => Some(Metric::L2),
+            1 => Some(Metric::Cosine),
+            2 => Some(Metric::InnerProduct),
+            _ => None,
+        }
+    }
 }
 
 /// Validate that `v` matches the expected dimensionality.
