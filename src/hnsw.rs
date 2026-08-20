@@ -171,25 +171,53 @@ pub struct Hnsw {
     rng: u64,
 }
 
+/// Summarizes the graph instead of dumping vectors and adjacency lists — a
+/// derived `Debug` would materialize gigabytes for a production-sized index.
+impl std::fmt::Debug for Hnsw {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Hnsw")
+            .field("len", &self.len())
+            .field("dim", &self.dim)
+            .field("metric", &self.metric)
+            .field("m", &self.m)
+            .field("max_layer", &self.max_layer)
+            .field("entry_point", &self.entry_point)
+            .finish_non_exhaustive()
+    }
+}
+
 impl Hnsw {
-    /// Create an empty index. `m` is clamped to ≥ 2 and `gamma` to ≥ 1;
-    /// dimensionality is fixed by the first inserted vector.
-    pub fn new(params: HnswParams) -> Self {
-        let m = params.m.max(2);
+    /// γ-scaled degree caps, the level normalizer, and the ef floor, derived
+    /// from `m` and a raw `gamma`. `gamma` is clamped to `[1, MAX_GAMMA]`
+    /// (non-finite ⇒ 1). One definition shared by construction and decoding so
+    /// the two can't drift. Returns `(gamma, m_cap, m0_cap, ml, ef_floor)`.
+    fn derived_params(m: usize, gamma: f32) -> (f32, usize, usize, f64, usize) {
         // γ below 1 would only thin the graph (defeating its purpose) and an
-        // unbounded γ would blow the degree caps up into absurd allocation sizes,
-        // so non-finite values mean "no densification" and finite ones clamp.
-        let gamma = if params.gamma.is_finite() {
-            params.gamma.clamp(1.0, HnswParams::MAX_GAMMA)
+        // unbounded γ would blow the degree caps up into absurd allocation
+        // sizes, so non-finite values mean "no densification" and finite ones
+        // clamp.
+        let gamma = if gamma.is_finite() {
+            gamma.clamp(1.0, HnswParams::MAX_GAMMA)
         } else {
             1.0
         };
         let m_cap = (m as f32 * gamma).round() as usize;
         let m0_cap = ((m * 2) as f32 * gamma).round() as usize;
+        // Level assignment stays tied to the base `m`: γ densifies within layers
+        // without reshaping the hierarchy.
+        let ml = 1.0 / (m as f64).ln();
         // A γ-dense layer-0 list only fills if the build pool supplies that many
         // candidates; without densification keep the historical `m` floor so
         // existing builds reproduce exactly.
         let ef_floor = if gamma > 1.0 { m0_cap } else { m };
+        (gamma, m_cap, m0_cap, ml, ef_floor)
+    }
+
+    /// Create an empty index. `m` is clamped to ≥ 2 and `gamma` to ≥ 1;
+    /// dimensionality is fixed by the first inserted vector.
+    pub fn new(params: HnswParams) -> Self {
+        let m = params.m.max(2);
+        let (gamma, m_cap, m0_cap, ml, ef_floor) = Self::derived_params(m, params.gamma);
         let seed = if params.seed == 0 {
             0x9E37_79B9_7F4A_7C15
         } else {
@@ -202,9 +230,7 @@ impl Hnsw {
             m_cap,
             m0_cap,
             ef_construction: params.ef_construction.max(ef_floor),
-            // Level assignment stays tied to the base `m`: γ densifies within
-            // layers without reshaping the hierarchy.
-            ml: 1.0 / (m as f64).ln(),
+            ml,
             dim: 0,
             seed,
             vectors: Vec::new(),
@@ -570,6 +596,322 @@ impl Hnsw {
         let n = fresh.len();
         *self = fresh;
         Ok(n)
+    }
+}
+
+/// Errors from decoding a graph serialized by [`Hnsw::to_bytes`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HnswDecodeError {
+    /// The input ended before the encoding said it would.
+    Truncated,
+    /// The input doesn't start with the serialized-graph magic.
+    BadMagic,
+    /// The format version is one this build doesn't understand.
+    UnsupportedVersion { got: u16 },
+    /// A structurally impossible value (bad metric code, id out of range, …).
+    Invalid(&'static str),
+}
+
+impl std::fmt::Display for HnswDecodeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            HnswDecodeError::Truncated => write!(f, "serialized graph is truncated"),
+            HnswDecodeError::BadMagic => write!(f, "not a serialized graph (bad magic)"),
+            HnswDecodeError::UnsupportedVersion { got } => {
+                write!(f, "unsupported graph format version {got}")
+            }
+            HnswDecodeError::Invalid(what) => write!(f, "invalid serialized graph: {what}"),
+        }
+    }
+}
+
+impl std::error::Error for HnswDecodeError {}
+
+const CODEC_MAGIC: u32 = 0x4248_4E57; // "BHNW"
+const CODEC_VERSION: u16 = 1;
+
+/// Bounds-checked little-endian reader over untrusted bytes. Every accessor
+/// errors (never panics) past the end of the buffer.
+struct ByteReader<'a> {
+    buf: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> ByteReader<'a> {
+    fn new(buf: &'a [u8]) -> Self {
+        Self { buf, pos: 0 }
+    }
+
+    fn take(&mut self, n: usize) -> Result<&'a [u8], HnswDecodeError> {
+        let end = self
+            .pos
+            .checked_add(n)
+            .filter(|&end| end <= self.buf.len())
+            .ok_or(HnswDecodeError::Truncated)?;
+        let slice = &self.buf[self.pos..end];
+        self.pos = end;
+        Ok(slice)
+    }
+
+    fn u8(&mut self) -> Result<u8, HnswDecodeError> {
+        Ok(self.take(1)?[0])
+    }
+
+    fn u16(&mut self) -> Result<u16, HnswDecodeError> {
+        let s = self.take(2)?;
+        Ok(u16::from_le_bytes([s[0], s[1]]))
+    }
+
+    fn u32(&mut self) -> Result<u32, HnswDecodeError> {
+        let s = self.take(4)?;
+        Ok(u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
+    }
+
+    fn u64(&mut self) -> Result<u64, HnswDecodeError> {
+        let s = self.take(8)?;
+        Ok(u64::from_le_bytes([
+            s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7],
+        ]))
+    }
+
+    /// A `u64` that must fit in `usize` (counts, ids, sizes).
+    fn len(&mut self) -> Result<usize, HnswDecodeError> {
+        usize::try_from(self.u64()?)
+            .map_err(|_| HnswDecodeError::Invalid("value exceeds address space"))
+    }
+
+    fn remaining(&self) -> usize {
+        self.buf.len() - self.pos
+    }
+
+    fn done(&self) -> bool {
+        self.pos == self.buf.len()
+    }
+}
+
+impl Hnsw {
+    /// Upper bound on the byte length of this graph's serialization. Exact for
+    /// a freshly built graph (degree caps hold); a safe over-estimate after
+    /// pruning only leaves neighbor lists shorter. Use it to size a buffer
+    /// before [`Hnsw::to_bytes_into`].
+    pub fn serialized_len_hint(&self) -> usize {
+        let per_node = 13 + self.dim * 4 + (self.m0_cap + 2) * 8;
+        72 + self.vectors.len() * per_node
+    }
+
+    /// Serialize the graph to a self-contained, versioned little-endian blob.
+    /// The PRNG state is included, so a graph restored with [`Hnsw::from_bytes`]
+    /// continues inserting exactly as the original would have.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.serialized_len_hint());
+        self.to_bytes_into(&mut out);
+        out
+    }
+
+    /// Append this graph's serialization to `out`. Lets a caller frame the
+    /// graph into a larger buffer (e.g. a length-prefixed on-disk payload)
+    /// without allocating a standalone graph blob first.
+    pub fn to_bytes_into(&self, out: &mut Vec<u8>) {
+        // This interim codec persists graph structure only, not attribute rows:
+        // build-produced graphs carry none, and predicate persistence is a
+        // later feature. Trip loudly if an attr-bearing graph reaches here
+        // before the format is extended.
+        debug_assert!(
+            self.attrs.iter().all(|a| a.is_empty()),
+            "codec v1 does not persist attribute rows"
+        );
+        out.reserve(self.serialized_len_hint());
+        out.extend_from_slice(&CODEC_MAGIC.to_le_bytes());
+        out.extend_from_slice(&CODEC_VERSION.to_le_bytes());
+        out.push(self.metric.code());
+        out.push(0); // reserved
+        out.extend_from_slice(&(self.m as u64).to_le_bytes());
+        out.extend_from_slice(&self.gamma.to_bits().to_le_bytes());
+        out.extend_from_slice(&(self.ef_construction as u64).to_le_bytes());
+        out.extend_from_slice(&(self.dim as u64).to_le_bytes());
+        out.extend_from_slice(&(self.max_layer as u64).to_le_bytes());
+        out.extend_from_slice(&self.seed.to_le_bytes());
+        out.extend_from_slice(&self.rng.to_le_bytes());
+        let entry = self.entry_point.map_or(u64::MAX, |e| e as u64);
+        out.extend_from_slice(&entry.to_le_bytes());
+        out.extend_from_slice(&(self.vectors.len() as u64).to_le_bytes());
+        for id in 0..self.vectors.len() {
+            out.push(u8::from(self.deleted[id]));
+            out.extend_from_slice(&(self.links[id].len() as u64).to_le_bytes());
+            for x in &self.vectors[id] {
+                out.extend_from_slice(&x.to_le_bytes());
+            }
+            for layer in &self.links[id] {
+                out.extend_from_slice(&(layer.len() as u64).to_le_bytes());
+                for &neighbor in layer {
+                    out.extend_from_slice(&(neighbor as u64).to_le_bytes());
+                }
+            }
+        }
+    }
+
+    /// Reconstruct a graph serialized by [`Hnsw::to_bytes`].
+    ///
+    /// Validates everything needed for memory safety (magic, version, id
+    /// ranges, flag values); the graph's *quality* invariants (degree caps,
+    /// neighbor choice) are trusted as-is, since a well-formed-but-worse graph
+    /// only degrades recall, never safety.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, HnswDecodeError> {
+        let mut r = ByteReader::new(bytes);
+        if r.u32()? != CODEC_MAGIC {
+            return Err(HnswDecodeError::BadMagic);
+        }
+        let version = r.u16()?;
+        if version != CODEC_VERSION {
+            return Err(HnswDecodeError::UnsupportedVersion { got: version });
+        }
+        let metric =
+            Metric::from_code(r.u8()?).ok_or(HnswDecodeError::Invalid("unknown metric code"))?;
+        let _reserved = r.u8()?;
+        let m = r.len()?;
+        if m < 2 {
+            return Err(HnswDecodeError::Invalid("m out of range"));
+        }
+        let gamma = f32::from_bits(r.u32()?);
+        if !gamma.is_finite() || !(1.0..=HnswParams::MAX_GAMMA).contains(&gamma) {
+            return Err(HnswDecodeError::Invalid("gamma out of range"));
+        }
+        // Same derivation `new()` uses, so a decoded graph's degree caps and ef
+        // floor match a freshly built one's.
+        let (_, m_cap, m0_cap, ml, ef_floor) = Self::derived_params(m, gamma);
+        let ef_construction = r.len()?;
+        if ef_construction < ef_floor {
+            return Err(HnswDecodeError::Invalid("ef_construction below floor"));
+        }
+        let dim = r.len()?;
+        let max_layer = r.len()?;
+        let seed = r.u64()?;
+        let rng = r.u64()?;
+        // Encoded graphs come from `new()`, which never produces a zero seed
+        // or zero PRNG state (xorshift preserves nonzero-ness).
+        if seed == 0 || rng == 0 {
+            return Err(HnswDecodeError::Invalid("PRNG state must be nonzero"));
+        }
+        let entry_raw = r.u64()?;
+        let n = r.len()?;
+        let entry_point = if entry_raw == u64::MAX {
+            None
+        } else {
+            let e = usize::try_from(entry_raw)
+                .ok()
+                .filter(|&e| e < n)
+                .ok_or(HnswDecodeError::Invalid("entry point out of range"))?;
+            Some(e)
+        };
+        if n > 0 && entry_point.is_none() {
+            return Err(HnswDecodeError::Invalid(
+                "nonempty graph without entry point",
+            ));
+        }
+        if n > 0 && dim == 0 {
+            return Err(HnswDecodeError::Invalid(
+                "nonempty graph with zero dimension",
+            ));
+        }
+
+        let vector_bytes = dim
+            .checked_mul(4)
+            .ok_or(HnswDecodeError::Invalid("dimension out of range"))?;
+        // Pre-size from `n` only up to what the remaining bytes could possibly
+        // hold, so a corrupt count can't trigger a huge allocation. Same
+        // pattern below for per-node level and link counts. `saturating_add`
+        // because `vector_bytes` can be near `usize::MAX` on a crafted blob.
+        let min_node_bytes = 17usize.saturating_add(vector_bytes);
+        let plausible_n = n.min(r.remaining() / min_node_bytes);
+        let mut vectors: Vec<Vec<f32>> = Vec::with_capacity(plausible_n);
+        let mut links: Vec<Vec<Vec<usize>>> = Vec::with_capacity(plausible_n);
+        let mut deleted: Vec<bool> = Vec::with_capacity(plausible_n);
+        for _ in 0..n {
+            deleted.push(match r.u8()? {
+                0 => false,
+                1 => true,
+                _ => return Err(HnswDecodeError::Invalid("bad tombstone flag")),
+            });
+            let levels = r.len()?;
+            if levels == 0 {
+                return Err(HnswDecodeError::Invalid("node with no layers"));
+            }
+            if levels - 1 > max_layer {
+                return Err(HnswDecodeError::Invalid("node above the top layer"));
+            }
+            let raw = r.take(vector_bytes)?;
+            let mut vector = Vec::with_capacity(dim);
+            for c in raw.chunks_exact(4) {
+                vector.push(f32::from_le_bytes([c[0], c[1], c[2], c[3]]));
+            }
+            vectors.push(vector);
+            if levels > r.remaining() / 8 {
+                return Err(HnswDecodeError::Truncated);
+            }
+            let mut node_links = Vec::with_capacity(levels);
+            for _ in 0..levels {
+                let count = r.len()?;
+                if count > r.remaining() / 8 {
+                    return Err(HnswDecodeError::Truncated);
+                }
+                let mut layer = Vec::with_capacity(count);
+                for _ in 0..count {
+                    let id = r.len()?;
+                    if id >= n {
+                        return Err(HnswDecodeError::Invalid("link target out of range"));
+                    }
+                    layer.push(id);
+                }
+                node_links.push(layer);
+            }
+            links.push(node_links);
+        }
+        if !r.done() {
+            return Err(HnswDecodeError::Invalid("trailing bytes"));
+        }
+
+        // `insert` maintains "the entry point owns the top layer"; a graph
+        // violating it would panic in a later insert's layer indexing, so
+        // reject it here. This also bounds max_layer by a real node's layer
+        // count, keeping search's top-down descent finite.
+        match entry_point {
+            Some(e) => {
+                // `len() - 1` cannot underflow: every node has ≥ 1 layer.
+                if links[e].len() - 1 != max_layer {
+                    return Err(HnswDecodeError::Invalid(
+                        "entry point does not own the top layer",
+                    ));
+                }
+            }
+            None => {
+                if max_layer != 0 {
+                    return Err(HnswDecodeError::Invalid(
+                        "empty graph with nonzero top layer",
+                    ));
+                }
+            }
+        }
+
+        Ok(Self {
+            metric,
+            m,
+            gamma,
+            m_cap,
+            m0_cap,
+            ef_construction,
+            ml,
+            dim,
+            seed,
+            vectors,
+            links,
+            // Build-produced graphs carry no attribute rows; reconstruct the
+            // parallel table empty so `attrs(id)` stays consistent.
+            attrs: vec![Vec::new(); n],
+            deleted,
+            entry_point,
+            max_layer,
+            rng,
+        })
     }
 }
 
@@ -973,6 +1315,143 @@ mod tests {
                 h.attrs(new_id),
                 &[AttrValue::Int(i as i64)],
                 "vector {i} lost or mismatched its attribute after compaction"
+            );
+        }
+    }
+
+    #[test]
+    fn bytes_round_trip_preserves_graph() {
+        let (mut h, _) = build(250, 12, 21);
+        h.delete(17).unwrap();
+        h.delete(42).unwrap();
+        let restored = Hnsw::from_bytes(&h.to_bytes()).expect("decode");
+        assert_eq!(restored.links, h.links, "neighbor lists must round-trip");
+        assert_eq!(restored.entry_point, h.entry_point);
+        assert_eq!(restored.vectors, h.vectors);
+        assert_eq!(restored.deleted, h.deleted);
+        assert_eq!(restored.max_layer, h.max_layer);
+        assert_eq!(restored.dim(), h.dim());
+        assert_eq!(restored.metric(), h.metric());
+        assert_eq!(
+            (
+                restored.m,
+                restored.m_cap,
+                restored.m0_cap,
+                restored.ef_construction
+            ),
+            (h.m, h.m_cap, h.m0_cap, h.ef_construction)
+        );
+        assert_eq!(restored.gamma, h.gamma);
+        assert_eq!((restored.seed, restored.rng), (h.seed, h.rng));
+    }
+
+    #[test]
+    fn bytes_round_trip_preserves_gamma() {
+        // A γ-dense graph must come back with the same density (caps derive from
+        // the persisted γ) and the same neighbor lists.
+        let (h, _) = build_gamma(200, 12, 7, 4.0);
+        let restored = Hnsw::from_bytes(&h.to_bytes()).expect("decode");
+        assert_eq!(restored.gamma, 4.0);
+        assert_eq!(
+            (restored.m_cap, restored.m0_cap),
+            (h.m_cap, h.m0_cap),
+            "degree caps must survive the round-trip"
+        );
+        assert_eq!(restored.links, h.links);
+    }
+
+    #[test]
+    fn bytes_round_trip_empty_index() {
+        let h = Hnsw::new(HnswParams::default());
+        let restored = Hnsw::from_bytes(&h.to_bytes()).expect("decode");
+        assert!(restored.is_empty());
+        assert_eq!(restored.dim(), 0);
+        assert_eq!(restored.entry_point, None);
+        assert!(restored.search(&[1.0, 2.0], 5, 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn restored_index_inserts_identically() {
+        let (mut original, _) = build(80, 8, 33);
+        let mut restored = Hnsw::from_bytes(&original.to_bytes()).unwrap();
+        let mut rng = 0xFEED_u64;
+        for _ in 0..40 {
+            let v: Vec<f32> = (0..8).map(|_| next_f64(&mut rng) as f32).collect();
+            original.insert(v.clone()).unwrap();
+            restored.insert(v).unwrap();
+        }
+        assert_eq!(original.links, restored.links);
+        assert_eq!(original.entry_point, restored.entry_point);
+    }
+
+    #[test]
+    fn decode_rejects_bad_magic() {
+        let (h, _) = build(10, 4, 1);
+        let mut bytes = h.to_bytes();
+        bytes[0] ^= 0xFF;
+        assert_eq!(
+            Hnsw::from_bytes(&bytes).unwrap_err(),
+            HnswDecodeError::BadMagic
+        );
+    }
+
+    #[test]
+    fn decode_rejects_newer_version() {
+        let (h, _) = build(10, 4, 1);
+        let mut bytes = h.to_bytes();
+        bytes[4] = 0xFF; // version lives right after the 4-byte magic
+        assert!(matches!(
+            Hnsw::from_bytes(&bytes),
+            Err(HnswDecodeError::UnsupportedVersion { .. })
+        ));
+    }
+
+    #[test]
+    fn decode_rejects_inflated_max_layer() {
+        // Corrupting max_layer must fail the entry-point/top-layer check
+        // instead of decoding into a graph whose search loops over phantom
+        // layers (or whose next insert panics).
+        let (h, _) = build(10, 4, 1);
+        let mut bytes = h.to_bytes();
+        // Layout: magic(4) version(2) metric(1) reserved(1) m(8) gamma(4) ef(8)
+        // dim(8), then max_layer at offset 36.
+        bytes[36..44].copy_from_slice(&(h.max_layer as u64 + 1).to_le_bytes());
+        assert_eq!(
+            Hnsw::from_bytes(&bytes).unwrap_err(),
+            HnswDecodeError::Invalid("entry point does not own the top layer")
+        );
+    }
+
+    #[test]
+    fn decode_rejects_nonzero_max_layer_on_empty_graph() {
+        let h = Hnsw::new(HnswParams::default());
+        let mut bytes = h.to_bytes();
+        bytes[36..44].copy_from_slice(&1u64.to_le_bytes());
+        assert_eq!(
+            Hnsw::from_bytes(&bytes).unwrap_err(),
+            HnswDecodeError::Invalid("empty graph with nonzero top layer")
+        );
+    }
+
+    #[test]
+    fn decode_rejects_trailing_bytes() {
+        let (h, _) = build(10, 4, 1);
+        let mut bytes = h.to_bytes();
+        bytes.push(0);
+        assert_eq!(
+            Hnsw::from_bytes(&bytes).unwrap_err(),
+            HnswDecodeError::Invalid("trailing bytes")
+        );
+    }
+
+    #[test]
+    fn decode_of_any_prefix_errors_not_panics() {
+        let (h, _) = build(12, 4, 5);
+        let bytes = h.to_bytes();
+        for cut in 0..bytes.len() {
+            assert!(
+                Hnsw::from_bytes(&bytes[..cut]).is_err(),
+                "prefix of {cut} bytes decoded successfully"
             );
         }
     }
