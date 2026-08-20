@@ -71,6 +71,15 @@ jobs:
           PG_CONFIG=/usr/lib/postgresql/${{ matrix.pg }}/bin/pg_config
           sudo chown -R "$(id -un)" "$($PG_CONFIG --pkglibdir)" "$($PG_CONFIG --sharedir)/extension"
 
+      # `cargo pgrx test` puts its ephemeral test cluster in target/test-pgdata,
+      # which rust-cache saves and restores as part of target/. A restored data
+      # dir makes the pgrx test harness skip initdb and then fail to start
+      # Postgres ("could not access .../postgresql.conf: No such file"), which
+      # takes down every SQL test. Delete any restored copy so each run initdb's
+      # a fresh cluster.
+      - name: Clear cached pgrx test cluster
+        run: rm -rf target/test-pgdata
+
       - name: Clippy
         run: cargo clippy --no-default-features --features pg${{ matrix.pg }} -- -D warnings
 
