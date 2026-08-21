@@ -112,7 +112,16 @@ pub fn parse_literal(input: &str) -> Result<Vec<f32>, VectorError> {
         return Err(VectorError::Empty);
     }
 
-    let mut values = Vec::with_capacity(body.split(',').count());
+    // The field count comes straight from user input, so it is checked before
+    // it sizes an allocation: a literal of a billion commas must raise, not
+    // reserve gigabytes (a Rust allocation failure aborts the backend, where a
+    // rejected literal is just an ERROR).
+    let count = body.split(',').count();
+    if count > MAX_DIM {
+        return Err(VectorError::TooManyDimensions(count));
+    }
+
+    let mut values = Vec::with_capacity(count);
     for (index, field) in body.split(',').enumerate() {
         let value: f32 = field
             .trim()
@@ -484,6 +493,17 @@ mod literal_tests {
     }
 
     #[test]
+    fn rejects_an_oversized_literal_before_sizing_an_allocation() {
+        // All fields are empty, so an element-by-element parse would fail on the
+        // first one — the dimension count has to be rejected on its own.
+        let literal = format!("[{}]", ",".repeat(MAX_DIM + 1));
+        assert_eq!(
+            parse_literal(&literal),
+            Err(VectorError::TooManyDimensions(MAX_DIM + 2))
+        );
+    }
+
+    #[test]
     fn rejects_values_that_cannot_rank() {
         assert_eq!(parse_literal("[1,NaN]"), Err(VectorError::NonFinite(1)));
         assert_eq!(parse_literal("[inf]"), Err(VectorError::NonFinite(0)));
@@ -580,6 +600,11 @@ mod tests {
     #[pg_test(error = "brindle: malformed vector literal: expected '[' at the start")]
     fn rejects_a_malformed_literal() {
         Spi::run("SELECT '1,2,3'::brindle_vector").expect("cast");
+    }
+
+    #[pg_test(error = "brindle: vector must have at least one dimension")]
+    fn rejects_an_empty_array() {
+        Spi::run("SELECT '{}'::real[]::brindle_vector").expect("cast");
     }
 
     #[pg_test(error = "brindle: vector must be a one-dimensional array")]
