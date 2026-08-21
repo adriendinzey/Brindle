@@ -12,7 +12,10 @@
 //! to the caller. It fetches a batch and grows on demand:
 //!
 //! 1. The first batch searches the graph with a candidate budget of
-//!    [`DEFAULT_EF_SEARCH`].
+//!    `brindle.ef_search`, read at the start of each scan so a session can
+//!    retune accuracy against latency without rebuilding anything.
+//!    TODO: let a per-index reloption override the session setting, so one
+//!    index can be tuned without moving every scan in the session.
 //! 2. Draining a batch doubles the budget and re-runs the search from scratch.
 //!    A wider search is not a strict superset of a narrower one, so results
 //!    already handed to the executor are filtered out by node id — a row is
@@ -38,12 +41,8 @@ use pgrx::{pg_guard, pg_sys};
 
 use super::opclass;
 use super::storage::{self, TidPair};
+use crate::guc;
 use crate::hnsw::{Hnsw, HnswError};
-
-/// Layer-0 candidate budget for a scan's first batch. Larger means better recall
-/// and more work per query.
-// TODO: read this from a `brindle.ef_search` GUC and per-index reloptions.
-const DEFAULT_EF_SEARCH: usize = 64;
 
 /// Errors raised while producing scan results.
 #[derive(Debug)]
@@ -105,7 +104,7 @@ impl ScanSearch {
             query: Vec::new(),
             batch: Vec::new(),
             cursor: 0,
-            budget: DEFAULT_EF_SEARCH,
+            budget: guc::ef_search(),
             emitted: HashSet::new(),
             drained: true,
         }
@@ -116,7 +115,9 @@ impl ScanSearch {
         self.query = query;
         self.batch.clear();
         self.cursor = 0;
-        self.budget = DEFAULT_EF_SEARCH;
+        // Re-read per scan: a session that raised ef_search expects the next
+        // query to use it, not the value in force when the scan was opened.
+        self.budget = guc::ef_search();
         self.emitted.clear();
         self.drained = false;
         self.refill()
@@ -332,6 +333,9 @@ pub(super) unsafe extern "C" fn amendscan(scan: pg_sys::IndexScanDesc) {
 #[pg_schema]
 mod tests {
     use pgrx::prelude::*;
+    use pgrx::PgRelation;
+
+    use super::{storage, ScanSearch};
 
     const DIM: usize = 8;
     /// Big enough that a graph search (rather than the exact tail) answers a
@@ -605,6 +609,39 @@ mod tests {
             ids.iter().all(|&id| id > 500),
             "partial index returned rows outside its predicate: {ids:?}"
         );
+    }
+
+    /// The session's `brindle.ef_search` is what sizes a scan's first batch —
+    /// asserted on the scan state itself, since the budget only changes how hard
+    /// the scan looks, not the rows it ends up returning.
+    #[pg_test]
+    fn ef_search_sizes_the_scans_candidate_budget() {
+        create_indexed_fixture("t_ef", 200);
+        let (hnsw, tids) = {
+            // SAFETY: the index exists; PgRelation holds AccessShare on it.
+            let relation = unsafe { PgRelation::open_with_name("t_ef_idx") }.expect("open index");
+            unsafe { storage::load_index(relation.as_ptr()) }
+        };
+
+        Spi::run("SET brindle.ef_search = 137").expect("set");
+        let mut search = ScanSearch::new(hnsw, tids);
+        assert_eq!(
+            search.budget, 137,
+            "a new scan starts at the session's value"
+        );
+
+        // `start` fills the first batch, and filling one doubles the budget for
+        // the next, so what is left behind is twice the session's setting.
+        Spi::run("SET brindle.ef_search = 41").expect("set");
+        search.start(QUERY.to_vec()).expect("start");
+        assert_eq!(
+            search.budget, 82,
+            "restarting a scan searches at a value set since it was opened"
+        );
+
+        Spi::run("RESET brindle.ef_search").expect("reset");
+        search.start(QUERY.to_vec()).expect("start");
+        assert_eq!(search.budget, 128, "reset returns the scan to the default");
     }
 
     #[pg_test(error = "brindle: vector dimension mismatch: expected 8, got 2")]
