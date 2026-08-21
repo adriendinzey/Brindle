@@ -297,6 +297,9 @@ pub(super) unsafe extern "C" fn amgettuple(
         error!("brindle: index scans only run forward");
     }
 
+    // `scan.kill_prior_tuple` asks the AM to mark the previously returned
+    // entry dead. Recording that needs the same machinery as vacuum
+    // integration; ignoring the hint is always legal, just less efficient.
     match scan_search(scan).next() {
         Ok(Some((block, offset))) => {
             item_pointer_set_all(&mut (*scan).xs_heaptid, block, offset);

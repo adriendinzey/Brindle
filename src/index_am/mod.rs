@@ -230,9 +230,18 @@ unsafe extern "C" fn ambulkdelete(
     _callback_state: *mut c_void,
 ) -> *mut pg_sys::IndexBulkDeleteResult {
     // TODO: propagate dead TIDs into graph tombstones. Until then dead heap
-    // tuples merely linger in the graph, costing space and recall, not
-    // correctness. Passing `stats` through (possibly NULL) tells VACUUM we
-    // have nothing to report, which is the truth.
+    // tuples linger in the graph, costing space and recall.
+    //
+    // Skipping the callback is only safe because `aminsert` rejects every
+    // INSERT and UPDATE. VACUUM takes our silence to mean the index holds no
+    // reference to the dead TIDs and recycles their line pointers, so a table
+    // that could still gain tuples would eventually hand one of those slots to
+    // an unrelated row — which a scan would then return as if it were the
+    // indexed one. Whoever lifts the `aminsert` restriction has to honor this
+    // callback in the same change.
+    //
+    // Passing `stats` through (possibly NULL) tells VACUUM we have nothing to
+    // report, which is the truth.
     stats
 }
 

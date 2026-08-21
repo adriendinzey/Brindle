@@ -15,9 +15,23 @@ versions may break).
   to SQL as `brindle_l2_distance`, `brindle_cosine_distance`,
   `brindle_inner_product`, and `brindle_negative_inner_product` over `real[]`.
 - Pure-Rust in-memory HNSW graph: construction, layered search, brute-force
-  reference search, and soft-delete with compaction (not yet wired to a
-  Postgres index access method).
+  reference search, and soft-delete with compaction.
+- The `brindle` index access method: `CREATE INDEX ... USING brindle (embedding)`
+  builds an HNSW graph over a `real[]` column and stores it in the index
+  relation.
+- Nearest-neighbor index scans — `SELECT ... ORDER BY embedding <-> $1 LIMIT k`
+  is answered from the index, nearest first, through the new `<->` L2 distance
+  operator over `real[]` and the default `real_array_l2_ops` operator class.
+  A scan asked for more rows than one search budget holds keeps widening until
+  it has returned every matching row, so an unfiltered `ORDER BY` is complete
+  rather than truncated.
 - Criterion micro-benchmarks for the distance kernels.
 - CI: rustfmt, clippy, and pgrx integration tests on PostgreSQL 16 and 17.
 - Repository hygiene: PR/issue templates, Dependabot (cargo + GitHub Actions),
   contributor guide.
+
+### Known limitations
+
+- A table is effectively read-only once a brindle index exists on it: `INSERT`
+  and `UPDATE` raise an error until incremental insert lands. Load the data
+  first, then create the index, and `REINDEX` after further loads.
