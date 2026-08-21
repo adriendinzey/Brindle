@@ -25,6 +25,13 @@ versions may break).
   A scan asked for more rows than one search budget holds keeps widening until
   it has returned every matching row, so an unfiltered `ORDER BY` is complete
   rather than truncated.
+- Rows inserted after `CREATE INDEX` are picked up automatically — `INSERT` and
+  `UPDATE` no longer error, and the new vectors are findable through an index
+  scan without a `REINDEX`. Each insert rewrites the stored graph, so the cost
+  is proportional to index size: bulk loads are still far faster as `COPY`
+  followed by `CREATE INDEX`.
+- `VACUUM` integration: entries for deleted rows are tombstoned so the index
+  never returns a heap slot that has been recycled for a different row.
 - Criterion micro-benchmarks for the distance kernels.
 - CI: rustfmt, clippy, and pgrx integration tests on PostgreSQL 16 and 17.
 - Repository hygiene: PR/issue templates, Dependabot (cargo + GitHub Actions),

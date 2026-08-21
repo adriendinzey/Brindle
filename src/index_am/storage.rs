@@ -160,25 +160,34 @@ const PAGE_CONTENTS_OFFSET: usize =
 /// Usable bytes per data page.
 const PAGE_CHUNK_CAPACITY: usize = pg_sys::BLCKSZ as usize - PAGE_CONTENTS_OFFSET;
 
-/// Append one initialized page holding `contents` to `forknum`.
+/// Write `contents` as a freshly initialized page at `blkno`, or as a newly
+/// appended page when `blkno` is [`pg_sys::InvalidBlockNumber`] (Postgres'
+/// `P_NEW`).
 ///
 /// # Safety
-/// `index` must be an open index relation this backend may extend; `contents`
-/// must fit in [`PAGE_CHUNK_CAPACITY`].
-unsafe fn append_page(index: pg_sys::Relation, forknum: pg_sys::ForkNumber::Type, contents: &[u8]) {
+/// `index` must be an open index relation this backend may write and extend,
+/// with every other writer excluded; `contents` must fit in
+/// [`PAGE_CHUNK_CAPACITY`].
+unsafe fn write_page(
+    index: pg_sys::Relation,
+    forknum: pg_sys::ForkNumber::Type,
+    blkno: pg_sys::BlockNumber,
+    contents: &[u8],
+) {
     if contents.len() > PAGE_CHUNK_CAPACITY {
         error!(
             "brindle: page chunk of {} bytes exceeds page capacity",
             contents.len()
         );
     }
-    // SAFETY: P_NEW (InvalidBlockNumber) extends the fork by one page; the
-    // relation is ours to extend (build holds an exclusive lock), and the
-    // buffer stays pinned+locked until the copy below is done.
+    // SAFETY: an existing block is re-read in place, while P_NEW
+    // (InvalidBlockNumber) extends the fork by one page. Either way the
+    // relation is ours to write (callers exclude other writers) and the buffer
+    // stays pinned+locked until the copy below is done.
     let buffer = pg_sys::ReadBufferExtended(
         index,
         forknum,
-        pg_sys::InvalidBlockNumber,
+        blkno,
         pg_sys::ReadBufferMode::RBM_NORMAL,
         core::ptr::null_mut(),
     );
@@ -213,15 +222,64 @@ pub unsafe fn write_index_blob(
         error!("brindle: refusing to overwrite a non-empty index fork");
     }
 
-    append_page(index, forknum, &encode_meta(blob.len() as u64));
+    write_page(
+        index,
+        forknum,
+        pg_sys::InvalidBlockNumber,
+        &encode_meta(blob.len() as u64),
+    );
     for chunk in blob.chunks(PAGE_CHUNK_CAPACITY) {
-        append_page(index, forknum, chunk);
+        write_page(index, forknum, pg_sys::InvalidBlockNumber, chunk);
+    }
+    log_fork_pages(index, forknum);
+}
+
+/// Replace the main fork's contents with `blob`, reusing the pages already
+/// allocated and extending only when the blob outgrows them.
+///
+/// No caller shrinks the blob yet — inserting appends a node and tombstoning
+/// flips a byte the encoding already carries — so the tail-clearing pass below
+/// exists for the compaction that will reclaim tombstoned nodes. Leftover pages
+/// are re-initialized empty rather than truncated away: shrinking a relation
+/// needs a lock this path doesn't hold, and [`read_index_blob`] concatenates
+/// only each page's used bytes, so an empty tail page contributes nothing.
+///
+/// # Safety
+/// `index` must be an open index relation this backend may write, and the
+/// caller must hold [`IMAGE_LOCK_BLOCK`] exclusively. That excludes writers —
+/// the rewrite is not atomic, so a second one would interleave with it — and
+/// readers, who would otherwise splice together halves of two images.
+pub unsafe fn rewrite_index_blob(index: pg_sys::Relation, blob: &[u8]) {
+    let forknum = pg_sys::ForkNumber::MAIN_FORKNUM;
+    let existing = pg_sys::RelationGetNumberOfBlocksInFork(index, forknum);
+
+    let meta = encode_meta(blob.len() as u64);
+    let mut blkno: pg_sys::BlockNumber = 0;
+    for contents in core::iter::once(&meta[..]).chain(blob.chunks(PAGE_CHUNK_CAPACITY)) {
+        let target = if blkno < existing {
+            blkno
+        } else {
+            pg_sys::InvalidBlockNumber
+        };
+        write_page(index, forknum, target, contents);
+        blkno += 1;
+    }
+    while blkno < existing {
+        write_page(index, forknum, blkno, &[]);
+        blkno += 1;
     }
 
-    // WAL-log full page images so the build survives a crash and reaches
-    // replicas. The init fork of an unlogged index must always be logged (it
-    // seeds the main fork after recovery); the main fork only when the
-    // relation is WAL-logged at all.
+    log_fork_pages(index, forknum);
+}
+
+/// WAL-log every page of `forknum` as a full page image, so the contents
+/// survive a crash and reach replicas. The init fork of an unlogged index must
+/// always be logged (it seeds the main fork after recovery); the main fork only
+/// when the relation is WAL-logged at all.
+///
+/// # Safety
+/// `index` must be an open index relation this backend may read.
+unsafe fn log_fork_pages(index: pg_sys::Relation, forknum: pg_sys::ForkNumber::Type) {
     // SAFETY: rd_rel is always a valid Form_pg_class for an open relation.
     let needs_wal = forknum == pg_sys::ForkNumber::INIT_FORKNUM
         || (*(*index).rd_rel).relpersistence == pg_sys::RELPERSISTENCE_PERMANENT as c_char;
@@ -312,16 +370,34 @@ pub unsafe fn read_index_blob(index: pg_sys::Relation) -> Vec<u8> {
     blob
 }
 
-/// The one way to load a persisted index: read the blob, decode both halves,
-/// and enforce the invariant that ties them together — `tids[i]` addresses
-/// graph node `i`, so the table must cover every node. All future readers
-/// (scans, incremental inserts, vacuum) go through here rather than
-/// re-deriving that check.
+/// Block whose heavyweight page lock arbitrates the stored image: share to read
+/// it whole, exclusive to replace it. Nothing about the metapage itself matters
+/// — it is simply the one block every index has, so it names the whole image in
+/// the lock manager.
+///
+/// The image spans pages that a rewrite cannot update atomically, and buffer
+/// locks are too short-lived to span the whole traversal, so this is what keeps
+/// a reader from splicing together halves of two different images. It also
+/// serializes writers against each other, which a lost update would otherwise
+/// need. Both jobs go away with page-structured storage, where an update
+/// touches only the pages it changes.
+pub const IMAGE_LOCK_BLOCK: pg_sys::BlockNumber = 0;
+
+/// The one way to load a persisted index: read the blob under the image lock,
+/// decode both halves, and enforce the invariant that ties them together —
+/// `tids[i]` addresses graph node `i`, so the table must cover every node. All
+/// readers (scans, incremental inserts, vacuum) go through here rather than
+/// re-deriving that check or the locking.
 ///
 /// # Safety
 /// `index` must be an open brindle index relation locked at least AccessShare.
 pub unsafe fn load_index(index: pg_sys::Relation) -> (Hnsw, Vec<TidPair>) {
+    // A writer already holding the exclusive lock re-enters here freely: the
+    // lock manager never conflicts a request with the requester's own locks.
+    pg_sys::LockPage(index, IMAGE_LOCK_BLOCK, pg_sys::ShareLock as i32);
     let blob = read_index_blob(index);
+    pg_sys::UnlockPage(index, IMAGE_LOCK_BLOCK, pg_sys::ShareLock as i32);
+
     let (graph_bytes, tids) =
         decode_index_payload(&blob).unwrap_or_else(|e| error!("brindle: {e}"));
     let hnsw = Hnsw::from_bytes(graph_bytes).unwrap_or_else(|e| error!("brindle: {e}"));
