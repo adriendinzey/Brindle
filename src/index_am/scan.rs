@@ -36,6 +36,7 @@ use pgrx::itemptr::item_pointer_set_all;
 use pgrx::prelude::*;
 use pgrx::{pg_guard, pg_sys};
 
+use super::opclass;
 use super::storage::{self, TidPair};
 use crate::hnsw::{Hnsw, HnswError};
 
@@ -279,9 +280,12 @@ pub(super) unsafe extern "C" fn amrescan(
         search.stop(); // nothing ranks against a NULL query vector
         return;
     }
-    // SAFETY: the operator class restricts the ordering operator's arguments to
-    // real[], so the key argument is a non-null real[] datum.
-    let query = super::f32_vec_from_array_datum(key.sk_argument);
+    // SAFETY: an ordering operator's arguments have the type its operator class
+    // indexes, so the key argument is a non-null value of that type — which is
+    // what the class reports here. Resolving it per rescan costs one support
+    // call against a scan that re-searches the graph anyway.
+    let query =
+        super::f32_vec_from_datum(opclass::index_kind((*scan).indexRelation), key.sk_argument);
     if let Err(e) = search.start(query) {
         error!("brindle: {e}");
     }
@@ -403,6 +407,64 @@ mod tests {
             "SELECT id FROM {table} ORDER BY brindle_l2_distance(embedding, {}) LIMIT {K}",
             query_literal()
         )
+    }
+
+    /// The same fixture in the `brindle_vector` type, indexed with the cosine
+    /// operator class.
+    fn create_cosine_fixture(table: &str, rows: i64) {
+        Spi::run(&format!(
+            "CREATE TABLE {table} (id int, embedding brindle_vector)"
+        ))
+        .expect("create");
+        Spi::run("SELECT setseed(0.42)").expect("seed");
+        Spi::run(&format!(
+            "INSERT INTO {table}
+             SELECT i, array_agg(random()::real)::brindle_vector
+             FROM generate_series(1, {rows}) i, generate_series(1, {DIM}) d
+             GROUP BY i"
+        ))
+        .expect("insert");
+        Spi::run(&format!(
+            "CREATE INDEX {table}_idx ON {table}
+             USING brindle (embedding brindle_vector_cosine_ops)"
+        ))
+        .expect("create index");
+    }
+
+    fn vector_query_literal() -> String {
+        let elements: Vec<String> = QUERY.iter().map(|v| v.to_string()).collect();
+        format!("'[{}]'::brindle_vector", elements.join(","))
+    }
+
+    /// The operator class an index is created with, not a constant, decides how
+    /// the graph ranks — visible in the rows a query gets back.
+    #[pg_test]
+    fn a_cosine_operator_class_ranks_by_cosine() {
+        create_cosine_fixture("t_cosine", ROWS);
+        let query = vector_query_literal();
+
+        let sql = format!("SELECT id FROM t_cosine ORDER BY embedding <=> {query} LIMIT {K}");
+        assert_uses_index(&sql, "t_cosine_idx");
+
+        let by_cosine = ordered_ids(&format!(
+            "SELECT id FROM t_cosine
+             ORDER BY brindle_vector_cosine_distance(embedding, {query}) LIMIT {K}"
+        ));
+        let by_l2 = ordered_ids(&format!(
+            "SELECT id FROM t_cosine
+             ORDER BY brindle_vector_l2_distance(embedding, {query}) LIMIT {K}"
+        ));
+        assert_ne!(
+            by_cosine, by_l2,
+            "fixture does not distinguish cosine from L2"
+        );
+
+        let approx = ordered_ids(&sql);
+        let hits = approx.iter().filter(|id| by_cosine.contains(id)).count();
+        assert!(
+            hits * 10 >= K * 9,
+            "recall {hits}/{K} against the exact cosine ordering\n  index: {approx:?}\n  cosine: {by_cosine:?}\n  l2: {by_l2:?}"
+        );
     }
 
     #[pg_test]

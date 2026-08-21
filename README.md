@@ -52,8 +52,9 @@ competitive analysis.
 2. **Hybrid by default** — vector + PostgreSQL full-text, fused with RRF.
 3. **Honest engineering** — `Result`-based error handling, no `unwrap()` in hot
    paths, zero-allocation distance kernels, benchmark-driven claims.
-4. **Drop-in friendly** — interoperates with pgvector's `vector` type and
-   operators (`<->`, `<=>`, `<#>`) so it's a low-friction swap.
+4. **Drop-in friendly** — its own `brindle_vector` type speaks pgvector's text
+   format and operators (`<->`, `<=>`, `<#>`), and `real[]` columns index
+   directly, so moving over is low-friction and pulls in no other extension.
 
 ## Quick start (dev)
 

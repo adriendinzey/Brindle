@@ -1,10 +1,10 @@
 //! Brindle — filter-aware, hybrid vector search for PostgreSQL.
 //!
-//! Current surface: pure distance functions over `real[]` plus the `brindle`
-//! index access method, which builds an HNSW graph and answers `ORDER BY
-//! embedding <-> $1 LIMIT k` from it. Incremental inserts and the remaining
-//! work — ACORN-style filtering, hybrid RRF — land in later phases, see
-//! `docs/ROADMAP.md`.
+//! Current surface: the `brindle_vector` type and distance functions over it
+//! and over `real[]`, plus the `brindle` index access method, which builds an
+//! HNSW graph and answers `ORDER BY embedding <-> $1 LIMIT k` from it.
+//! Incremental inserts and the remaining work — ACORN-style filtering, hybrid
+//! RRF — land in later phases, see `docs/ROADMAP.md`.
 //!
 //! Layering: all algorithmic logic lives in dependency-free modules (e.g.
 //! [`distance`], [`hnsw`]); this file and [`index_am`] are the thin pgrx
@@ -18,6 +18,7 @@ pub mod filter;
 pub mod fusion;
 pub mod hnsw;
 pub mod index_am;
+pub mod pg_vector;
 pub mod vector;
 
 ::pgrx::pg_module_magic!();
@@ -25,7 +26,7 @@ pub mod vector;
 /// Adapt a kernel `Result` into a Postgres value, raising a clean `ERROR` on
 /// failure instead of panicking. Keeps `unwrap()` out of the SQL-facing path.
 #[inline]
-fn or_error(result: Result<f32, distance::DistanceError>) -> f32 {
+pub(crate) fn or_error(result: Result<f32, distance::DistanceError>) -> f32 {
     result.unwrap_or_else(|e| error!("brindle: {e}"))
 }
 
@@ -33,6 +34,14 @@ fn or_error(result: Result<f32, distance::DistanceError>) -> f32 {
 #[pg_extern(immutable, strict, parallel_safe)]
 fn brindle_l2_distance(a: Vec<f32>, b: Vec<f32>) -> f32 {
     or_error(distance::l2_distance(&a, &b))
+}
+
+/// Squared Euclidean distance between two `real[]` vectors: the same ordering
+/// as [`brindle_l2_distance`] without the square root, which is how the index
+/// ranks internally.
+#[pg_extern(immutable, strict, parallel_safe)]
+fn brindle_l2_squared_distance(a: Vec<f32>, b: Vec<f32>) -> f32 {
+    or_error(distance::l2_squared(&a, &b))
 }
 
 /// Cosine distance (`1 - cosine_similarity`) between two `real[]` vectors.
@@ -66,6 +75,16 @@ mod tests {
         .expect("SPI failed")
         .expect("null result");
         assert!((d - 5.196_152).abs() < 1e-4, "got {d}");
+    }
+
+    #[pg_test]
+    fn l2_squared_distance_via_spi() {
+        let d = Spi::get_one::<f32>(
+            "SELECT brindle_l2_squared_distance(ARRAY[1,2,3]::real[], ARRAY[4,5,6]::real[])",
+        )
+        .expect("SPI failed")
+        .expect("null result");
+        assert!((d - 27.0).abs() < 1e-4, "got {d}");
     }
 
     #[pg_test]

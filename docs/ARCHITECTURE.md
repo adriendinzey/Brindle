@@ -99,11 +99,48 @@ layer** touches Postgres. This is deliberate:
 |---|---|---|
 | Language / framework | **Rust + pgrx** | Same stack as pgvectorscale & VectorChord; memory safety in unsafe DB territory |
 | Target Postgres | **16 / 17** (test matrix 14–17) | Current; pgrx supports all |
-| Vector type | **Reuse pgvector's `vector`** where present; provide a fallback | Drop-in interop is a feature, not reinventing a type |
+| Vector type | **Brindle's own `brindle_vector`**, laid out and spelled like pgvector's `vector`; `real[]` also indexable | Zero external dependencies, with interop kept through a matching text form and casts |
 | Distance kernels | **Stable-Rust autovectorized loops** now; explicit SIMD (`std::arch`/`wide`) in Phase 5 | Avoid nightly; correctness first, then optimize with benchmarks |
 | Index storage | **In-memory first**, native buffer/WAL later | Don't block the interesting algorithms on the hardest systems work |
 | Filtering | **Indexed label + numeric-range predicates** first; arbitrary SQL pushdown is the research frontier | Achievable and honest; still a real improvement over post-filtering |
 | Error handling | `Result` everywhere; `ereport`/`error!` at the boundary; **no `unwrap()` in hot paths** | Production-grade habits; project coding standard |
+
+### On the vector type
+
+Brindle defines its own type, `brindle_vector`: one varlena holding a dimension
+count and the components as `f32`, so the distance kernels read the stored bytes
+as a `&[f32]` with no copy or deserialization per comparison.
+
+The alternative was to reuse pgvector's `vector` and declare pgvector a
+prerequisite extension. That buys drop-in interop for the price of a hard
+dependency: every install, CI job, and `cargo pgrx test` run would first have to
+build pgvector for each Postgres major. Brindle's differentiator is
+filter-aware search, not the type, so the type is not worth a dependency that
+users cannot remove.
+
+Interop is kept where it is cheap instead of free:
+
+- the value layout matches pgvector's (`int16` dimension, two padding bytes,
+  then the components), and the text form is pgvector's `[1,2,3]`, so
+  `embedding::text::brindle_vector` moves a pgvector column over;
+- the operators are the familiar ones — `<->` L2, `<#>` (negative) inner
+  product, `<=>` cosine — so a query keeps its shape; within Brindle's access
+  method each metric also gets its own strategy number (1, 2, 3), so one
+  operator family can hold all three;
+- casts run to and from `real[]`, which is itself indexable through
+  `real_array_l2_ops` for data that already lives in arrays.
+
+`brindle_vector` deliberately has no typmod: a column does not declare its
+dimensions, and the index rejects a vector that disagrees with the ones already
+in it. Adding `brindle_vector(3)` is a compatible change if column-level
+enforcement turns out to be wanted.
+
+An operator class carries the rest of the contract. Each one declares the metric
+its index ranks by (`brindle_vector_l2_ops`, `_cosine_ops`, `_ip_ops`) and the
+type it indexes, both as support functions the access method reads at build
+time — a build has no scan key to take a strategy number from, and index
+maintenance runs with a restricted `search_path`, so neither fact can be
+recovered from the catalogs alone.
 
 ### On storage (the honest tradeoff)
 
@@ -120,7 +157,8 @@ calls this out explicitly so the tradeoff is never hidden.
 src/
   lib.rs            # pg_module_magic, extension entry, #[pg_extern] surface
   distance.rs       # pure distance kernels + unit tests          [Phase 0 ✓]
-  vector.rs         # vector views / validation / pgvector interop [Phase 1]
+  vector.rs         # metric selection / validation over slices          [Phase 1]
+  pg_vector.rs      # the brindle_vector type: layout, I/O, operators     [Phase 1]
   hnsw/
     mod.rs          # graph types, params (M, ef_construction)     [Phase 1]
     build.rs        # incremental insert, layer assignment         [Phase 1]
@@ -129,6 +167,7 @@ src/
   filter.rs         # predicate model: labels, ranges, bitmaps     [Phase 2]
   index_am/
     mod.rs          # IndexAmRoutine wiring                        [Phase 1]
+    opclass.rs      # operator classes: metric + indexed type      [Phase 1]
     scan.rs         # ambeginscan/amgettuple/amrescan              [Phase 1]
   hybrid.rs         # RRF fusion over vector + tsvector ranks      [Phase 4]
   quantize.rs       # scalar/binary quantization                  [Phase 5]
@@ -140,20 +179,21 @@ bench/              # ann-benchmarks-style recall@k vs QPS harness [Phase 5]
 ## 6. Public SQL surface (target)
 
 ```sql
--- Phase 0 (works today): pure distance functions over real[]
+-- Phase 0 (works today): distance functions over real[]
 brindle_l2_distance(a real[], b real[])      -> real
 brindle_cosine_distance(a real[], b real[])  -> real
 brindle_inner_product(a real[], b real[])    -> real
 
--- Works today: an L2 index over real[], queried through the `<->` ordering
--- operator. Distance operators keep pgvector's spelling and strategy numbers
--- (1 = `<->` L2, 2 = `<#>` inner product, 3 = `<=>` cosine) so adopting a real
--- vector type later doesn't move the surface.
-CREATE INDEX ON docs USING brindle (embedding);
-SELECT id FROM docs ORDER BY embedding <-> $1 LIMIT 10;
+-- Phase 1 (works today): the vector type, its operators, and an index whose
+-- operator class picks the metric. Operator spelling is pgvector's:
+-- `<->` L2, `<#>` (negative) inner product, `<=>` cosine.
+CREATE TABLE docs (id int, embedding brindle_vector);
+INSERT INTO docs VALUES (1, '[0.1,0.2,0.3]');   -- or ARRAY[...]::real[]
+CREATE INDEX ON docs USING brindle (embedding brindle_vector_cosine_ops);
+SELECT id FROM docs ORDER BY embedding <=> $1 LIMIT 10;
 
--- Phase 1 (remaining): the metric chosen by operator class, build/query knobs
-CREATE INDEX ON docs USING brindle (embedding vector_cosine_ops)
+-- Phase 1 (remaining): build/query knobs
+CREATE INDEX ON docs USING brindle (embedding brindle_vector_cosine_ops)
   WITH (m = 16, ef_construction = 64);
 SET brindle.ef_search = 64;
 
