@@ -8,8 +8,8 @@
 //! `docs/ROADMAP.md`.
 //!
 //! Layering: all algorithmic logic lives in dependency-free modules (e.g.
-//! [`distance`], [`hnsw`]); this file and [`index_am`] are the thin pgrx
-//! boundary that adapts Postgres types and turns `Result::Err` into a
+//! [`distance`], [`hnsw`]); this file, [`guc`], and [`index_am`] are the thin
+//! pgrx boundary that adapts Postgres types and turns `Result::Err` into a
 //! Postgres `ERROR`.
 
 use pgrx::prelude::*;
@@ -17,12 +17,22 @@ use pgrx::prelude::*;
 pub mod distance;
 pub mod filter;
 pub mod fusion;
+pub mod guc;
 pub mod hnsw;
 pub mod index_am;
 pub mod pg_vector;
 pub mod vector;
 
 ::pgrx::pg_module_magic!();
+
+/// Library load hook. Postgres calls this once per backend, before any SQL
+/// function or index callback in this extension can run, which is the only
+/// point at which custom GUCs and reloptions may be registered.
+#[pg_guard]
+pub extern "C" fn _PG_init() {
+    guc::init();
+    index_am::options::init();
+}
 
 /// Adapt a kernel `Result` into a Postgres value, raising a clean `ERROR` on
 /// failure instead of panicking. Keeps `unwrap()` out of the SQL-facing path.

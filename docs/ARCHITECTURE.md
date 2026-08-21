@@ -168,10 +168,11 @@ src/
   index_am/
     mod.rs          # IndexAmRoutine wiring                        [Phase 1]
     opclass.rs      # operator classes: metric + indexed type      [Phase 1]
+    options.rs      # per-index WITH (m, ef_construction, gamma)   [Phase 1]
     scan.rs         # ambeginscan/amgettuple/amrescan              [Phase 1]
   hybrid.rs         # RRF fusion over vector + tsvector ranks      [Phase 4]
   quantize.rs       # scalar/binary quantization                  [Phase 5]
-  guc.rs            # GUCs: brindle.ef_search, brindle.gamma, ...  [Phase 1]
+  guc.rs            # session GUCs: brindle.ef_search, ...         [Phase 1]
 benches/            # criterion micro-benchmarks
 bench/              # ann-benchmarks-style recall@k vs QPS harness [Phase 5]
 ```
