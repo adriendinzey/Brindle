@@ -2,13 +2,15 @@
 //!
 //! Boundary layer only — it adapts the Postgres AM callback ABI to the pure
 //! [`crate::hnsw`] core. `ambuild` scans the heap into an in-memory graph and
-//! persists it through [`storage`], `aminsert` extends that stored graph a
-//! tuple at a time, and `ambulkdelete` tombstones what VACUUM reclaims;
+//! persists it through [`storage`] using the build parameters [`options`]
+//! parses from the index's `WITH (...)` clause, `aminsert` extends that stored
+//! graph a tuple at a time, and `ambulkdelete` tombstones what VACUUM reclaims;
 //! [`scan`] answers `ORDER BY` distance queries from it. The metric a build
 //! ranks by and the type its column holds both come from the index's operator
 //! class — see [`opclass`].
 
 pub mod opclass;
+pub mod options;
 pub mod scan;
 pub mod storage;
 
@@ -21,6 +23,7 @@ use pgrx::{pg_guard, pg_sys, Array, FromDatum, PgBox};
 use crate::hnsw::{Hnsw, HnswParams};
 use crate::pg_vector;
 use opclass::VectorKind;
+use options::build_params;
 use storage::TidPair;
 
 /// Handler returning the filled `IndexAmRoutine`; referenced by
@@ -64,7 +67,7 @@ fn brindle_amhandler(_fcinfo: pg_sys::FunctionCallInfo) -> PgBox<pg_sys::IndexAm
     routine.ambulkdelete = Some(ambulkdelete);
     routine.amvacuumcleanup = Some(amvacuumcleanup);
     routine.amcostestimate = Some(amcostestimate);
-    routine.amoptions = Some(amoptions);
+    routine.amoptions = Some(options::amoptions);
     routine.amvalidate = Some(amvalidate);
     routine.ambeginscan = Some(scan::ambeginscan);
     routine.amrescan = Some(scan::amrescan);
@@ -116,20 +119,6 @@ struct BuildState {
 /// everything — the path would then be dropped by luck of path ordering rather
 /// than by being expensive. Matches Postgres' own `disable_cost`.
 const DISABLED_COST: pg_sys::Cost = 1.0e10;
-
-/// Build parameters for an index. One definition shared by `ambuild` and
-/// `ambuildempty`, so an unlogged index's init fork can never disagree with
-/// its main fork.
-///
-/// # Safety
-/// `index` must be an open index relation of the brindle access method.
-unsafe fn build_params(index: pg_sys::Relation) -> HnswParams {
-    // TODO: take m/ef_construction from reloptions; they are fixed to defaults.
-    HnswParams {
-        metric: opclass::index_metric(index),
-        ..HnswParams::default()
-    }
-}
 
 /// Copy one indexed datum into an owned `Vec<f32>`, whichever type the column
 /// holds.
@@ -446,15 +435,6 @@ unsafe extern "C" fn amcostestimate(
     *index_selectivity = costs.indexSelectivity;
     *index_correlation = costs.indexCorrelation;
     *index_pages = costs.numIndexPages;
-}
-
-#[pg_guard]
-unsafe extern "C" fn amoptions(reloptions: pg_sys::Datum, validate: bool) -> *mut pg_sys::bytea {
-    // TODO: real reloptions (m, ef_construction, metric).
-    if validate && reloptions.value() != 0 {
-        error!("brindle: this index type has no options yet");
-    }
-    core::ptr::null_mut()
 }
 
 #[pg_guard]
@@ -787,10 +767,69 @@ mod tests {
         Spi::run("INSERT INTO t_ins_dim VALUES (11, ARRAY[1,2]::real[])").expect("insert");
     }
 
-    #[pg_test(error = "brindle: this index type has no options yet")]
-    fn reloptions_are_rejected() {
-        create_fixture("t_opts", 5);
-        Spi::run("CREATE INDEX ON t_opts USING brindle (embedding) WITH (m = 16)")
+    /// Build an index over the shared fixture and read back the parameters the
+    /// persisted graph was actually built with.
+    fn build_with(table: &str, index: &str, with_clause: &str) -> Hnsw {
+        create_fixture(table, 60);
+        Spi::run(&format!(
+            "CREATE INDEX {index} ON {table} USING brindle (embedding) {with_clause}"
+        ))
+        .expect("create index");
+        // SAFETY: freshly created index; AccessShare via PgRelation keeps it open.
+        let rel = unsafe { PgRelation::open_with_name(index) }.expect("open index");
+        unsafe { storage::load_index(rel.as_ptr()) }.0
+    }
+
+    #[pg_test]
+    fn reloptions_are_honored_at_build() {
+        let small = build_with("t_opt_m8", "t_opt_m8_idx", "WITH (m = 8)");
+        let large = build_with("t_opt_m32", "t_opt_m32_idx", "WITH (m = 32)");
+
+        assert_eq!(small.m(), 8);
+        assert_eq!(large.m(), 32);
+        // A denser graph is a bigger graph: the degree caps scale with m, so
+        // the serialized link table must grow with it.
+        assert!(
+            large.to_bytes().len() > small.to_bytes().len(),
+            "m = 32 should produce more links than m = 8"
+        );
+    }
+
+    #[pg_test]
+    fn reloptions_cover_every_build_parameter() {
+        let hnsw = build_with(
+            "t_opt_all",
+            "t_opt_all_idx",
+            "WITH (m = 6, ef_construction = 90, gamma = 2.5)",
+        );
+        assert_eq!(hnsw.m(), 6);
+        assert_eq!(hnsw.ef_construction(), 90);
+        assert!((hnsw.gamma() - 2.5).abs() < 1e-6, "got {}", hnsw.gamma());
+    }
+
+    #[pg_test]
+    fn omitted_reloptions_fall_back_to_defaults() {
+        let defaults = HnswParams::default();
+        // ef_construction alone; m and gamma must keep their defaults.
+        let hnsw = build_with(
+            "t_opt_part",
+            "t_opt_part_idx",
+            "WITH (ef_construction = 128)",
+        );
+        assert_eq!(hnsw.ef_construction(), 128);
+        assert_eq!(hnsw.m(), defaults.m);
+        assert_eq!(hnsw.gamma(), defaults.gamma);
+
+        let bare = build_with("t_opt_none", "t_opt_none_idx", "");
+        assert_eq!(bare.m(), defaults.m);
+        assert_eq!(bare.ef_construction(), defaults.ef_construction);
+        assert_eq!(bare.gamma(), defaults.gamma);
+    }
+
+    #[pg_test(error = "unrecognized parameter \"nonesuch\"")]
+    fn unknown_reloption_is_rejected() {
+        create_fixture("t_opt_bad", 5);
+        Spi::run("CREATE INDEX ON t_opt_bad USING brindle (embedding) WITH (nonesuch = 1)")
             .expect("create index");
     }
 
@@ -1029,5 +1068,41 @@ mod tests {
         let (hnsw, _) = load_persisted("t_vac_live_idx");
         assert_eq!(hnsw.live_len(), 20);
         assert_eq!(hnsw.deleted_count(), 0);
+    }
+
+    #[pg_test(error = "value 1 out of bounds for option \"m\"")]
+    fn out_of_range_reloption_is_rejected() {
+        create_fixture("t_opt_range", 5);
+        Spi::run("CREATE INDEX ON t_opt_range USING brindle (embedding) WITH (m = 1)")
+            .expect("create index");
+    }
+
+    #[pg_test(error = "invalid value for integer option \"m\": abc")]
+    fn non_numeric_reloption_is_rejected() {
+        create_fixture("t_opt_type", 5);
+        Spi::run("CREATE INDEX ON t_opt_type USING brindle (embedding) WITH (m = 'abc')")
+            .expect("create index");
+    }
+
+    /// `m` and `gamma` are each in range, but together they would size every
+    /// node's link list — and the build's candidate pool — far past what a
+    /// build can hold.
+    #[pg_test(
+        error = "brindle: m = 128 with gamma = 1024 would give each node up to 262144 neighbors"
+    )]
+    fn excessive_degree_combination_is_rejected() {
+        create_fixture("t_opt_degree", 5);
+        Spi::run(
+            "CREATE INDEX ON t_opt_degree USING brindle (embedding) WITH (m = 128, gamma = 1024)",
+        )
+        .expect("create index");
+    }
+
+    #[pg_test]
+    fn dense_but_bounded_combination_is_accepted() {
+        // 2 * 16 * 64 = 2048, exactly the layer-0 degree ceiling.
+        let hnsw = build_with("t_opt_edge", "t_opt_edge_idx", "WITH (m = 16, gamma = 64)");
+        assert_eq!(hnsw.m(), 16);
+        assert!((hnsw.gamma() - 64.0).abs() < 1e-6, "got {}", hnsw.gamma());
     }
 }

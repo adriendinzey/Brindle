@@ -259,6 +259,24 @@ impl Hnsw {
         self.metric
     }
 
+    /// Neighbors per node on upper layers, after the `>= 2` clamp
+    /// [`Hnsw::new`] applies. Layer 0 and γ scaling are derived from it.
+    pub fn m(&self) -> usize {
+        self.m
+    }
+
+    /// Build-time candidate pool, after [`Hnsw::new`] raised it to the graph's
+    /// degree-cap floor — so it can exceed the requested value.
+    pub fn ef_construction(&self) -> usize {
+        self.ef_construction
+    }
+
+    /// Edge-density multiplier in effect, after clamping to
+    /// `[1, HnswParams::MAX_GAMMA]`.
+    pub fn gamma(&self) -> f32 {
+        self.gamma
+    }
+
     /// Filterable attribute row stored for `id`, in the order it was inserted.
     /// An unknown id or an attribute-free node yields an empty slice (so a
     /// predicate over a missing column simply doesn't match — never panics).
