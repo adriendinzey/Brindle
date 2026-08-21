@@ -2,9 +2,10 @@
 //!
 //! Boundary layer only — it adapts the Postgres AM callback ABI to the pure
 //! [`crate::hnsw`] core. `ambuild` scans the heap into an in-memory graph and
-//! persists it through [`storage`]; scans and incremental inserts are stubbed
-//! with clear errors until those features land.
+//! persists it through [`storage`]; [`scan`] answers `ORDER BY` distance
+//! queries from it. Incremental inserts are still stubbed with a clear error.
 
+pub mod scan;
 pub mod storage;
 
 use core::ffi::c_void;
@@ -29,7 +30,7 @@ fn brindle_amhandler(_fcinfo: pg_sys::FunctionCallInfo) -> PgBox<pg_sys::IndexAm
     let mut routine =
         unsafe { PgBox::<pg_sys::IndexAmRoutine>::alloc_node(pg_sys::NodeTag::T_IndexAmRoutine) };
 
-    routine.amstrategies = 0; // no search operators yet; they arrive with scans
+    routine.amstrategies = 0; // ordering operators only, so no fixed strategy set
     routine.amsupport = 1; // support proc 1: the opclass distance function
     routine.amoptsprocnum = 0;
     routine.amcanorder = false;
@@ -59,18 +60,27 @@ fn brindle_amhandler(_fcinfo: pg_sys::FunctionCallInfo) -> PgBox<pg_sys::IndexAm
     routine.amcostestimate = Some(amcostestimate);
     routine.amoptions = Some(amoptions);
     routine.amvalidate = Some(amvalidate);
-    routine.ambeginscan = Some(ambeginscan);
-    routine.amrescan = Some(amrescan);
-    routine.amgettuple = Some(amgettuple);
-    routine.amendscan = Some(amendscan);
+    routine.ambeginscan = Some(scan::ambeginscan);
+    routine.amrescan = Some(scan::amrescan);
+    routine.amgettuple = Some(scan::amgettuple);
+    routine.amendscan = Some(scan::amendscan);
 
     routine.into_pg_boxed()
 }
 
+// Ordering-operator strategy numbers follow pgvector's, so the eventual vector
+// type can keep the same layout: 1 = L2, 2 = inner product, 3 = cosine.
 extension_sql!(
     r#"
+CREATE OPERATOR <-> (
+    LEFTARG = real[], RIGHTARG = real[],
+    FUNCTION = brindle_l2_distance,
+    COMMUTATOR = '<->'
+);
+
 CREATE OPERATOR CLASS real_array_l2_ops
     DEFAULT FOR TYPE real[] USING brindle AS
+    OPERATOR 1 <-> (real[], real[]) FOR ORDER BY float_ops,
     FUNCTION 1 brindle_l2_distance(real[], real[]);
 "#,
     name = "brindle_real_array_l2_ops",
@@ -83,6 +93,13 @@ struct BuildState {
     hnsw: Hnsw,
     heap_tids: Vec<TidPair>,
 }
+
+/// Cost that takes an index path out of contention. Finite on purpose: the
+/// planner derives an index path's run cost from `total - startup`, so two
+/// infinities would leave it `NaN`, and a `NaN` cost compares equal to
+/// everything — the path would then be dropped by luck of path ordering rather
+/// than by being expensive. Matches Postgres' own `disable_cost`.
+const DISABLED_COST: pg_sys::Cost = 1.0e10;
 
 /// Build parameters for an index. One definition shared by `ambuild` and
 /// `ambuildempty`, so an unlogged index's init fork can never disagree with
@@ -231,24 +248,55 @@ unsafe extern "C" fn amvacuumcleanup(
 #[allow(clippy::too_many_arguments)]
 #[pg_guard]
 unsafe extern "C" fn amcostestimate(
-    _root: *mut pg_sys::PlannerInfo,
-    _path: *mut pg_sys::IndexPath,
-    _loop_count: f64,
+    root: *mut pg_sys::PlannerInfo,
+    path: *mut pg_sys::IndexPath,
+    loop_count: f64,
     index_startup_cost: *mut pg_sys::Cost,
     index_total_cost: *mut pg_sys::Cost,
     index_selectivity: *mut pg_sys::Selectivity,
     index_correlation: *mut f64,
     index_pages: *mut f64,
 ) {
-    // Scans aren't implemented, so price the index out of every plan.
-    // TODO: a real cost model when index scans land.
     // SAFETY: Postgres always passes valid, writable out-pointers to
-    // amcostestimate; writing them is the callback's contract.
-    *index_startup_cost = 1.0e10;
-    *index_total_cost = 1.0e10;
-    *index_selectivity = 0.0;
-    *index_correlation = 0.0;
-    *index_pages = 0.0;
+    // amcostestimate, and `path` is the candidate IndexPath being costed.
+
+    // The AM has no search operators, so without an ORDER BY distance clause it
+    // has nothing to contribute: price it out of the plan. A partial index gets
+    // here, because a matching predicate alone is enough for the planner to
+    // build a candidate path.
+    if (*path).indexorderbys.is_null() {
+        *index_startup_cost = DISABLED_COST;
+        *index_total_cost = DISABLED_COST;
+        *index_selectivity = 0.0;
+        *index_correlation = 0.0;
+        *index_pages = 0.0;
+        return;
+    }
+
+    // Cost the graph walk, not a full index read: descent visits about one
+    // neighbor list per layer above 0, and the expected top layer for `n` nodes
+    // under the level distribution (1/ln m) is log_m(n). Presetting this stops
+    // genericcostestimate from assuming every index tuple is visited, which is
+    // what lets a `LIMIT k` plan prefer this index over sorting the whole table.
+    // TODO: fold in ef_search once it is configurable, and the cost of loading
+    // the graph while storage still rebuilds it once per scan.
+    let m = HnswParams::default().m.max(2) as f64;
+    let tuples = (*(*path).indexinfo).tuples.max(1.0);
+    let entry_level = (tuples.ln() / m.ln()).floor().max(0.0);
+
+    let mut costs = pg_sys::GenericCosts {
+        numIndexTuples: (entry_level + 2.0) * m,
+        ..Default::default()
+    };
+    pg_sys::genericcostestimate(root, path, loop_count, &mut costs);
+
+    // The search runs to completion before the first tuple comes back, so the
+    // startup cost is the whole index cost.
+    *index_startup_cost = costs.indexTotalCost;
+    *index_total_cost = costs.indexTotalCost;
+    *index_selectivity = costs.indexSelectivity;
+    *index_correlation = costs.indexCorrelation;
+    *index_pages = costs.numIndexPages;
 }
 
 #[pg_guard]
@@ -265,40 +313,6 @@ unsafe extern "C" fn amvalidate(_opclass_oid: pg_sys::Oid) -> bool {
     // TODO: verify the opclass shape (support proc 1 signature) once the
     // vector type and multiple metrics exist.
     true
-}
-
-#[pg_guard]
-unsafe extern "C" fn ambeginscan(
-    _index: pg_sys::Relation,
-    _nkeys: core::ffi::c_int,
-    _norderbys: core::ffi::c_int,
-) -> pg_sys::IndexScanDesc {
-    // TODO: index scans (beam search over the persisted graph).
-    error!("brindle: index scans are not implemented yet");
-}
-
-#[pg_guard]
-unsafe extern "C" fn amrescan(
-    _scan: pg_sys::IndexScanDesc,
-    _keys: pg_sys::ScanKey,
-    _nkeys: core::ffi::c_int,
-    _orderbys: pg_sys::ScanKey,
-    _norderbys: core::ffi::c_int,
-) {
-    error!("brindle: index scans are not implemented yet");
-}
-
-#[pg_guard]
-unsafe extern "C" fn amgettuple(
-    _scan: pg_sys::IndexScanDesc,
-    _direction: pg_sys::ScanDirection::Type,
-) -> bool {
-    error!("brindle: index scans are not implemented yet");
-}
-
-#[pg_guard]
-unsafe extern "C" fn amendscan(_scan: pg_sys::IndexScanDesc) {
-    error!("brindle: index scans are not implemented yet");
 }
 
 #[cfg(any(test, feature = "pg_test"))]

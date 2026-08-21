@@ -145,7 +145,14 @@ brindle_l2_distance(a real[], b real[])      -> real
 brindle_cosine_distance(a real[], b real[])  -> real
 brindle_inner_product(a real[], b real[])    -> real
 
--- Phase 1: the index
+-- Works today: an L2 index over real[], queried through the `<->` ordering
+-- operator. Distance operators keep pgvector's spelling and strategy numbers
+-- (1 = `<->` L2, 2 = `<#>` inner product, 3 = `<=>` cosine) so adopting a real
+-- vector type later doesn't move the surface.
+CREATE INDEX ON docs USING brindle (embedding);
+SELECT id FROM docs ORDER BY embedding <-> $1 LIMIT 10;
+
+-- Phase 1 (remaining): the metric chosen by operator class, build/query knobs
 CREATE INDEX ON docs USING brindle (embedding vector_cosine_ops)
   WITH (m = 16, ef_construction = 64);
 SET brindle.ef_search = 64;
