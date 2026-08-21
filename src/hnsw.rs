@@ -841,8 +841,8 @@ impl Hnsw {
             }
             let raw = r.take(vector_bytes)?;
             let mut vector = Vec::with_capacity(dim);
-            for c in raw.chunks_exact(4) {
-                vector.push(f32::from_le_bytes([c[0], c[1], c[2], c[3]]));
+            for c in raw.as_chunks::<4>().0 {
+                vector.push(f32::from_le_bytes(*c));
             }
             vectors.push(vector);
             if levels > r.remaining() / 8 {
