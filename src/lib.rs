@@ -2,9 +2,10 @@
 //!
 //! Current surface: the `brindle_vector` type and distance functions over it
 //! and over `real[]`, plus the `brindle` index access method, which builds an
-//! HNSW graph and answers `ORDER BY embedding <-> $1 LIMIT k` from it.
-//! Incremental inserts and the remaining work — ACORN-style filtering, hybrid
-//! RRF — land in later phases, see `docs/ROADMAP.md`.
+//! HNSW graph, answers `ORDER BY embedding <-> $1 LIMIT k` from it, and keeps
+//! it current as rows are inserted and vacuumed. The remaining work —
+//! ACORN-style filtering, hybrid RRF — lands in later phases, see
+//! `docs/ROADMAP.md`.
 //!
 //! Layering: all algorithmic logic lives in dependency-free modules (e.g.
 //! [`distance`], [`hnsw`]); this file and [`index_am`] are the thin pgrx
