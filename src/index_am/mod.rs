@@ -4,7 +4,10 @@
 //! [`crate::hnsw`] core. `ambuild` scans the heap into an in-memory graph and
 //! persists it through [`storage`]; [`scan`] answers `ORDER BY` distance
 //! queries from it. Incremental inserts are still stubbed with a clear error.
+//! The metric a build ranks by and the type its column holds both come from the
+//! index's operator class — see [`opclass`].
 
+pub mod opclass;
 pub mod scan;
 pub mod storage;
 
@@ -15,6 +18,8 @@ use pgrx::prelude::*;
 use pgrx::{pg_guard, pg_sys, Array, FromDatum, PgBox};
 
 use crate::hnsw::{Hnsw, HnswParams};
+use crate::pg_vector;
+use opclass::VectorKind;
 use storage::TidPair;
 
 /// Handler returning the filled `IndexAmRoutine`; referenced by
@@ -31,7 +36,7 @@ fn brindle_amhandler(_fcinfo: pg_sys::FunctionCallInfo) -> PgBox<pg_sys::IndexAm
         unsafe { PgBox::<pg_sys::IndexAmRoutine>::alloc_node(pg_sys::NodeTag::T_IndexAmRoutine) };
 
     routine.amstrategies = 0; // ordering operators only, so no fixed strategy set
-    routine.amsupport = 1; // support proc 1: the opclass distance function
+    routine.amsupport = opclass::SUPPORT_PROCS; // distance, metric, indexed type
     routine.amoptsprocnum = 0;
     routine.amcanorder = false;
     routine.amcanorderbyop = true; // distance ORDER BY is the point of this AM
@@ -68,8 +73,9 @@ fn brindle_amhandler(_fcinfo: pg_sys::FunctionCallInfo) -> PgBox<pg_sys::IndexAm
     routine.into_pg_boxed()
 }
 
-// Ordering-operator strategy numbers follow pgvector's, so the eventual vector
-// type can keep the same layout: 1 = L2, 2 = inner product, 3 = cosine.
+// `real[]` is the on-ramp for data that already lives in arrays; brindle_vector
+// is the compact form. Both index through the same access method. Strategy
+// numbers are per metric — see [`opclass`].
 extension_sql!(
     r#"
 CREATE OPERATOR <-> (
@@ -81,10 +87,18 @@ CREATE OPERATOR <-> (
 CREATE OPERATOR CLASS real_array_l2_ops
     DEFAULT FOR TYPE real[] USING brindle AS
     OPERATOR 1 <-> (real[], real[]) FOR ORDER BY float_ops,
-    FUNCTION 1 brindle_l2_distance(real[], real[]);
+    FUNCTION 1 brindle_l2_squared_distance(real[], real[]),
+    FUNCTION 2 (real[], real[]) brindle_l2_metric(),
+    FUNCTION 3 (real[], real[]) brindle_real_array_kind();
 "#,
     name = "brindle_real_array_l2_ops",
-    requires = [brindle_amhandler, brindle_l2_distance],
+    requires = [
+        brindle_amhandler,
+        brindle_l2_distance,
+        brindle_l2_squared_distance,
+        brindle_l2_metric,
+        brindle_real_array_kind,
+    ],
 );
 
 /// Accumulates the graph and the node-id → heap-TID table during a build.
@@ -92,6 +106,7 @@ CREATE OPERATOR CLASS real_array_l2_ops
 struct BuildState {
     hnsw: Hnsw,
     heap_tids: Vec<TidPair>,
+    kind: VectorKind,
 }
 
 /// Cost that takes an index path out of contention. Finite on purpose: the
@@ -104,17 +119,35 @@ const DISABLED_COST: pg_sys::Cost = 1.0e10;
 /// Build parameters for an index. One definition shared by `ambuild` and
 /// `ambuildempty`, so an unlogged index's init fork can never disagree with
 /// its main fork.
-fn build_params(_index: pg_sys::Relation) -> HnswParams {
-    // TODO: take m/ef_construction from reloptions and the metric from the
-    // operator class support function; both are fixed to defaults for now.
-    HnswParams::default()
+///
+/// # Safety
+/// `index` must be an open index relation of the brindle access method.
+unsafe fn build_params(index: pg_sys::Relation) -> HnswParams {
+    // TODO: take m/ef_construction from reloptions; they are fixed to defaults.
+    HnswParams {
+        metric: opclass::index_metric(index),
+        ..HnswParams::default()
+    }
+}
+
+/// Copy one indexed datum into an owned `Vec<f32>`, whichever type the column
+/// holds.
+///
+/// # Safety
+/// `datum` must be a non-null value of `kind`'s type.
+unsafe fn f32_vec_from_datum(kind: VectorKind, datum: pg_sys::Datum) -> Vec<f32> {
+    match kind {
+        VectorKind::RealArray => f32_vec_from_array_datum(datum),
+        // Reading the components in place keeps this to the one copy the graph
+        // needs, with no intermediate array.
+        VectorKind::Vector => pg_vector::components_from_datum(datum),
+    }
 }
 
 /// Copy one `real[]` datum into an owned `Vec<f32>`.
 ///
 /// # Safety
-/// `datum` must be a non-null, valid `real[]` value (the operator class
-/// restricts the indexed column to `real[]`).
+/// `datum` must be a non-null, valid `real[]` value.
 unsafe fn f32_vec_from_array_datum(datum: pg_sys::Datum) -> Vec<f32> {
     let array = Array::<f32>::from_polymorphic_datum(datum, false, pg_sys::FLOAT4ARRAYOID)
         .unwrap_or_else(|| error!("brindle: could not read real[] value"));
@@ -147,7 +180,7 @@ unsafe extern "C" fn build_callback(
     // SAFETY: single-column AM (amcanmulticol=false), so values[0]/isnull[0]
     // is the only entry, and we just checked it is not null. `tid` points at
     // the scanned tuple's live ItemPointerData for the duration of this call.
-    let vector = f32_vec_from_array_datum(*values);
+    let vector = f32_vec_from_datum(state.kind, *values);
     match state.hnsw.insert(vector) {
         Ok(_) => state.heap_tids.push(item_pointer_get_both(*tid)),
         Err(e) => error!("brindle: {e}"),
@@ -163,6 +196,7 @@ unsafe extern "C" fn ambuild(
     let mut state = BuildState {
         hnsw: Hnsw::new(build_params(index)),
         heap_tids: Vec::new(),
+        kind: opclass::index_kind(index),
     };
 
     // SAFETY: heap/index/index_info are the live, locked relations Postgres
@@ -332,6 +366,7 @@ mod tests {
 
     use crate::hnsw::{Hnsw, HnswParams};
     use crate::index_am::storage;
+    use crate::vector::Metric;
 
     /// The deterministic 4-dim vector the SQL fixtures build for row `i`.
     fn fixture_vector(i: i64) -> Vec<f32> {
@@ -457,5 +492,155 @@ mod tests {
         create_fixture("t_opts", 5);
         Spi::run("CREATE INDEX ON t_opts USING brindle (embedding) WITH (m = 16)")
             .expect("create index");
+    }
+
+    #[pg_test]
+    fn builds_over_out_of_line_vectors() {
+        // Wide enough to be stored out of line, which is the path where reading
+        // a vector has to detoast a copy and then release it.
+        const DIMS: i64 = 2000;
+        const ROWS: i64 = 20;
+        Spi::run("CREATE TABLE t_toast_build (id int, embedding brindle_vector)").expect("create");
+        Spi::run(&format!(
+            "INSERT INTO t_toast_build
+             SELECT i, ('[' || (SELECT string_agg(((j * i) % 97)::text, ',')
+                                FROM generate_series(1, {DIMS}) j) || ']')::brindle_vector
+             FROM generate_series(1, {ROWS}) i"
+        ))
+        .expect("insert");
+        Spi::run("CREATE INDEX t_toast_build_idx ON t_toast_build USING brindle (embedding)")
+            .expect("create index");
+
+        // SAFETY: freshly created index; AccessShare via PgRelation keeps it open.
+        let index = unsafe { PgRelation::open_with_name("t_toast_build_idx") }.expect("open");
+        let (graph, tids) = unsafe { storage::load_index(index.as_ptr()) };
+        assert_eq!(graph.len() as i64, ROWS);
+        assert_eq!(tids.len() as i64, ROWS);
+
+        // Detoasting produced the stored components, not a copy of some other
+        // row: searching for row 3's own vector finds row 3's node first.
+        let row = 3;
+        let query: Vec<f32> = (1..=DIMS).map(|j| ((j * row) % 97) as f32).collect();
+        let nearest = graph.search(&query, 1, 64).expect("search");
+        assert_eq!(
+            nearest.first().map(|&(_, node)| node),
+            Some(row as usize - 1)
+        );
+    }
+
+    #[pg_test(error = "brindle: operator class does not match the type of the indexed column")]
+    fn an_operator_class_that_misreports_its_type_is_rejected() {
+        create_fixture("t_mismatch", 5);
+        Spi::run(
+            "CREATE OPERATOR CLASS mismatched_ops FOR TYPE real[] USING brindle AS
+                 FUNCTION 1 brindle_l2_squared_distance(real[], real[]),
+                 FUNCTION 2 (real[], real[]) brindle_l2_metric(),
+                 FUNCTION 3 (real[], real[]) brindle_vector_kind()",
+        )
+        .expect("create operator class");
+        Spi::run("CREATE INDEX ON t_mismatch USING brindle (embedding mismatched_ops)")
+            .expect("create index");
+    }
+
+    const METRIC_FIXTURE_ROWS: i64 = 200;
+
+    /// A vector whose direction and magnitude vary independently, so ranking by
+    /// angle (cosine) and by distance (L2) disagree — which is what makes the
+    /// metric an index was built with observable in its results.
+    fn metric_fixture_vector(i: i64) -> Vec<f32> {
+        let scale = (1 + i % 5) as f32;
+        vec![
+            (i % 13) as f32 * scale,
+            (i % 7) as f32 * scale,
+            scale,
+            (i % 3) as f32 * scale,
+        ]
+    }
+
+    /// Build an index over the metric fixture and return the graph Postgres
+    /// persisted for it. `opclass` is empty to take the column's default.
+    fn build_metric_fixture(table: &str, opclass: &str) -> Hnsw {
+        Spi::run(&format!(
+            "CREATE TABLE {table} (id int, embedding brindle_vector)"
+        ))
+        .expect("create");
+        Spi::run(&format!(
+            "INSERT INTO {table}
+             SELECT i, ARRAY[((i % 13) * (1 + i % 5))::real, ((i % 7) * (1 + i % 5))::real,
+                             (1 + i % 5)::real, ((i % 3) * (1 + i % 5))::real]::brindle_vector
+             FROM generate_series(1, {METRIC_FIXTURE_ROWS}) i"
+        ))
+        .expect("insert");
+        Spi::run(&format!(
+            "CREATE INDEX {table}_idx ON {table} USING brindle (embedding {opclass})"
+        ))
+        .expect("create index");
+
+        // SAFETY: freshly created index; AccessShare via PgRelation keeps it open.
+        let index = unsafe { PgRelation::open_with_name(&format!("{table}_idx")) }.expect("open");
+        let (graph, _tids) = unsafe { storage::load_index(index.as_ptr()) };
+        graph
+    }
+
+    /// The same graph built in process, so any difference in results is the
+    /// metric and not the build.
+    fn in_memory_fixture(metric: Metric) -> Hnsw {
+        let mut hnsw = Hnsw::new(HnswParams {
+            metric,
+            ..HnswParams::default()
+        });
+        for i in 1..=METRIC_FIXTURE_ROWS {
+            hnsw.insert(metric_fixture_vector(i)).expect("insert");
+        }
+        hnsw
+    }
+
+    #[pg_test]
+    fn each_opclass_builds_its_own_metric() {
+        let query = vec![3.0_f32, 2.0, 1.0, 1.0];
+        for (opclass, metric, other) in [
+            ("brindle_vector_l2_ops", Metric::L2, Metric::Cosine),
+            ("brindle_vector_cosine_ops", Metric::Cosine, Metric::L2),
+            ("brindle_vector_ip_ops", Metric::InnerProduct, Metric::L2),
+        ] {
+            let indexed = build_metric_fixture(&format!("t_{opclass}"), opclass);
+            assert_eq!(
+                indexed.metric(),
+                metric,
+                "{opclass} recorded the wrong metric"
+            );
+
+            let expected = in_memory_fixture(metric)
+                .search(&query, 10, 64)
+                .expect("search");
+            let under_other = in_memory_fixture(other)
+                .search(&query, 10, 64)
+                .expect("search");
+            assert_ne!(
+                expected, under_other,
+                "fixture cannot tell {metric:?} from {other:?} apart"
+            );
+            assert_eq!(
+                indexed.search(&query, 10, 64).expect("search"),
+                expected,
+                "{opclass} ranked by the wrong metric"
+            );
+        }
+    }
+
+    #[pg_test]
+    fn the_default_opclass_is_l2() {
+        assert_eq!(
+            build_metric_fixture("t_default_vector", "").metric(),
+            Metric::L2
+        );
+
+        create_fixture("t_default_array", 50);
+        Spi::run("CREATE INDEX t_default_array_idx ON t_default_array USING brindle (embedding)")
+            .expect("create index");
+        // SAFETY: freshly created index; AccessShare via PgRelation keeps it open.
+        let index = unsafe { PgRelation::open_with_name("t_default_array_idx") }.expect("open");
+        let (graph, _tids) = unsafe { storage::load_index(index.as_ptr()) };
+        assert_eq!(graph.metric(), Metric::L2);
     }
 }

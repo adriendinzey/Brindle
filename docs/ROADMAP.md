@@ -21,9 +21,9 @@ Legend: ✅ done · 🚧 in progress · ⬜ planned
 
 - ⬜ In-memory HNSW: insert, layer assignment, greedy search, candidate heap
 - ⬜ `IndexAmRoutine`: `ambuild`, `aminsert`, `ambeginscan`, `amgettuple`, `amrescan`, `amendscan`
-- ⬜ `CREATE INDEX ... USING brindle (embedding vector_cosine_ops) WITH (m, ef_construction)`
+- ⬜ `CREATE INDEX ... USING brindle (embedding brindle_vector_cosine_ops) WITH (m, ef_construction)`
 - ⬜ GUC `brindle.ef_search`
-- ⬜ pgvector `vector` type interop (operators `<->`, `<=>`, `<#>`)
+- ⬜ `brindle_vector` type + one operator class per metric (operators `<->`, `<=>`, `<#>`)
 - ⬜ Recall sanity vs brute force on a small dataset
 
 ## Phase 2 — Filter-aware search (the differentiator) ⬜
