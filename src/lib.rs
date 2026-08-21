@@ -1,9 +1,10 @@
 //! Brindle — filter-aware, hybrid vector search for PostgreSQL.
 //!
 //! Current surface: pure distance functions over `real[]` plus the `brindle`
-//! index access method (build-only so far; scans, inserts, and the remaining
+//! index access method, which builds an HNSW graph and answers `ORDER BY
+//! embedding <-> $1 LIMIT k` from it. Incremental inserts and the remaining
 //! work — ACORN-style filtering, hybrid RRF — land in later phases, see
-//! `docs/ROADMAP.md`).
+//! `docs/ROADMAP.md`.
 //!
 //! Layering: all algorithmic logic lives in dependency-free modules (e.g.
 //! [`distance`], [`hnsw`]); this file and [`index_am`] are the thin pgrx
