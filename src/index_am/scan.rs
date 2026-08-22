@@ -332,6 +332,8 @@ pub(super) unsafe extern "C" fn amendscan(scan: pg_sys::IndexScanDesc) {
 #[cfg(any(test, feature = "pg_test"))]
 #[pg_schema]
 mod tests {
+    use std::collections::HashSet;
+
     use pgrx::prelude::*;
     use pgrx::PgRelation;
 
@@ -345,9 +347,19 @@ mod tests {
     /// An arbitrary point in the fixture's `[0,1]^DIM` cube.
     const QUERY: [f32; DIM] = [0.13, 0.77, 0.41, 0.92, 0.05, 0.63, 0.28, 0.55];
 
+    /// The module's own [`QUERY`] as a `real[]` literal.
     fn query_literal() -> String {
-        let elements: Vec<String> = QUERY.iter().map(|v| v.to_string()).collect();
+        array_literal(&QUERY)
+    }
+
+    fn array_literal(query: &[f32]) -> String {
+        let elements: Vec<String> = query.iter().map(|v| v.to_string()).collect();
         format!("ARRAY[{}]::real[]", elements.join(","))
+    }
+
+    fn vector_literal(query: &[f32]) -> String {
+        let elements: Vec<String> = query.iter().map(|v| v.to_string()).collect();
+        format!("'[{}]'::brindle_vector", elements.join(","))
     }
 
     /// A table of `rows` random `DIM`-dimensional vectors with a brindle index.
@@ -435,9 +447,9 @@ mod tests {
         .expect("create index");
     }
 
+    /// The module's own [`QUERY`] as a `brindle_vector` literal.
     fn vector_query_literal() -> String {
-        let elements: Vec<String> = QUERY.iter().map(|v| v.to_string()).collect();
-        format!("'[{}]'::brindle_vector", elements.join(","))
+        vector_literal(&QUERY)
     }
 
     /// The operator class an index is created with, not a constant, decides how
@@ -544,10 +556,18 @@ mod tests {
     /// search is genuinely approximating rather than exhausting the graph; by
     /// `k = 100` the scan has widened its budget and recovers what it missed.
     ///
-    /// The margin absorbs CI variation across Postgres versions (the fixture's
-    /// values come from Postgres' PRNG, which is only stable within a major),
-    /// and leaves a regression in graph quality room to show up as a failure
-    /// rather than a near-miss.
+    /// What the bar does and does not catch, measured by damaging the graph and
+    /// re-running: quartering the neighbors a build keeps takes every `k` red
+    /// (L2 0.800 / 0.800 / 0.668 / 0.796), while *halving* them stays green
+    /// (0.980 at k = 10, 0.929 at k = 50). Cutting `ef_search` 16-fold is caught
+    /// only at `k = 1`, since the widening path re-searches until it can fill
+    /// the `LIMIT` whatever budget it started from. So this gate catches a
+    /// broken index and a badly degraded one; it is not a fine-grained quality
+    /// alarm, and a threshold near the measured values would be.
+    ///
+    /// The remaining margin absorbs CI variation across Postgres versions: the
+    /// fixture's values come from Postgres' PRNG, which is only guaranteed
+    /// stable within a major.
     const MIN_RECALL: f64 = 0.9;
 
     /// Deterministic query points, from a small xorshift rather than Postgres'
@@ -591,16 +611,6 @@ mod tests {
         .expect("create index");
     }
 
-    fn array_literal(query: &[f32]) -> String {
-        let elements: Vec<String> = query.iter().map(|v| v.to_string()).collect();
-        format!("ARRAY[{}]::real[]", elements.join(","))
-    }
-
-    fn vector_literal(query: &[f32]) -> String {
-        let elements: Vec<String> = query.iter().map(|v| v.to_string()).collect();
-        format!("'[{}]'::brindle_vector", elements.join(","))
-    }
-
     /// Sweep one metric: assert mean recall@k clears [`MIN_RECALL`] for every
     /// `k`, and that the two sides of the comparison are what they claim to be —
     /// the approximate query answered by the index, the exact one not.
@@ -636,10 +646,14 @@ mod tests {
             "the exact baseline was answered by the index it is meant to check:\n{baseline_plan}"
         );
 
-        // One scan per query point answers every `k`: results stream
-        // nearest-first, and `widest` stays inside the candidates the first
-        // batch already holds, so a shorter LIMIT returns this list's prefix.
-        // That is a property of the scan, not an assumption — hence the check.
+        // One scan per query point answers every `k`. `LIMIT` is invisible to
+        // an access method: the order rows come out in depends only on the
+        // query, `ef_search`, and the graph, and a smaller `LIMIT` merely stops
+        // the same scan sooner. So a shorter list is the longer one's prefix by
+        // construction — at any `k`, whatever the budget, including the `k` past
+        // the first batch where a widened re-search can return something nearer
+        // than what came before it. Asserted below all the same, because the
+        // shortcut it justifies is what makes this sweep affordable.
         let widest_ids = ordered_ids(&approximate(&sample, widest));
         for k in RECALL_K {
             assert_eq!(
@@ -664,10 +678,12 @@ mod tests {
             );
 
             for (slot, k) in RECALL_K.iter().enumerate() {
-                hits[slot] += approx[..*k]
-                    .iter()
-                    .filter(|id| exact[..*k].contains(id))
-                    .count() as f64;
+                // Overlap of *distinct* ids. Counting matches instead would let
+                // a row returned twice count twice, inflating recall in the one
+                // test whose job is to notice the scan misbehaving.
+                let truth: HashSet<i32> = exact[..*k].iter().copied().collect();
+                let found: HashSet<i32> = approx[..*k].iter().copied().collect();
+                hits[slot] += found.intersection(&truth).count() as f64;
             }
         }
 
