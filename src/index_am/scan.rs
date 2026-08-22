@@ -332,6 +332,8 @@ pub(super) unsafe extern "C" fn amendscan(scan: pg_sys::IndexScanDesc) {
 #[cfg(any(test, feature = "pg_test"))]
 #[pg_schema]
 mod tests {
+    use std::collections::HashSet;
+
     use pgrx::prelude::*;
     use pgrx::PgRelation;
 
@@ -345,9 +347,19 @@ mod tests {
     /// An arbitrary point in the fixture's `[0,1]^DIM` cube.
     const QUERY: [f32; DIM] = [0.13, 0.77, 0.41, 0.92, 0.05, 0.63, 0.28, 0.55];
 
+    /// The module's own [`QUERY`] as a `real[]` literal.
     fn query_literal() -> String {
-        let elements: Vec<String> = QUERY.iter().map(|v| v.to_string()).collect();
+        array_literal(&QUERY)
+    }
+
+    fn array_literal(query: &[f32]) -> String {
+        let elements: Vec<String> = query.iter().map(|v| v.to_string()).collect();
         format!("ARRAY[{}]::real[]", elements.join(","))
+    }
+
+    fn vector_literal(query: &[f32]) -> String {
+        let elements: Vec<String> = query.iter().map(|v| v.to_string()).collect();
+        format!("'[{}]'::brindle_vector", elements.join(","))
     }
 
     /// A table of `rows` random `DIM`-dimensional vectors with a brindle index.
@@ -435,9 +447,9 @@ mod tests {
         .expect("create index");
     }
 
+    /// The module's own [`QUERY`] as a `brindle_vector` literal.
     fn vector_query_literal() -> String {
-        let elements: Vec<String> = QUERY.iter().map(|v| v.to_string()).collect();
-        format!("'[{}]'::brindle_vector", elements.join(","))
+        vector_literal(&QUERY)
     }
 
     /// The operator class an index is created with, not a constant, decides how
@@ -492,6 +504,249 @@ mod tests {
         assert!(
             hits * 10 >= K * 9,
             "recall {hits}/{K} below 0.9\n  index: {approx:?}\n  exact: {exact:?}"
+        );
+    }
+
+    // --- recall sweep ----------------------------------------------------
+    //
+    // The gate for "this index returns the right rows": for each metric, the
+    // ids an index scan returns against the ids an exact ordering returns, at
+    // several `k`, averaged over a set of queries. Recall is id-set overlap@k,
+    // the ann-benchmarks measure.
+
+    /// Queries per metric per `k`. Enough that one unlucky query cannot pass or
+    /// fail the gate on its own, while keeping the sweep to a few seconds.
+    const RECALL_QUERIES: usize = 15;
+
+    /// The sweep's own fixture is wider and deeper than the rest of this
+    /// module's: at 8 dimensions a graph search finds the exact answer whatever
+    /// state the graph is in, so a gate built there would pass a degraded index
+    /// as readily as a good one. 32 dimensions is where neighbor quality starts
+    /// to matter.
+    const RECALL_DIM: usize = 32;
+    const RECALL_ROWS: i64 = 2000;
+
+    /// `k` values swept. 1 checks the nearest neighbor itself, 10 is the
+    /// headline number, 50 is a deep page still inside the first batch, and 100
+    /// is past [`SWEEP_EF_SEARCH`] candidates — so the sweep also covers the
+    /// widening path, where the scan re-searches with a doubled budget and has
+    /// to suppress what it already returned.
+    const RECALL_K: [usize; 4] = [1, 10, 50, 100];
+
+    /// The candidate budget the sweep measures at, pinned rather than inherited:
+    /// the threshold below is calibrated against this value, and a session or
+    /// cluster setting left elsewhere would quietly turn the gate into a
+    /// measurement of something else — a high budget hiding a real regression, a
+    /// low one failing for an unrelated reason.
+    const SWEEP_EF_SEARCH: usize = 64;
+
+    /// Mean overlap@k the index must reach against the exact ordering, at
+    /// [`SWEEP_EF_SEARCH`] over [`RECALL_ROWS`] rows of [`RECALL_DIM`]
+    /// dimensions.
+    ///
+    /// 0.9 is the usual bar for a usable ANN index. Measured on this fixture the
+    /// graph sits well above it, at k = 1 / 10 / 50 / 100:
+    ///
+    /// | metric | recall |
+    /// |---|---|
+    /// | L2 | 1.000 / 1.000 / 0.993 / 1.000 |
+    /// | cosine | 1.000 / 1.000 / 0.999 / 0.999 |
+    ///
+    /// `k = 50` is the deepest page the first batch answers alone, and where the
+    /// search is genuinely approximating rather than exhausting the graph; by
+    /// `k = 100` the scan has widened its budget and recovers what it missed.
+    ///
+    /// What the bar catches, measured by rebuilding this fixture with a smaller
+    /// `m` — `WITH (m = ...)`, i.e. fewer neighbors kept per node — and running
+    /// the sweep again:
+    ///
+    /// | build | worst recall across the four `k` | verdict |
+    /// |---|---|---|
+    /// | `m = 16` (default) | 0.993 | passes |
+    /// | `m = 8` | 0.944 | passes — a halved graph clears the bar |
+    /// | `m = 4` | 0.745 | fails, but cosine still reports 0.933 at `k = 1` |
+    ///
+    /// So this gate catches an index that is broken or badly degraded, not one
+    /// that is merely worse — and `k = 1` is the least sensitive depth, not a
+    /// cheap stand-in for the sweep. A 16-fold `ef_search` cut likewise shows up
+    /// only at `k = 1`, because the widening path re-searches until it can fill
+    /// the `LIMIT` whatever budget it started from.
+    ///
+    /// The remaining margin absorbs CI variation across Postgres versions: the
+    /// fixture's values come from Postgres' PRNG, which is only guaranteed
+    /// stable within a major.
+    const MIN_RECALL: f64 = 0.9;
+
+    /// Deterministic query points, from a small xorshift rather than Postgres'
+    /// PRNG: the fixture's own values come from `setseed`, and a query set that
+    /// depends on nothing but this test keeps a failure reproducible.
+    fn recall_queries() -> Vec<Vec<f32>> {
+        let mut state: u64 = 0x2545_F491_4F6C_DD1D;
+        let mut unit = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            // Top 24 bits, so the value is exact in an f32.
+            (state >> 40) as f32 / 16_777_216.0
+        };
+        (0..RECALL_QUERIES)
+            .map(|_| (0..RECALL_DIM).map(|_| unit() - 0.5).collect())
+            .collect()
+    }
+
+    /// A table of centered random vectors with a brindle index over `opclass`.
+    ///
+    /// Centered on the origin so directions spread over the whole sphere:
+    /// cosine ranks by angle alone, and data confined to one orthant would make
+    /// every pair look alike, turning a cosine recall number into noise.
+    fn create_recall_fixture(table: &str, column_type: &str, cast: &str, opclass: &str) {
+        Spi::run(&format!(
+            "CREATE TABLE {table} (id int, embedding {column_type})"
+        ))
+        .expect("create");
+        Spi::run("SELECT setseed(0.17)").expect("seed");
+        Spi::run(&format!(
+            "INSERT INTO {table}
+             SELECT i, array_agg((random() - 0.5)::real){cast}
+             FROM generate_series(1, {RECALL_ROWS}) i, generate_series(1, {RECALL_DIM}) d
+             GROUP BY i"
+        ))
+        .expect("insert");
+        Spi::run(&format!(
+            "CREATE INDEX {table}_idx ON {table} USING brindle (embedding {opclass})"
+        ))
+        .expect("create index");
+    }
+
+    /// Sweep one metric: assert mean recall@k clears [`MIN_RECALL`] for every
+    /// `k`, and that the two sides of the comparison are what they claim to be —
+    /// the approximate query answered by the index, the exact one not.
+    fn assert_recall_sweep(
+        table: &str,
+        operator: &str,
+        distance_fn: &str,
+        literal: fn(&[f32]) -> String,
+    ) {
+        let index = format!("{table}_idx");
+        let queries = recall_queries();
+        let approximate = |query: &str, k: usize| {
+            format!("SELECT id FROM {table} ORDER BY embedding {operator} {query} LIMIT {k}")
+        };
+        // Ordering by a plain function call leaves the planner nothing the index
+        // can answer, so the baseline is computed independently of what it is
+        // measuring. Asserted below rather than assumed.
+        let exact = |query: &str, k: usize| {
+            format!("SELECT id FROM {table} ORDER BY {distance_fn}(embedding, {query}) LIMIT {k}")
+        };
+
+        // Scoped to the test's transaction, so the sweep neither inherits a
+        // stray setting nor leaves one behind.
+        Spi::run(&format!("SET LOCAL brindle.ef_search = {SWEEP_EF_SEARCH}"))
+            .expect("pin ef_search");
+
+        let widest = RECALL_K
+            .iter()
+            .copied()
+            .max()
+            .expect("RECALL_K is not empty");
+        let sample = literal(&queries[0]);
+        assert_uses_index(&approximate(&sample, widest), &index);
+        let baseline_plan = plan_of(&exact(&sample, widest));
+        assert!(
+            !baseline_plan.contains(&index),
+            "the exact baseline was answered by the index it is meant to check:\n{baseline_plan}"
+        );
+
+        // One scan per query point answers every `k`. `LIMIT` is invisible to an
+        // access method: *within a scan* the order rows come out in depends only
+        // on the query, `ef_search`, and the graph, and a smaller `LIMIT` merely
+        // stops that scan sooner — so a shorter list is the longer one's prefix
+        // at any `k`, including the ones past the first batch, where a widened
+        // re-search can return something nearer than what came before it.
+        //
+        // What `LIMIT` does reach is the planner: a different `k` could be
+        // costed onto a different path, and two lists from two different plans
+        // need not relate at all. That is the assumption the assertion below
+        // guards, and the reason this shortcut is checked rather than trusted.
+        let widest_ids = ordered_ids(&approximate(&sample, widest));
+        for k in RECALL_K {
+            // Check the premise, not just its consequence: at a `k` where every
+            // id is correct anyway, a flip to a sort would return the same list
+            // and slip past the comparison below.
+            assert_uses_index(&approximate(&sample, k), &index);
+            assert_eq!(
+                ordered_ids(&approximate(&sample, k)),
+                widest_ids[..k],
+                "LIMIT {k} is not the prefix of LIMIT {widest}, so one scan \
+                 cannot stand in for the others"
+            );
+        }
+
+        let mut hits = [0.0; RECALL_K.len()];
+        for query in &queries {
+            let query = literal(query);
+            let approx = ordered_ids(&approximate(&query, widest));
+            let exact = ordered_ids(&exact(&query, widest));
+            assert_eq!(approx.len(), widest, "index returned {} rows", approx.len());
+            assert_eq!(
+                exact.len(),
+                widest,
+                "baseline returned {} rows",
+                exact.len()
+            );
+
+            for (slot, k) in RECALL_K.iter().enumerate() {
+                // Overlap of *distinct* ids. Counting matches instead would let
+                // a row returned twice count twice, inflating recall in the one
+                // test whose job is to notice the scan misbehaving.
+                let truth: HashSet<i32> = exact[..*k].iter().copied().collect();
+                let found: HashSet<i32> = approx[..*k].iter().copied().collect();
+                hits[slot] += found.intersection(&truth).count() as f64;
+            }
+        }
+
+        let recalls: Vec<(usize, f64)> = RECALL_K
+            .iter()
+            .enumerate()
+            .map(|(slot, k)| (*k, hits[slot] / (k * queries.len()) as f64))
+            .collect();
+        // Report the whole sweep whichever `k` fails: one weak `k` next to the
+        // others is the difference between "the graph is off" and "this depth
+        // is where it thins out".
+        let summary: Vec<String> = recalls
+            .iter()
+            .map(|(k, recall)| format!("recall@{k} {recall:.3}"))
+            .collect();
+
+        for (k, recall) in &recalls {
+            assert!(
+                *recall >= MIN_RECALL,
+                "{table}: mean recall@{k} below {MIN_RECALL} over {} queries [{}]",
+                queries.len(),
+                summary.join(", ")
+            );
+        }
+    }
+
+    #[pg_test]
+    fn l2_index_recall_clears_the_threshold() {
+        create_recall_fixture("t_sweep_l2", "real[]", "", "");
+        assert_recall_sweep("t_sweep_l2", "<->", "brindle_l2_distance", array_literal);
+    }
+
+    #[pg_test]
+    fn cosine_index_recall_clears_the_threshold() {
+        create_recall_fixture(
+            "t_sweep_cos",
+            "brindle_vector",
+            "::brindle_vector",
+            "brindle_vector_cosine_ops",
+        );
+        assert_recall_sweep(
+            "t_sweep_cos",
+            "<=>",
+            "brindle_vector_cosine_distance",
+            vector_literal,
         );
     }
 
