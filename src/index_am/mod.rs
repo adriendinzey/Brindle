@@ -416,8 +416,10 @@ unsafe extern "C" fn amcostestimate(
     // under the level distribution (1/ln m) is log_m(n). Presetting this stops
     // genericcostestimate from assuming every index tuple is visited, which is
     // what lets a `LIMIT k` plan prefer this index over sorting the whole table.
-    // TODO: fold in ef_search once it is configurable, and the cost of loading
-    // the graph while storage still rebuilds it once per scan.
+    // TODO: fold in `brindle.ef_search`, which now sizes the scan's candidate
+    // budget and so its work, along with the cost of loading the graph while
+    // storage still rebuilds it once per scan. Both raise the estimate, so a
+    // tuned-up session currently looks cheaper to the planner than it is.
     let m = HnswParams::default().m.max(2) as f64;
     let tuples = (*(*path).indexinfo).tuples.max(1.0);
     let entry_level = (tuples.ln() / m.ln()).floor().max(0.0);
@@ -439,8 +441,9 @@ unsafe extern "C" fn amcostestimate(
 
 #[pg_guard]
 unsafe extern "C" fn amvalidate(_opclass_oid: pg_sys::Oid) -> bool {
-    // TODO: verify the opclass shape (support proc 1 signature) once the
-    // vector type and multiple metrics exist.
+    // TODO: check the support functions an operator class must supply — proc 1's
+    // signature, and that procs 2 and 3 return codes this build understands — so
+    // a malformed class is rejected here rather than at the first build.
     true
 }
 
