@@ -99,7 +99,7 @@ and external tooling (`pageinspect`) sees a well-formed page.
 Element tuples and neighbor chunks live on **separate pages**, tracked by two
 insert pointers in the metapage. The separation costs at most one extra page on
 a tiny index and buys three things: a sequential sweep of vectors (used by
-brute-force fallback, by vacuum, and by build) reads no adjacency bytes; an edge
+exhaustive scan fallback, by vacuum, and by build) reads no adjacency bytes; an edge
 update never dirties a vector page; and vector pages stay dense, which is what
 the distance loop scans.
 
@@ -116,18 +116,43 @@ offset size field
 
 `page_id` is the same trick pgvector uses: it makes a page recognizable to
 `pageinspect` and turns "we read a page from the wrong relation or fork" into a
-loud error instead of a misparse. Every read validates `page_id` and `kind`
-before trusting the contents.
+loud error instead of a misparse. Every read of an element or neighbor page
+validates `page_id` and `kind` before trusting the contents.
 
-### 3.2 Metapage (block 0, item 1)
+Two exceptions, both load-bearing:
+
+- **Block 0 is validated in a fixed order** — magic, then version, then special
+  space — never the other way round. A version-1 index has no special space at
+  all ([§ 11](#11-migration-from-the-interim-format)), so a special-space check
+  that ran first would read past the page end instead of producing the clean
+  "rebuild this index" error.
+- **An uninitialized page is not an error.** Relation extension is not
+  transactional: `smgr` extends the file before any WAL record is written, so a
+  crash *or an ordinary `ROLLBACK`* between the extension and the record leaves
+  a zeroed block in the fork permanently. Every reader treats `PageIsNew` as an
+  empty page and moves on; the allocator ([§ 7.4](#74-allocation-and-free-space))
+  treats it as a free page to initialize and reuse. A sweep that errored on one
+  would turn a routine rollback into an unqueryable index.
+
+### 3.2 Metapage (block 0, page contents)
+
+The metapage is written into the page's content area — directly after the
+standard header, at `PageGetContents`, with `pd_lower` marking its end — and
+**not** as a line-pointer item. That is where version 1 puts its own metapage
+and where pgvector puts its HNSW metapage, and it is what makes the version
+check in [§ 11](#11-migration-from-the-interim-format) work: `magic` and
+`version` land at the same page offsets (24 and 28) in both formats, so
+version-2 code reading a version-1 index finds the field it needs at the
+offset it expects, rather than dereferencing a line pointer that format
+never wrote.
 
 Fixed offsets, little-endian, exactly as the version-1 metapage and the graph
 codec already store their scalars:
 
 ```
 offset size field                notes
-  0     4   magic               0x4252_4E44 "BRND"
-  4     4   version             2
+  0     4   magic               0x4252_4E44 "BRND"   ─┐ same offsets as version 1,
+  4     4   version             2                    ─┘ so the version check works
   8     1   metric              Metric::code()
   9     1   flags               reserved, zero
  10     2   reserved
@@ -137,18 +162,21 @@ offset size field                notes
  24     4   gamma               f32 bits
  28     4   entry_block         entry point, InvalidBlockNumber when empty
  32     2   entry_offset
- 34     2   entry_level         the entry point's top layer
- 36     4   max_layer
- 40     8   node_count          hint, see below
- 48     8   deleted_count       hint, see below
- 56     4   element_insert_page block to try first for a new element tuple
- 60     4   neighbor_insert_page
- 64     4   free_head           head of the free-page chain, or InvalidBlockNumber
- 68     4   reserved
- 72     8   seed                PRNG seed the index was built with
- 80     8   rng_state           live PRNG state, advanced by each insert
-                                (88 bytes)
+ 34     2   entry_level         the entry point's layer = the graph's top layer
+ 36     4   element_insert_page block to try first for a new element tuple
+ 40     4   neighbor_insert_page
+ 44     4   free_head           head of the free-page chain, or InvalidBlockNumber
+ 48     8   node_count          hint, see below
+ 56     8   deleted_count       hint, see below
+ 64     8   seed                PRNG seed the index was built with
+ 72     8   rng_state           live PRNG state, advanced by each insert
+                                (80 bytes)
 ```
+
+There is deliberately no separate `max_layer`. The entry point is by
+construction a node at the top layer — the core raises both together, in one
+place — so a second field could only ever disagree with `entry_level`. Descent
+starts at `entry_level`.
 
 `m`, `ef_construction`, `gamma`, `metric`, `dim` and `seed` are written once at
 build and never change — an `ALTER INDEX ... SET (...)` still takes effect only
@@ -162,9 +190,12 @@ version-1 codec serializes the graph's PRNG state for the same reason; the
 metapage is where it lives now, and an insert advances it under the writer lock.
 
 `node_count` and `deleted_count` are **hints**: they feed planner statistics and
-the compaction trigger, and a crash may leave them one behind. Nothing that must
-be correct may read them — every authoritative count comes from a sweep of the
-element pages ([§ 6.3](#63-sequential-sweep)).
+the compaction trigger, and a crash may leave them one behind. They may
+*schedule* work — decide when a scan switches to an exhaustive sweep, when
+compaction is worth running — but they may never *bound a result set*. Every
+count a correct answer depends on comes from a sweep of the element pages
+([§ 6.3](#63-sequential-sweep)). [§ 6.2](#62-index-scan) spells out the one
+place where confusing the two would drop rows.
 
 ### 3.3 Element tuple
 
@@ -202,6 +233,18 @@ Three deliberate choices:
   not persist attributes at all — it carries a debug assertion that the graph
   reaching it has none. This format closes that gap, which is what lets
   filter-aware search survive a restart.)
+
+  The 16-byte slot is twice what the value needs — three variants and an 8-byte
+  payload — and buys a fixed stride with a naturally aligned payload, which is
+  what keeps predicate evaluation a subscript rather than a parse. Attribute
+  rows are a handful of values per node; the packing is not where this format's
+  space goes.
+
+  **Nothing stores an attribute *schema*.** Positions in the row are the index's
+  own attribute order — the included columns as the catalog lists them — so the
+  mapping lives in the index's tuple descriptor, which every path already has
+  open. Storing a copy would create a second source of truth that `ALTER TABLE`
+  could desynchronize.
 - **The vector is 8-byte aligned** and stored as plain `f32`, so the distance
   kernels read page bytes directly as a `&[f32]` — no copy, no decode, matching
   how `brindle_vector` is already laid out in the heap.
@@ -230,6 +273,11 @@ The chunk is allocated at full `capacity` and never grows, so adding a back-edge
 is a `count += 1` plus a 6-byte write inside one page, and pruning a full list
 rewrites entries in place. That is what makes an edge update a single-page,
 single-record change.
+
+The 6-byte stride means every entry after the first is 4-byte misaligned — the
+same reason `ItemPointerData` is spelled as three `uint16`s rather than a
+`uint32` and a `uint16`. Decode entries bytewise; an aligned 32-bit load over
+this array is undefined behavior, not an optimization.
 
 Levels are geometrically distributed — a node reaches layer 1 with probability
 `1/m`, so at `m = 16` about 15 nodes in 16 exist only at layer 0. The common node
@@ -278,13 +326,15 @@ At level 0 with no attributes that leaves `(8152 − 24) / 4 = 2032` components,
 so:
 
 - **Maximum indexable dimensions: 2000.** Same limit pgvector's HNSW carries,
-  and for the same reason. The `brindle_vector` type still accepts up to 16000
-  — the cap applies to *indexing*, and `CREATE INDEX` rejects a wider column
-  with a message naming the limit.
-- Attributes and levels eat into the same budget (8 attributes ≈ 128 bytes ≈ 32
-  dimensions), so the build and insert paths compute the exact tuple size and
-  raise a clear error if it does not fit, rather than relying on the headline
-  number.
+  and for the same reason. The `brindle_vector` type still accepts up to 16000;
+  the cap applies to *indexing*.
+- The check happens on the first vector indexed, not at `CREATE INDEX`: a column
+  does not declare its width (the type has no typmod, and `real[]` carries none
+  either), and `dim` is fixed by the first vector the build sees. So build and
+  insert compute the exact tuple size — attributes and levels eat the same
+  budget, 8 attributes ≈ 128 bytes ≈ 32 dimensions — and raise an error naming
+  the dimension count and the limit if it does not fit. The headline number is
+  the guidance; the size check is the rule.
 
 **Neighbor chunk** = `8 + 6·capacity`, so a chunk fits while capacity ≤ 1357.
 
@@ -326,6 +376,9 @@ pub trait GraphStore {
     /// Distance from `query` to `node`'s vector.
     fn distance(&self, query: &[f32], node: NodeRef) -> Result<f32, Self::Error>;
 
+    /// Copy `node`'s vector into `out`, for when it must outlive the page pin.
+    fn load_vector(&self, node: NodeRef, out: &mut Vec<f32>) -> Result<(), Self::Error>;
+
     /// Replace `out` with `node`'s attribute row (empty if it has none).
     fn attrs(&self, node: NodeRef, out: &mut Vec<AttrValue>) -> Result<(), Self::Error>;
 }
@@ -342,6 +395,66 @@ in place, and unpins before returning. Lending the slice would push buffer-pin
 lifetimes into generic core code, and copying the vector out would allocate per
 comparison — the one thing the distance path must never do. Callers pass scratch
 buffers (`out`) in for the same reason.
+
+`load_vector` is the deliberate escape hatch, and the neighbor-selection
+heuristic is why it exists: that heuristic compares candidates *to each other*,
+not just to the query, so it needs one node's vector to outlive the page pin on
+another's. The pattern is copy the base vector into a scratch buffer once, then
+`distance(&scratch, candidate)` down the candidate list — one copy per pruning
+pass, not one per comparison.
+
+### 6.1.1 The write side
+
+The read trait is not enough. Insert has to run the same descent, layer search
+and neighbor-selection heuristic the in-memory build runs — those are private
+helpers on the graph today — and then write edges back. Without a mutable
+counterpart the boundary would have to reimplement all three, which is exactly
+the duplication this section exists to prevent, and the surest way to break
+invariant I10.
+
+```rust
+pub trait GraphStoreMut: GraphStore {
+    /// What the boundary needs to store beside a node and the core never reads
+    /// — the heap TID for the paged store, `()` for the in-memory one.
+    type Payload;
+
+    /// Draw the next node's level from the index's persistent PRNG, advancing it.
+    fn next_level(&mut self) -> Result<usize, Self::Error>;
+
+    /// Reserve a node at `level` with its vector, attribute row and payload, its
+    /// neighbor lists empty. Nothing references it yet.
+    fn add_node(&mut self, level: usize, vector: &[f32], attrs: &[AttrValue],
+                payload: Self::Payload) -> Result<NodeRef, Self::Error>;
+
+    /// Replace `node`'s neighbor list at `layer`. The only edge-write primitive:
+    /// adding a back-edge and pruning a full list are both this call.
+    fn set_neighbors(&mut self, node: NodeRef, layer: usize, neighbors: &[NodeRef])
+        -> Result<(), Self::Error>;
+
+    /// Make `node` the entry point at `level`. Only ever raises the top layer.
+    fn set_entry(&mut self, node: NodeRef, level: usize) -> Result<(), Self::Error>;
+
+    /// Set or clear a node's tombstone.
+    fn set_deleted(&mut self, node: NodeRef, deleted: bool) -> Result<(), Self::Error>;
+}
+```
+
+Insert becomes a core free function over the pair —
+`insert_into<S: GraphStoreMut>(store, vector, attrs, payload) -> Result<NodeRef, S::Error>`
+— carrying level assignment, descent, layer search, neighbor selection and
+back-edge pruning. `Hnsw::insert` becomes a thin wrapper over it, so the core's
+own tests, recall checks and benchmarks keep running against the in-memory
+implementation unchanged.
+
+Note what this means for sequencing: **this is a change to the pure core, not
+only to the boundary.** The algorithm is untouched — what changes is that it
+reads and writes through a trait instead of through its own fields — but the
+edit lands in `src/hnsw.rs`, and the storage implementation has to budget for
+it.
+
+The core stays `pgrx`-free throughout: `NodeRef` is an opaque `u64`, `Payload`
+is an associated type the core never inspects, and nothing in either trait
+mentions a buffer, a page or a relation.
 
 ### 6.2 Index scan
 
@@ -360,20 +473,38 @@ scan; the result is an approximate search that started one node off, which is
 within what an approximate index promises.
 
 The batching behavior scans rely on today — widen the budget and re-search until
-the executor stops asking — is unchanged. It reads `node_count` and
-`deleted_count` from the metapage where it reads `len()`/`live_len()` from the
-in-memory graph today.
+the executor stops asking — is unchanged in shape, but **not** in where it gets
+its live count. Today that count is exact, because the scan holds a private copy
+of the whole graph. The metapage's `deleted_count` and `node_count` are hints
+that a crash can leave one behind ([§ 3.2](#32-metapage-block-0-page-contents)),
+and this is the one place where treating a hint as exact would be a wrong
+answer rather than a recall trade-off: an unfiltered `ORDER BY` promises *every*
+row, the widening loop stops as soon as its budget covers the live count, and
+the exhaustive pass returns only as many rows as that budget. Understate the
+live count by *n* and the scan silently drops *n* rows.
+
+So the rule is:
+
+- The hint may decide **when** to stop widening and switch to the exhaustive
+  sweep ([§ 6.3](#63-sequential-sweep)).
+- The sweep's own count decides **whether the scan is done**. The sweep visits
+  every element page, so it returns the true live set and the true live count;
+  a scan may mark itself drained only once it has emitted that set. A hint that
+  understates the live count therefore costs one early sweep, never a row.
 
 ### 6.3 Sequential sweep
 
-Three paths need every element and no adjacency: the brute-force fallback (when
-the requested budget exceeds the live node count), vacuum, and the statistics a
-cleanup pass reports. All three sweep element pages in block order, and per page
-walk line pointers 1..`PageGetMaxOffsetNumber`, skipping items whose `kind` is
-not `ELEMENT`. Sweeping is sequential I/O over exactly the vector bytes, which
-is why elements and neighbor chunks are on separate pages.
+Three paths need every element and no adjacency: the exhaustive fallback that
+ends a widening scan, vacuum, and the statistics a cleanup pass reports. All
+three sweep element pages in block order, and per page walk line pointers
+1..`PageGetMaxOffsetNumber`, skipping items whose `kind` is not `ELEMENT` and
+skipping `PageIsNew` pages entirely ([§ 3.1](#31-page-special-space)). Sweeping
+is sequential I/O over exactly the vector bytes, which is why elements and
+neighbor chunks are on separate pages.
 
-A sweep is the authoritative source for counts; the metapage counters are hints.
+A sweep is the authoritative source for counts and for the live set; the
+metapage counters are hints, and [§ 6.2](#62-index-scan) is the reason that
+distinction is not academic.
 
 ---
 
@@ -424,8 +555,8 @@ paged `GraphStore`:
    which needs distances, so the candidate vectors are read *before* the
    exclusive lock is taken — then rewrite the list. One page, one record, per
    back-edge.
-5. If the new node's level exceeds `max_layer`, update the metapage's entry
-   point, `entry_level` and `max_layer`.
+5. If the new node's level exceeds the current `entry_level`, update the
+   metapage's entry point and `entry_level` together — they are one fact.
 6. Update the metapage: `node_count`, insert pointers, PRNG state (folded into
    step 5's write when both happen).
 
@@ -457,14 +588,25 @@ metapage.
 ### 7.4 Allocation and free space
 
 A new item goes on the insert page for its kind (`element_insert_page` /
-`neighbor_insert_page`) if `PageGetFreeSpace` admits it. Otherwise: pop a page
-from `free_head` if the chain is non-empty, else extend the relation with
-`P_NEW`; initialize it with the right `kind`; make it the new insert pointer.
-Because writers are serialized, extension needs no extra interlock.
+`neighbor_insert_page`) if it fits. Compare against `MAXALIGN(item_size)`, not
+the raw size: `PageAddItem` aligns every item, and `PageGetFreeSpace` has
+already subtracted the line pointer the item will need, so the aligned size is
+the honest comparison. Otherwise: reuse a page from `free_head` or a `PageIsNew`
+block if one is available, else extend the relation; initialize it with the
+right `kind`; make it the new insert pointer.
 
-Relation extension is the buffer manager's own business — it takes the
-extension lock for `P_NEW` internally — and the writer lock means no two
-backends are racing for it anyway.
+**Extension does not take the extension lock for you.** The `P_NEW` path of
+`ReadBufferExtended` passes `EB_SKIP_EXTENSION_LOCK` — it is documented in
+`bufmgr.c` as a backwards-compatibility path — so what actually keeps two
+backends from extending at once here is brindle's own writer serialization
+([§ 8.3](#83-writers)), nothing in the buffer manager. Prefer
+`ExtendBufferedRel`, which takes the lock and scales better, and treat this as
+a hard prerequisite of ever relaxing [§ 8.4](#84-why-writers-are-serialized):
+concurrent writers without a real extension interlock corrupt the fork.
+
+`free_head` has no producer until compaction lands ([§ 7.3](#73-delete-and-vacuum))
+— today the chain is always empty and the branch is dead. It is specified now so
+that reclamation does not have to change the metapage format later.
 
 Insert pointers are hints like the counters — a stale one costs a wasted page,
 never correctness.
@@ -502,6 +644,13 @@ Inserts and vacuum take an `ExclusiveLock` on a designated page-lock block
 (block 0 — the same heavyweight lock the interim format uses to arbitrate the
 whole image, kept only as a writer mutex). It is held for the duration of one
 insert or one vacuum pass.
+
+Note the asymmetry: an insert holds it for a handful of page reads and writes,
+but a vacuum pass holds it across a full sequential sweep of every element page,
+blocking every `INSERT` on the table for that long. That is no worse than today,
+where vacuum rewrites the entire image under the same lock, and it is a bounded
+sequential scan rather than a rewrite — but it is a real cost, and it is the
+second reason (after insert concurrency) to revisit [§ 8.4](#84-why-writers-are-serialized).
 
 ### 8.4 Why writers are serialized
 
@@ -549,6 +698,15 @@ ordering invariant (I5) buys.
 Buffers registered in one record are locked in ascending block order, per
 [§ 8.1](#81-the-rule).
 
+One mechanical rule belongs here rather than with the call sequences in
+[§ 12](#12-left-to-the-implementation), because getting it wrong is a
+correctness bug and not a style one: a **newly initialized page must be
+registered with `GENERIC_XLOG_FULL_IMAGE`.** Generic WAL logs the delta between
+the page as it was at registration and as it is at finish, so a page that was
+`PageInit`ed *before* being registered replays onto a zeroed block during
+recovery and loses its header. Every allocation path in
+[§ 7.4](#74-allocation-and-free-space) hits this.
+
 ### 9.3 Recovery
 
 - **Nothing is cached across transactions**, so recovery rebuilds nothing.
@@ -586,8 +744,13 @@ storage tests should be written against.
 
 - **I1** Block 0 is the metapage, has `kind = META`, and carries magic `BRND`
   and the format version. Every read validates both before trusting a byte.
-- **I2** Every page carries `page_id = 0x4252` and a `kind`; every item carries a
-  `kind` byte matching its page. A mismatch is an error, never a reinterpretation.
+- **I2** Every *initialized* page carries `page_id = 0x4252` and a `kind`; every
+  item carries a `kind` byte matching its page. A mismatch is an error, never a
+  reinterpretation. A `PageIsNew` block is not a mismatch — extension is not
+  transactional, so a zeroed block is a legal state that readers skip and the
+  allocator reuses.
+- **I2b** Block 0 is checked magic-then-version-then-special-space, so a
+  version-1 index produces a clean error instead of an out-of-page read.
 - **I3** An element's `(block, offset)` is stable for the life of the index. A
   line pointer is never reused, and a tombstoned element is never removed, while
   any neighbor list could still name it. Only compaction under an exclusive lock
@@ -601,8 +764,13 @@ storage tests should be written against.
   derived cap (`m0_cap` at layer 0, `m_cap` above) for the index's `m` and `γ`.
 - **I7** Every item fits its page: no element tuple, neighbor chunk or metapage
   item spans pages. Build and insert verify the size and error before writing.
-- **I8** `node_count` and `deleted_count` are hints. No correctness decision
-  reads them; a sweep of the element pages is authoritative.
+- **I8** `node_count` and `deleted_count` are hints: they may schedule work but
+  never bound a result set. In particular a scan may mark itself drained only on
+  the strength of a sweep, never of a counter — a stale counter must cost an
+  extra sweep, never a missing row.
+- **I8b** `entry_level` is the level of the node `entry_block`/`entry_offset`
+  names, and every element's `dim` equals the metapage's. Both are redundant by
+  construction and are checked on read, not trusted.
 - **I9** No path holds two buffer content locks except within a single WAL
   record, where buffers are locked in ascending block order.
 - **I10** A scan's results and recall are unchanged from the in-memory
@@ -620,9 +788,14 @@ rebuilt with `REINDEX`.**
   version-2 code fails with an error naming the version and telling the user to
   `REINDEX INDEX <name>` (or `REINDEX TABLE`), rather than misparsing a blob as
   a metapage.
-- The magic (`BRND`) and the metapage's position (block 0, first two fields)
-  are deliberately unchanged, so the version check is the first thing that runs
-  and always finds the field it needs.
+- That check works only because the two formats agree on where to look, which is
+  why [§ 3.2](#32-metapage-block-0-page-contents) keeps the metapage in the page
+  content area rather than making it a line-pointer item: `magic` and `version`
+  sit at page offsets 24 and 28 in both. A version-1 page has no line pointers
+  and no special space, so a version-2 reader that consulted either one first
+  would read past the end of the page instead of reporting the version — which
+  is why the read order in [§ 3.1](#31-page-special-space) is an invariant (I2b)
+  and not a suggestion.
 - Writing a converter was considered and rejected: it would have to reconstruct
   a graph from a format that is about to be deleted, for an extension that has
   not shipped a release. `REINDEX` produces a better graph anyway.
