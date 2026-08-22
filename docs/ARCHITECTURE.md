@@ -151,6 +151,10 @@ load**, because graph algorithms + filtering are the differentiating work and th
 buffer-manager integration is largely orthogonal systems plumbing. The roadmap
 calls this out explicitly so the tradeoff is never hidden.
 
+The page layout that replaces the interim blob — metapage, element tuples,
+neighbor chunks, and the locking and WAL plan around them — is specified in
+[STORAGE.md](STORAGE.md).
+
 ## 5. Module map (target)
 
 ```
