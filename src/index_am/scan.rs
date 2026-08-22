@@ -6,34 +6,33 @@
 //! right-hand argument is the query vector. Results stream nearest-first and the
 //! executor stops whenever it has seen enough.
 //!
-//! # How many neighbors to fetch
+//! # How many rows a scan can produce
 //!
-//! `LIMIT` is not visible to an access method, so the scan can't size its search
-//! to the caller. It fetches a batch and grows on demand:
+//! One search, at a candidate budget of `brindle.ef_search`, read at the start of
+//! each scan so a session can retune accuracy against latency without rebuilding
+//! anything. Its results are returned in distance order and then the scan ends —
+//! so `ORDER BY ... LIMIT n` yields `min(n, ef_search)` rows, and a caller who
+//! wants more raises the budget.
 //!
-//! 1. The first batch searches the graph with a candidate budget of
-//!    `brindle.ef_search`, read at the start of each scan so a session can
-//!    retune accuracy against latency without rebuilding anything.
-//!    TODO: let a per-index reloption override the session setting, so one
-//!    index can be tuned without moving every scan in the session.
-//! 2. Draining a batch doubles the budget and re-runs the search from scratch.
-//!    A wider search is not a strict superset of a narrower one, so results
-//!    already handed to the executor are filtered out by node id — a row is
-//!    never returned twice.
-//! 3. Once the budget reaches the number of live nodes the scan switches to an
-//!    exact pass. A graph walk can leave nodes unreachable, and an unfiltered
-//!    `ORDER BY` that quietly dropped rows would be a wrong answer rather than a
-//!    recall trade-off; the exact tail also costs no more than the sort the
-//!    planner would otherwise have chosen.
+//! That ceiling is deliberate, and it is the whole reason this module is shaped
+//! this way. `amcanorderbyop` promises the planner that rows arrive in operator
+//! order, and on that promise the planner deletes its own Sort node — so nothing
+//! downstream can repair an order the access method got wrong. Producing more
+//! rows than one search holds means widening the search, and a wider HNSW search
+//! is not a superset of a narrower one: it can turn up a row nearer than one
+//! already handed over, which is an inversion no `LIMIT` will ever notice and no
+//! user can tune away. Postgres' reorder queue (`xs_recheckorderby`) cannot
+//! rescue it either — it needs a non-decreasing *lower bound* per row, and a
+//! graph walk cannot bound what it has not visited.
 //!
-//! Because the budget doubles, a scan that reads `n` rows does about `2n` rows'
-//! worth of search in total. Bookkeeping is one node id per row returned.
+//! Between an approximate result set and an approximate ordering, this scan takes
+//! the first: recall is the trade the caller chose by reaching for an ANN index,
+//! ordering is a contract they cannot see break.
 //!
-//! TODO: stream directly out of the graph's candidate heap instead of re-running
-//! the search, so a deep scan resumes rather than restarts.
+//! TODO: an opt-in mode that keeps searching past the budget for callers who need
+//! completeness more than ordering, the way pgvector's iterative scans do.
 
 use core::ffi::{c_int, c_void};
-use std::collections::HashSet;
 
 use pgrx::itemptr::item_pointer_set_all;
 use pgrx::prelude::*;
@@ -73,103 +72,63 @@ impl From<HnswError> for ScanError {
 }
 
 /// The search behind one scan: the graph it loaded, the node-id → TID table, and
-/// the current batch of results with a cursor into it.
+/// the result of the one search this scan runs, with a cursor into it.
 struct ScanSearch {
     hnsw: Hnsw,
     /// `tids[i]` is the heap address of graph node `i`.
     tids: Vec<TidPair>,
-    /// Live node count, fixed for the life of the scan (the graph is a private
-    /// copy that nothing mutates).
-    live: usize,
     query: Vec<f32>,
-    /// Current batch as `(node id, heap tid)`, nearest first.
-    batch: Vec<(usize, TidPair)>,
+    /// The search's results as heap addresses, nearest first.
+    results: Vec<TidPair>,
     cursor: usize,
-    /// Candidate budget for the next batch; doubles until it covers the graph.
-    budget: usize,
-    /// Node ids already handed to the executor, so a wider re-search never
-    /// repeats a row.
-    emitted: HashSet<usize>,
-    /// Set once the graph can produce nothing new.
-    drained: bool,
 }
 
 impl ScanSearch {
     fn new(hnsw: Hnsw, tids: Vec<TidPair>) -> Self {
-        let live = hnsw.live_len();
         Self {
             hnsw,
             tids,
-            live,
             query: Vec::new(),
-            batch: Vec::new(),
+            results: Vec::new(),
             cursor: 0,
-            budget: guc::ef_search(),
-            emitted: HashSet::new(),
-            drained: true,
         }
     }
 
-    /// Begin (or restart) the scan for `query`, filling the first batch.
+    /// Begin (or restart) the scan for `query`, running its one search.
     fn start(&mut self, query: Vec<f32>) -> Result<(), ScanError> {
         self.query = query;
-        self.batch.clear();
         self.cursor = 0;
-        // Re-read per scan: a session that raised ef_search expects the next
-        // query to use it, not the value in force when the scan was opened.
-        self.budget = guc::ef_search();
-        self.emitted.clear();
-        self.drained = false;
-        self.refill()
+        // Read per scan: a session that raised ef_search expects the next query
+        // to use it, not the value in force when the scan was opened.
+        let budget = guc::ef_search().max(1);
+
+        let found = self.hnsw.search(&self.query, budget, budget)?;
+        self.results.clear();
+        self.results.reserve(found.len());
+        for (_, id) in found {
+            match self.tids.get(id) {
+                Some(&tid) => self.results.push(tid),
+                None => return Err(ScanError::UnmappedNode(id)),
+            }
+        }
+        Ok(())
     }
 
     /// End the scan without returning anything.
     fn stop(&mut self) {
         self.query = Vec::new();
-        self.batch.clear();
+        self.results = Vec::new();
         self.cursor = 0;
-        self.emitted = HashSet::new();
-        self.drained = true;
     }
 
-    /// The next heap TID, nearest first, or `None` once the scan is exhausted.
+    /// The next heap TID, nearest first, or `None` once the search's results are
+    /// spent — which is also where the scan ends, even if the caller wanted more.
     fn next(&mut self) -> Result<Option<TidPair>, ScanError> {
-        while self.cursor >= self.batch.len() {
-            if self.drained {
-                return Ok(None);
-            }
-            self.refill()?;
+        let tid = self.results.get(self.cursor).copied();
+        if tid.is_some() {
+            self.cursor += 1;
         }
-        let (id, tid) = self.batch[self.cursor];
-        self.cursor += 1;
-        self.emitted.insert(id);
-        Ok(Some(tid))
-    }
-
-    /// Search again with the current budget and keep whatever hasn't been
-    /// returned yet. See the module docs for why the widest batch is exact.
-    fn refill(&mut self) -> Result<(), ScanError> {
-        let budget = self.budget.max(1);
-        let found = if budget >= self.live {
-            self.drained = true;
-            self.hnsw.brute_force(&self.query, budget)?
-        } else {
-            self.budget = budget.saturating_mul(2);
-            self.hnsw.search(&self.query, budget, budget)?
-        };
-
-        self.batch.clear();
-        self.cursor = 0;
-        for (_, id) in found {
-            if self.emitted.contains(&id) {
-                continue;
-            }
-            match self.tids.get(id) {
-                Some(&tid) => self.batch.push((id, tid)),
-                None => return Err(ScanError::UnmappedNode(id)),
-            }
-        }
-        Ok(())
+        Ok(tid)
     }
 }
 
@@ -527,17 +486,21 @@ mod tests {
     const RECALL_ROWS: i64 = 2000;
 
     /// `k` values swept. 1 checks the nearest neighbor itself, 10 is the
-    /// headline number, 50 is a deep page still inside the first batch, and 100
-    /// is past [`SWEEP_EF_SEARCH`] candidates — so the sweep also covers the
-    /// widening path, where the scan re-searches with a doubled budget and has
-    /// to suppress what it already returned.
-    const RECALL_K: [usize; 4] = [1, 10, 50, 100];
+    /// headline number, and 25 and 50 are deep pages where a graph walk has had
+    /// room to go wrong. All of them sit under [`SWEEP_EF_SEARCH`], because a
+    /// scan stops at its budget: a deeper `k` would measure that ceiling rather
+    /// than the graph's quality.
+    const RECALL_K: [usize; 4] = [1, 10, 25, 50];
 
     /// The candidate budget the sweep measures at, pinned rather than inherited:
     /// the threshold below is calibrated against this value, and a session or
     /// cluster setting left elsewhere would quietly turn the gate into a
     /// measurement of something else — a high budget hiding a real regression, a
     /// low one failing for an unrelated reason.
+    ///
+    /// It must be at least the deepest `k`: a scan returns what one search found
+    /// and then stops, so measuring recall@100 on a 64-candidate budget would
+    /// measure that ceiling rather than the graph's quality.
     const SWEEP_EF_SEARCH: usize = 64;
 
     /// Mean overlap@k the index must reach against the exact ordering, at
@@ -545,16 +508,16 @@ mod tests {
     /// dimensions.
     ///
     /// 0.9 is the usual bar for a usable ANN index. Measured on this fixture the
-    /// graph sits well above it, at k = 1 / 10 / 50 / 100:
+    /// graph sits well above it, at k = 1 / 10 / 25 / 50:
     ///
     /// | metric | recall |
     /// |---|---|
-    /// | L2 | 1.000 / 1.000 / 0.993 / 1.000 |
-    /// | cosine | 1.000 / 1.000 / 0.999 / 0.999 |
+    /// | L2 | 1.000 / 1.000 / 0.995 / 0.993 |
+    /// | cosine | 1.000 / 1.000 / 1.000 / 0.999 |
     ///
-    /// `k = 50` is the deepest page the first batch answers alone, and where the
-    /// search is genuinely approximating rather than exhausting the graph; by
-    /// `k = 100` the scan has widened its budget and recovers what it missed.
+    /// Recall falls with depth because the graph walk has more chances to miss:
+    /// `k = 50` is where this fixture is genuinely approximating rather than
+    /// finding the exact answer, which is what makes it the useful depth.
     ///
     /// What the bar catches, measured by rebuilding this fixture with a smaller
     /// `m` — `WITH (m = ...)`, i.e. fewer neighbors kept per node — and running
@@ -568,9 +531,7 @@ mod tests {
     ///
     /// So this gate catches an index that is broken or badly degraded, not one
     /// that is merely worse — and `k = 1` is the least sensitive depth, not a
-    /// cheap stand-in for the sweep. A 16-fold `ef_search` cut likewise shows up
-    /// only at `k = 1`, because the widening path re-searches until it can fill
-    /// the `LIMIT` whatever budget it started from.
+    /// cheap stand-in for the sweep.
     ///
     /// The remaining margin absorbs CI variation across Postgres versions: the
     /// fixture's values come from Postgres' PRNG, which is only guaranteed
@@ -769,12 +730,81 @@ mod tests {
         assert!(monotone, "distances were not non-decreasing");
     }
 
+    /// Count rows in `sql` that came back nearer than the row before them —
+    /// the inversions an `ORDER BY` promises never to produce. `distance` is the
+    /// operator's own distance function, computed from the heap.
+    fn order_inversions(table: &str, operator: &str, distance: &str, literal: &str) -> i64 {
+        let rows = format!(
+            "SELECT {distance}(embedding, {literal}) AS d
+             FROM {table} ORDER BY embedding {operator} {literal} LIMIT 200"
+        );
+        Spi::get_one::<i64>(&format!(
+            "SELECT count(*)
+             FROM (SELECT d, lag(d) OVER () AS prev FROM ({rows}) s) w
+             WHERE prev IS NOT NULL AND d < prev"
+        ))
+        .expect("spi")
+        .expect("non-null")
+    }
+
+    /// The same promise as [`index_scan_returns_rows_nearest_first`], but with a
+    /// `LIMIT` far past the budget — the shape that used to make the scan widen
+    /// mid-stream and hand back a row nearer than one already returned.
+    ///
+    /// Both metrics, because each operator has its own distance function and the
+    /// units differ: `<->` is true L2 while the graph ranks by its square.
     #[pg_test]
-    fn scan_past_the_first_batch_returns_every_row_once() {
+    fn index_scan_stays_ordered_past_the_budget() {
+        // The recall fixture, not the 8-dimensional one: at 8 dimensions the
+        // graph finds the exact answer whatever budget it is given, so nothing
+        // ever turned up late to be out of order.
+        create_recall_fixture("t_order_l2", "real[]", "::real[]", "");
+        create_recall_fixture(
+            "t_order_cos",
+            "brindle_vector",
+            "::brindle_vector",
+            "brindle_vector_cosine_ops",
+        );
+        Spi::run("SET LOCAL brindle.ef_search = 16").expect("set");
+
+        // Three query points, not the full sweep: ordering is a property of the
+        // scan rather than of the data, so this checks the contract cheaply and
+        // leaves measuring quality to the recall sweep.
+        for query in recall_queries().into_iter().take(3) {
+            let as_array = array_literal(&query);
+            let as_vector = vector_literal(&query);
+            for (table, operator, distance, literal) in [
+                ("t_order_l2", "<->", "brindle_l2_distance", &as_array),
+                (
+                    "t_order_cos",
+                    "<=>",
+                    "brindle_vector_cosine_distance",
+                    &as_vector,
+                ),
+            ] {
+                let sql = format!(
+                    "SELECT id FROM {table} ORDER BY embedding {operator} {literal} LIMIT 200"
+                );
+                assert_uses_index(&sql, &format!("{table}_idx"));
+
+                let inversions = order_inversions(table, operator, distance, literal);
+                assert_eq!(
+                    inversions, 0,
+                    "{table}: {inversions} rows came back nearer than the row \
+                     before them — ORDER BY promises distance order"
+                );
+            }
+        }
+    }
+
+    #[pg_test]
+    fn a_scan_stops_at_its_budget_and_repeats_nothing() {
         create_indexed_fixture("t_drain", ROWS);
-        // Asking for far more rows than one search budget holds forces the scan
-        // to widen repeatedly; it must terminate having returned each row once.
+        // Ask for far more rows than the budget holds. The scan returns what one
+        // search found — no more, since producing more would mean widening, and
+        // a wider search can beat a row already handed over.
         Spi::run("SET LOCAL enable_seqscan = off").expect("set");
+        Spi::run("SET LOCAL brindle.ef_search = 40").expect("set");
         let sql = format!(
             "SELECT id FROM t_drain ORDER BY embedding <-> {} LIMIT {}",
             query_literal(),
@@ -787,7 +817,11 @@ mod tests {
         ))
         .expect("spi")
         .expect("non-null");
-        assert_eq!(counts, vec![ROWS, ROWS], "expected {ROWS} distinct rows");
+        assert_eq!(
+            counts,
+            vec![40, 40],
+            "a scan yields min(LIMIT, ef_search) rows, each once"
+        );
     }
 
     #[pg_test]
@@ -878,25 +912,33 @@ mod tests {
             unsafe { storage::load_index(relation.as_ptr()) }
         };
 
-        Spi::run("SET brindle.ef_search = 137").expect("set");
+        // The budget is observable as how many rows one search yields, since the
+        // scan returns exactly what it found and then ends.
         let mut search = ScanSearch::new(hnsw, tids);
+
+        Spi::run("SET brindle.ef_search = 137").expect("set");
+        search.start(QUERY.to_vec()).expect("start");
         assert_eq!(
-            search.budget, 137,
-            "a new scan starts at the session's value"
+            search.results.len(),
+            137,
+            "a scan searches at the session's value"
         );
 
-        // `start` fills the first batch, and filling one doubles the budget for
-        // the next, so what is left behind is twice the session's setting.
         Spi::run("SET brindle.ef_search = 41").expect("set");
         search.start(QUERY.to_vec()).expect("start");
         assert_eq!(
-            search.budget, 82,
-            "restarting a scan searches at a value set since it was opened"
+            search.results.len(),
+            41,
+            "restarting picks up a value set since the scan was opened"
         );
 
         Spi::run("RESET brindle.ef_search").expect("reset");
         search.start(QUERY.to_vec()).expect("start");
-        assert_eq!(search.budget, 128, "reset returns the scan to the default");
+        assert_eq!(
+            search.results.len(),
+            64,
+            "reset returns the scan to the default"
+        );
     }
 
     #[pg_test(error = "brindle: vector dimension mismatch: expected 8, got 2")]
