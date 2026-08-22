@@ -80,8 +80,13 @@ jobs:
       - name: Clear cached pgrx test cluster
         run: rm -rf target/test-pgdata
 
+      # --all-targets so benches and test modules are linted too, not just the
+      # lib: without it `benches/` is never compiled here at all, so a dependency
+      # bump that breaks the bench still shows a green tick. pg_test additionally
+      # pulls in the SQL test modules, which `cargo pgrx test` compiles but which
+      # nothing lints.
       - name: Clippy
-        run: cargo clippy --no-default-features --features pg${{ matrix.pg }} -- -D warnings
+        run: cargo clippy --all-targets --no-default-features --features pg${{ matrix.pg }},pg_test -- -D warnings
 
       - name: Test
         run: cargo pgrx test pg${{ matrix.pg }}
