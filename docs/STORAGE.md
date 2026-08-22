@@ -79,13 +79,16 @@ Everything lives in the **main fork**. Unlogged indexes additionally get a
 metapage-only **init fork** ([§ 9.4](#94-unlogged-indexes)).
 
 Every page is a standard Postgres page: page header, line-pointer array, items
-growing from the end, and 8 bytes of special space. Items are added with
-`PageAddItem`, so an item's address is an ordinary `(BlockNumber, OffsetNumber)`
-and external tooling (`pageinspect`) sees a well-formed page.
+growing from the end, and 8 bytes of special space. Element and neighbor items
+are added with `PageAddItem`, so an item's address is an ordinary
+`(BlockNumber, OffsetNumber)` and external tooling (`pageinspect`) sees a
+well-formed page. The metapage is the exception — it holds no items, keeping its
+struct in the page's content area for the reason
+[§ 3.2](#32-metapage-block-0-page-contents) gives.
 
 ```
                          ┌─────────────────────────────────────┐
-  block 0                │ META      metapage item             │
+  block 0                │ META      metapage (page contents)  │
                          ├─────────────────────────────────────┤
   block 1                │ ELEMENT   element tuples            │
   block 2                │ ELEMENT   (header, heap TID,        │
@@ -110,7 +113,7 @@ Every page, including the metapage, ends with:
 ```
 offset size field
   0     4   next_free   BlockNumber — free-list link, InvalidBlockNumber if not free
-  4     2   kind        0 = meta, 1 = element, 2 = neighbor
+  4     2   kind        1 = meta, 2 = element, 3 = neighbor (never 0)
   6     2   page_id     0x4252 ('BR') — identifies the page as Brindle's
 ```
 
@@ -126,13 +129,16 @@ Two exceptions, both load-bearing:
   all ([§ 11](#11-migration-from-the-interim-format)), so a special-space check
   that ran first would read past the page end instead of producing the clean
   "rebuild this index" error.
-- **An uninitialized page is not an error.** Relation extension is not
-  transactional: `smgr` extends the file before any WAL record is written, so a
-  crash *or an ordinary `ROLLBACK`* between the extension and the record leaves
-  a zeroed block in the fork permanently. Every reader treats `PageIsNew` as an
-  empty page and moves on; the allocator ([§ 7.4](#74-allocation-and-free-space))
-  treats it as a free page to initialize and reuse. A sweep that errored on one
-  would turn a routine rollback into an unqueryable index.
+- **An uninitialized page is not an error, and `PageIsNew` is tested first.**
+  Relation extension is not transactional: `smgr` extends the file before any
+  WAL record is written, so a crash *or an ordinary `ROLLBACK`* between the
+  extension and the record leaves a zeroed block in the fork permanently. Every
+  reader treats `PageIsNew` as an empty page and moves on; the allocator
+  ([§ 7.4](#74-allocation-and-free-space)) treats it as a free page to
+  initialize and reuse. A sweep that errored on one would turn a routine
+  rollback into an unqueryable index. No page kind is numbered 0 for the same
+  reason — a zeroed page must not be able to decode as a valid kind even if
+  something checks the kind before the `PageIsNew` test.
 
 ### 3.2 Metapage (block 0, page contents)
 
@@ -399,9 +405,16 @@ buffers (`out`) in for the same reason.
 `load_vector` is the deliberate escape hatch, and the neighbor-selection
 heuristic is why it exists: that heuristic compares candidates *to each other*,
 not just to the query, so it needs one node's vector to outlive the page pin on
-another's. The pattern is copy the base vector into a scratch buffer once, then
-`distance(&scratch, candidate)` down the candidate list — one copy per pruning
-pass, not one per comparison.
+another's. The pattern is copy a vector into a scratch buffer, then
+`distance(&scratch, other)` against the page bytes of the other.
+
+Be honest about what that costs on paged storage. Recomputing a full neighbor
+list after a prune copies its base once and compares down the list — one copy
+per pass. The selection heuristic does not: its base changes with every
+candidate it examines, so it is one `load_vector` per candidate, bounded by
+`ef_construction`, at every layer of every insert. That is the most expensive
+thing in this design that the interim format got for free, and it is the first
+thing to measure once inserts run on pages.
 
 ### 6.1.1 The write side
 
@@ -421,8 +434,10 @@ pub trait GraphStoreMut: GraphStore {
     /// Draw the next node's level from the index's persistent PRNG, advancing it.
     fn next_level(&mut self) -> Result<usize, Self::Error>;
 
-    /// Reserve a node at `level` with its vector, attribute row and payload, its
-    /// neighbor lists empty. Nothing references it yet.
+    /// Reserve a node at `level` with its vector, attribute row and payload,
+    /// together with an empty neighbor list per layer. The store decides the
+    /// physical write order (see § 7.2 step 3); on return the node exists and
+    /// nothing references it yet.
     fn add_node(&mut self, level: usize, vector: &[f32], attrs: &[AttrValue],
                 payload: Self::Payload) -> Result<NodeRef, Self::Error>;
 
@@ -439,10 +454,21 @@ pub trait GraphStoreMut: GraphStore {
 }
 ```
 
-Insert becomes a core free function over the pair —
-`insert_into<S: GraphStoreMut>(store, vector, attrs, payload) -> Result<NodeRef, S::Error>`
-— carrying level assignment, descent, layer search, neighbor selection and
-back-edge pruning. `Hnsw::insert` becomes a thin wrapper over it, so the core's
+Insert becomes a core free function over the pair:
+
+```rust
+pub fn insert_into<S: GraphStoreMut>(store: &mut S, vector: &[f32],
+                                     attrs: &[AttrValue], payload: S::Payload)
+    -> Result<NodeRef, S::Error>
+where
+    S::Error: From<HnswError>;
+```
+
+The bound is not incidental: the algorithm rejects an empty vector or a
+dimension mismatch on its own account, before it ever calls the store, so the
+error type has to carry `HnswError` as well as the store's. The generic search
+needs the same bound. It carries level assignment, descent, layer search,
+neighbor selection and back-edge pruning. `Hnsw::insert` becomes a thin wrapper over it, so the core's
 own tests, recall checks and benchmarks keep running against the in-memory
 implementation unchanged.
 
@@ -458,8 +484,9 @@ mentions a buffer, a page or a relation.
 
 ### 6.2 Index scan
 
-1. `ambeginscan` reads the metapage once: parameters, entry point, `node_count`,
-   `deleted_count`. Nothing else is read, and nothing is cached across scans.
+1. `ambeginscan` reads the metapage once: parameters, entry point and its
+   `entry_level`, `node_count`, `deleted_count`. Nothing else is read, and
+   nothing is cached across scans.
 2. `amrescan` runs the layered search against the paged `GraphStore`. Each hop
    is: read the neighbor chunk (one page), then for each neighbor read its
    element tuple (one page) to compute a distance — and, once filtering is
@@ -490,7 +517,15 @@ So the rule is:
 - The sweep's own count decides **whether the scan is done**. The sweep visits
   every element page, so it returns the true live set and the true live count;
   a scan may mark itself drained only once it has emitted that set. A hint that
-  understates the live count therefore costs one early sweep, never a row.
+  understates the live count therefore costs a sweep, never a row.
+
+That sweep is not free, and it is worth being plain about it: it reads every
+element page and materializes the live set to order it, so a stale counter can
+turn a `LIMIT 10` into a full index scan. The trade is deliberate — a scan that
+occasionally does too much work is recoverable, a scan that silently returns
+nine rows out of ten is not — but it is the one path in this design that is
+still O(index), and the compaction pass that keeps the counters honest is what
+keeps it rare.
 
 ### 6.3 Sequential sweep
 
@@ -539,16 +574,18 @@ to the init fork.
 Under the writer lock ([§ 8](#8-concurrency)), and reading the graph through the
 paged `GraphStore`:
 
-1. Read the metapage: parameters, entry point, max layer, insert pointers, PRNG
-   state. Assign the new node's level from the PRNG; write the advanced state
-   back with the metapage update in step 6.
+1. Read the metapage: parameters, entry point and its `entry_level`, insert
+   pointers, PRNG state. Assign the new node's level from the PRNG; write the
+   advanced state back with the metapage update in step 6.
 2. Run the normal HNSW descent and layer searches to select the new node's
    neighbors at every layer ≤ its level. This is page reads only.
-3. Allocate and write, fully formed: one neighbor chunk per layer holding the
-   new node's outgoing edges, then the element tuple naming them (heap TID,
-   attributes, vector, `neighbor_ptr[]`). Chunks before the element that points
-   at them, so that a write split across several records is valid at every
-   prefix. **Nothing points at the new node yet.**
+3. Allocate and write the node (`add_node`): one **empty** neighbor chunk per
+   layer, then the element tuple naming them (heap TID, attributes, vector,
+   `neighbor_ptr[]`). Chunks before the element that points at them, so a write
+   split across several records never leaves an element naming a chunk that
+   does not exist. Then fill the node's own outgoing edges with `set_neighbors`
+   per layer. **Nothing points at the new node yet**, so every prefix of this
+   sequence is unreachable garbage rather than a broken graph.
 4. For each selected neighbor, add the back-edge: read its chunk under a share
    lock, and if `count < capacity` write the entry under an exclusive lock. If
    the chunk is full, run the same pruning heuristic the in-memory build uses —
@@ -591,9 +628,15 @@ A new item goes on the insert page for its kind (`element_insert_page` /
 `neighbor_insert_page`) if it fits. Compare against `MAXALIGN(item_size)`, not
 the raw size: `PageAddItem` aligns every item, and `PageGetFreeSpace` has
 already subtracted the line pointer the item will need, so the aligned size is
-the honest comparison. Otherwise: reuse a page from `free_head` or a `PageIsNew`
-block if one is available, else extend the relation; initialize it with the
-right `kind`; make it the new insert pointer.
+the honest comparison. Otherwise: reuse a page from `free_head` if the chain is
+non-empty, else extend the relation; initialize it with the right `kind`; make
+it the new insert pointer.
+
+An uninitialized page needs no search. Extension appends, so the only blocks
+that can be `PageIsNew` are at the tail of the fork, left by an extension whose
+record never landed. The allocator finds one by looking at the last block, not
+by scanning; anything it misses is picked up by the next extension, which is
+free to initialize and use a zeroed block it finds there.
 
 **Extension does not take the extension lock for you.** The `P_NEW` path of
 `ReadBufferExtended` passes `EB_SKIP_EXTENSION_LOCK` — it is documented in
@@ -689,7 +732,7 @@ ordering invariant (I5) buys.
 
 | Record | Buffers | Atomic because |
 |---|---|---|
-| New element + its neighbor chunks | ≤ 4 (split by page when more) | nothing references them yet, so a partial write is unreachable garbage |
+| New node: empty chunks, then the element naming them, then its own edges | ≤ 4 (split by page when more) | nothing references them yet, so a partial write is unreachable garbage |
 | One back-edge added or a list pruned | 1 | a neighbor list only ever changes within its own page |
 | Entry-point / metapage update | 1 | last, and only after the element it names is durable |
 | Tombstone flip | 1 | one byte in one element tuple |
@@ -762,8 +805,9 @@ storage tests should be written against.
   an element that is not yet durable.
 - **I6** `count ≤ capacity` in every chunk, and `capacity` equals the layer's
   derived cap (`m0_cap` at layer 0, `m_cap` above) for the index's `m` and `γ`.
-- **I7** Every item fits its page: no element tuple, neighbor chunk or metapage
-  item spans pages. Build and insert verify the size and error before writing.
+- **I7** Every item fits its page: no element tuple or neighbor chunk spans
+  pages, and the metapage struct fits the content area. Build and insert verify
+  the size and error before writing.
 - **I8** `node_count` and `deleted_count` are hints: they may schedule work but
   never bound a result set. In particular a scan may mark itself drained only on
   the strength of a sweep, never of a counter — a stale counter must cost an
