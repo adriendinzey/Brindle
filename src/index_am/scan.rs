@@ -556,14 +556,21 @@ mod tests {
     /// search is genuinely approximating rather than exhausting the graph; by
     /// `k = 100` the scan has widened its budget and recovers what it missed.
     ///
-    /// What the bar does and does not catch, measured by damaging the graph and
-    /// re-running: quartering the neighbors a build keeps takes every `k` red
-    /// (L2 0.800 / 0.800 / 0.668 / 0.796), while *halving* them stays green
-    /// (0.980 at k = 10, 0.929 at k = 50). Cutting `ef_search` 16-fold is caught
-    /// only at `k = 1`, since the widening path re-searches until it can fill
-    /// the `LIMIT` whatever budget it started from. So this gate catches a
-    /// broken index and a badly degraded one; it is not a fine-grained quality
-    /// alarm, and a threshold near the measured values would be.
+    /// What the bar catches, measured by rebuilding this fixture with a smaller
+    /// `m` — `WITH (m = ...)`, i.e. fewer neighbors kept per node — and running
+    /// the sweep again:
+    ///
+    /// | build | worst recall across the four `k` | verdict |
+    /// |---|---|---|
+    /// | `m = 16` (default) | 0.993 | passes |
+    /// | `m = 8` | 0.944 | passes — a halved graph clears the bar |
+    /// | `m = 4` | 0.745 | fails, but cosine still reports 0.933 at `k = 1` |
+    ///
+    /// So this gate catches an index that is broken or badly degraded, not one
+    /// that is merely worse — and `k = 1` is the least sensitive depth, not a
+    /// cheap stand-in for the sweep. A 16-fold `ef_search` cut likewise shows up
+    /// only at `k = 1`, because the widening path re-searches until it can fill
+    /// the `LIMIT` whatever budget it started from.
     ///
     /// The remaining margin absorbs CI variation across Postgres versions: the
     /// fixture's values come from Postgres' PRNG, which is only guaranteed
@@ -637,7 +644,11 @@ mod tests {
         Spi::run(&format!("SET LOCAL brindle.ef_search = {SWEEP_EF_SEARCH}"))
             .expect("pin ef_search");
 
-        let widest = RECALL_K[RECALL_K.len() - 1];
+        let widest = RECALL_K
+            .iter()
+            .copied()
+            .max()
+            .expect("RECALL_K is not empty");
         let sample = literal(&queries[0]);
         assert_uses_index(&approximate(&sample, widest), &index);
         let baseline_plan = plan_of(&exact(&sample, widest));
@@ -659,6 +670,10 @@ mod tests {
         // guards, and the reason this shortcut is checked rather than trusted.
         let widest_ids = ordered_ids(&approximate(&sample, widest));
         for k in RECALL_K {
+            // Check the premise, not just its consequence: at a `k` where every
+            // id is correct anyway, a flip to a sort would return the same list
+            // and slip past the comparison below.
+            assert_uses_index(&approximate(&sample, k), &index);
             assert_eq!(
                 ordered_ids(&approximate(&sample, k)),
                 widest_ids[..k],
