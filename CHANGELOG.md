@@ -37,8 +37,20 @@ versions may break).
 - Repository hygiene: PR/issue templates, Dependabot (cargo + GitHub Actions),
   contributor guide.
 
+### Changed
+
+- The stored graph format now carries each row's filterable attribute values
+  (format version 2). Version 1 payloads are rejected rather than read as
+  attribute-free, because that would let a filtered scan silently return no rows
+  instead of failing; an index built by an earlier development build must be
+  rebuilt with `REINDEX`. No released version wrote the old format.
+
 ### Known limitations
 
-- A table is effectively read-only once a brindle index exists on it: `INSERT`
-  and `UPDATE` raise an error until incremental insert lands. Load the data
-  first, then create the index, and `REINDEX` after further loads.
+- Every `INSERT` or `UPDATE` of an indexed row rewrites the whole stored graph,
+  so write cost grows with index size. Writes are correct and immediately
+  searchable, but a bulk load is still far faster as `COPY` followed by
+  `CREATE INDEX` than as inserts into an existing index.
+- Filter-aware search exists in the index core but has no SQL surface yet: a
+  `WHERE` clause alongside `ORDER BY embedding <-> $1` is applied by the
+  executor after the index has already spent its candidate budget.
