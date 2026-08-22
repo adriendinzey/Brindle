@@ -646,14 +646,17 @@ mod tests {
             "the exact baseline was answered by the index it is meant to check:\n{baseline_plan}"
         );
 
-        // One scan per query point answers every `k`. `LIMIT` is invisible to
-        // an access method: the order rows come out in depends only on the
-        // query, `ef_search`, and the graph, and a smaller `LIMIT` merely stops
-        // the same scan sooner. So a shorter list is the longer one's prefix by
-        // construction — at any `k`, whatever the budget, including the `k` past
-        // the first batch where a widened re-search can return something nearer
-        // than what came before it. Asserted below all the same, because the
-        // shortcut it justifies is what makes this sweep affordable.
+        // One scan per query point answers every `k`. `LIMIT` is invisible to an
+        // access method: *within a scan* the order rows come out in depends only
+        // on the query, `ef_search`, and the graph, and a smaller `LIMIT` merely
+        // stops that scan sooner — so a shorter list is the longer one's prefix
+        // at any `k`, including the ones past the first batch, where a widened
+        // re-search can return something nearer than what came before it.
+        //
+        // What `LIMIT` does reach is the planner: a different `k` could be
+        // costed onto a different path, and two lists from two different plans
+        // need not relate at all. That is the assumption the assertion below
+        // guards, and the reason this shortcut is checked rather than trusted.
         let widest_ids = ordered_ids(&approximate(&sample, widest));
         for k in RECALL_K {
             assert_eq!(
