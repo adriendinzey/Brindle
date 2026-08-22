@@ -15,7 +15,8 @@
 # Usage:
 #   scripts/worktree.sh new <slug> [--shared-pg]   create branch task/<slug> + sandbox
 #   scripts/worktree.sh ls                          list active sandboxes (+ pg ports)
-#   scripts/worktree.sh rm  <slug>                  stop pg, remove worktree, delete branch
+#   scripts/worktree.sh rm  <slug>                  stop pg, remove worktree + caches, delete branch
+#   scripts/worktree.sh gc  [--dry-run]             safety net: sweep caches orphaned outside `rm`
 #
 # Worktrees are created as siblings of the main clone, under
 # <parent>/brindle-wt/<slug>, on the Linux-native filesystem.
@@ -178,15 +179,21 @@ cmd_rm() {
   local slug="${1:-}"
   [[ -n "$slug" ]] || usage 1
   valid_slug "$slug"
-  local branch="task/$slug" base_dir wt_dir pgrx_home
+  local branch="task/$slug" base_dir wt_dir pgrx_home cache_dir
   base_dir="$(dirname "$(main_worktree)")"
   wt_dir="$base_dir/brindle-wt/$slug"
   pgrx_home="$HOME/.pgrx-$slug"
+  cache_dir="$HOME/.cargo-target/$slug"
 
   if [[ -d "$pgrx_home" ]]; then
     PGRX_HOME="$pgrx_home" cargo pgrx stop "pg$PG_MAJOR" >/dev/null 2>&1 || true
     rm -rf "$pgrx_home"
     echo "removed isolated Postgres: $pgrx_home"
+  fi
+
+  if [[ -d "$cache_dir" ]]; then
+    rm -rf "$cache_dir"
+    echo "removed build cache: $cache_dir"
   fi
 
   if [[ -d "$wt_dir" ]]; then
@@ -210,7 +217,57 @@ cmd_rm() {
       die "branch $branch isn't merged (no merged PR found); if intentional: git branch -D '$branch'"
     fi
   fi
-  echo "(build cache at \$HOME/.cargo-target/$slug left in place — rm -rf it to reclaim disk)"
+}
+
+# Safety net, not the primary cleanup path: `rm` already deletes a task's
+# pgrx home and build cache itself. This catches the two only if a worktree
+# was torn down by bypassing the script (e.g. `git worktree remove` or
+# `git branch -D` run by hand) instead of via `rm`, leaving them orphaned.
+# Sweeps ~/.cargo-target/<slug> and ~/.pgrx-<slug> that have no live worktree
+# or task/<slug> branch.
+cmd_gc() {
+  local dry_run=0
+  [[ "${1:-}" == "--dry-run" ]] && dry_run=1
+
+  local main_wt base_dir; main_wt="$(main_worktree)"; base_dir="$(dirname "$main_wt")"
+  local cache_dir slug wt_dir age total_kb freed_kb=0 removed=0 kept=0
+
+  for cache_dir in "$HOME"/.cargo-target/*/ "$HOME"/.pgrx-*/; do
+    [[ -d "$cache_dir" ]] || continue
+    slug="$(basename "$cache_dir")"
+    [[ "$cache_dir" == "$HOME/.pgrx-"* ]] && slug="${slug#.pgrx-}"
+    wt_dir="$base_dir/brindle-wt/$slug"
+
+    if [[ -d "$wt_dir" ]] || git -C "$main_wt" show-ref --verify --quiet "refs/heads/task/$slug"; then
+      kept=$((kept + 1))
+      continue
+    fi
+
+    # Grace period: `new` creates these dirs before the branch/worktree exist,
+    # so skip anything touched in the last hour to avoid a race with it.
+    age=$(( $(date +%s) - $(stat -c %Y "$cache_dir") ))
+    if [[ $age -lt 3600 ]]; then
+      kept=$((kept + 1))
+      continue
+    fi
+
+    total_kb=$(du -sk "$cache_dir" 2>/dev/null | cut -f1)
+    freed_kb=$((freed_kb + total_kb))
+    removed=$((removed + 1))
+    if [[ $dry_run -eq 1 ]]; then
+      echo "would remove: $cache_dir  (${total_kb} KB, no branch/worktree for '$slug')"
+    else
+      rm -rf "$cache_dir"
+      echo "removed: $cache_dir  (${total_kb} KB, no branch/worktree for '$slug')"
+    fi
+  done
+
+  echo
+  if [[ $dry_run -eq 1 ]]; then
+    echo "gc --dry-run: $removed orphaned dir(s), $((freed_kb / 1024)) MB would be freed; $kept kept"
+  else
+    echo "gc: $removed orphaned dir(s) removed, $((freed_kb / 1024)) MB freed; $kept kept"
+  fi
 }
 
 [[ $# -ge 1 ]] || usage 1
@@ -221,6 +278,7 @@ case "$sub" in
   new) cmd_new "$@" ;;
   ls|list) cmd_ls "$@" ;;
   rm|remove) cmd_rm "$@" ;;
+  gc) cmd_gc "$@" ;;
   -h|--help|help) usage 0 ;;
-  *) die "unknown command '$sub' (try: new | ls | rm)" ;;
+  *) die "unknown command '$sub' (try: new | ls | rm | gc)" ;;
 esac
