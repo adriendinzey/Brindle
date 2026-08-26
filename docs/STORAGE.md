@@ -499,38 +499,41 @@ A concurrent insert that moves the entry point is invisible to an in-flight
 scan; the result is an approximate search that started one node off, which is
 within what an approximate index promises.
 
-The batching behavior scans rely on today — widen the budget and re-search until
-the executor stops asking — is unchanged in shape, but **not** in where it gets
-its live count. Today that count is exact, because the scan holds a private copy
-of the whole graph. The metapage's `deleted_count` and `node_count` are hints
-that a crash can leave one behind ([§ 3.2](#32-metapage-block-0-page-contents)),
-and this is the one place where treating a hint as exact would be a wrong
-answer rather than a recall trade-off: an unfiltered `ORDER BY` promises *every*
-row, the widening loop stops as soon as its budget covers the live count, and
-the exhaustive pass returns only as many rows as that budget. Understate the
-live count by *n* and the scan silently drops *n* rows.
+An earlier version of this section specified a scan that widened its budget and
+re-searched until the executor stopped asking, backed by an exhaustive sweep so
+that an unfiltered `ORDER BY` returned *every* row. **That behavior is gone**,
+and the reasoning behind removing it belongs here, because this document is the
+spec a storage implementation will follow.
 
-So the rule is:
+Widening broke ordering. A wider graph search is not a superset of a narrower
+one, so re-searching could turn up a row nearer than one already handed to the
+executor — and because `amcanorderbyop` makes the planner delete its own sort,
+nothing downstream repairs that. A scan now runs **one** search at
+`brindle.ef_search`, returns those rows in distance order, and ends, yielding at
+most `ef_search` rows.
 
-- The hint may decide **when** to stop widening and switch to the exhaustive
-  sweep ([§ 6.3](#63-sequential-sweep)).
-- The sweep's own count decides **whether the scan is done**. The sweep visits
-  every element page, so it returns the true live set and the true live count;
-  a scan may mark itself drained only once it has emitted that set. A hint that
-  understates the live count therefore costs a sweep, never a row.
+What that changes for storage:
 
-That sweep is not free, and it is worth being plain about it: it reads every
-element page and materializes the live set to order it, so a stale counter can
-turn a `LIMIT 10` into a full index scan. The trade is deliberate — a scan that
-occasionally does too much work is recoverable, a scan that silently returns
-nine rows out of ten is not — but it is the one path in this design that is
-still O(index), and the compaction pass that keeps the counters honest is what
-keeps it rare.
+- **No exhaustive fallback ends a scan.** The sequential sweep
+  ([§ 6.3](#63-sequential-sweep)) is still needed for vacuum and for the
+  statistics a cleanup pass reports, but it is no longer a query path.
+- **The live-count hint is no longer load-bearing for correctness.** It mattered
+  because an understated count silently dropped rows from a scan that had
+  promised completeness. With no such promise, `deleted_count` and `node_count`
+  ([§ 3.2](#32-metapage-block-0-page-contents)) are hints for planning and
+  vacuum decisions, where staleness costs accuracy rather than rows.
+- **A stale counter can no longer turn a `LIMIT 10` into a full index scan.**
+  The O(index) query path this section used to justify is gone.
+
+Reintroducing a widening loop would reintroduce the ordering bug. If completeness
+is wanted back, it belongs behind an opt-in mode that documents its ordering as
+relaxed — not in the default scan path.
 
 ### 6.3 Sequential sweep
 
-Three paths need every element and no adjacency: the exhaustive fallback that
-ends a widening scan, vacuum, and the statistics a cleanup pass reports. All
+Two paths need every element and no adjacency: vacuum, and the statistics a
+cleanup pass reports. (A third, the exhaustive fallback that used to end a
+widening scan, is gone — see [§ 6.2](#62-search).) Both
 three sweep element pages in block order, and per page walk line pointers
 1..`PageGetMaxOffsetNumber`, skipping items whose `kind` is not `ELEMENT` and
 skipping `PageIsNew` pages entirely ([§ 3.1](#31-page-special-space)). Sweeping

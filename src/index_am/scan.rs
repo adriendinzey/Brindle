@@ -11,8 +11,9 @@
 //! One search, at a candidate budget of `brindle.ef_search`, read at the start of
 //! each scan so a session can retune accuracy against latency without rebuilding
 //! anything. Its results are returned in distance order and then the scan ends —
-//! so `ORDER BY ... LIMIT n` yields `min(n, ef_search)` rows, and a caller who
-//! wants more raises the budget.
+//! so `ORDER BY ... LIMIT n` yields **at most `ef_search` rows** — fewer when
+//! the walk converges early or routes through tombstoned nodes — and a caller
+//! who wants more raises the budget.
 //!
 //! That ceiling is deliberate, and it is the whole reason this module is shaped
 //! this way. `amcanorderbyop` promises the planner that rows arrive in operator
@@ -98,12 +99,14 @@ impl ScanSearch {
     fn start(&mut self, query: Vec<f32>) -> Result<(), ScanError> {
         self.query = query;
         self.cursor = 0;
+        // Cleared before the search rather than after: a search that fails must
+        // not leave the previous scan's results sitting under the new query.
+        self.results.clear();
         // Read per scan: a session that raised ef_search expects the next query
         // to use it, not the value in force when the scan was opened.
         let budget = guc::ef_search().max(1);
 
         let found = self.hnsw.search(&self.query, budget, budget)?;
-        self.results.clear();
         self.results.reserve(found.len());
         for (_, id) in found {
             match self.tids.get(id) {
@@ -123,6 +126,10 @@ impl ScanSearch {
 
     /// The next heap TID, nearest first, or `None` once the search's results are
     /// spent — which is also where the scan ends, even if the caller wanted more.
+    ///
+    /// Infallible today, since handing out an already-resolved TID cannot fail;
+    /// the `Result` is kept because a scan that resolves TIDs lazily, or resumes
+    /// a search, would need it back.
     fn next(&mut self) -> Result<Option<TidPair>, ScanError> {
         let tid = self.results.get(self.cursor).copied();
         if tid.is_some() {
@@ -622,8 +629,7 @@ mod tests {
         // access method: *within a scan* the order rows come out in depends only
         // on the query, `ef_search`, and the graph, and a smaller `LIMIT` merely
         // stops that scan sooner — so a shorter list is the longer one's prefix
-        // at any `k`, including the ones past the first batch, where a widened
-        // re-search can return something nearer than what came before it.
+        // at any `k` the budget can serve.
         //
         // What `LIMIT` does reach is the planner: a different `k` could be
         // costed onto a different path, and two lists from two different plans
@@ -820,7 +826,7 @@ mod tests {
         assert_eq!(
             counts,
             vec![40, 40],
-            "a scan yields min(LIMIT, ef_search) rows, each once"
+            "a scan yields at most ef_search rows, each once"
         );
     }
 
@@ -900,9 +906,9 @@ mod tests {
         );
     }
 
-    /// The session's `brindle.ef_search` is what sizes a scan's first batch —
-    /// asserted on the scan state itself, since the budget only changes how hard
-    /// the scan looks, not the rows it ends up returning.
+    /// The session's `brindle.ef_search` is what sizes a scan's one search, and
+    /// so how many rows it can return. Asserted on the scan state rather than
+    /// through SQL, to read the count the search itself produced.
     #[pg_test]
     fn ef_search_sizes_the_scans_candidate_budget() {
         create_indexed_fixture("t_ef", 200);

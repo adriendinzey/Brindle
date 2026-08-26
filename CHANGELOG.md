@@ -22,9 +22,12 @@ versions may break).
 - Nearest-neighbor index scans — `SELECT ... ORDER BY embedding <-> $1 LIMIT k`
   is answered from the index, nearest first, through the new `<->` L2 distance
   operator over `real[]` and the default `real_array_l2_ops` operator class.
-  A scan asked for more rows than one search budget holds keeps widening until
-  it has returned every matching row, so an unfiltered `ORDER BY` is complete
-  rather than truncated.
+  A scan runs one search at `brindle.ef_search` and returns its rows in distance
+  order, so it yields **at most `ef_search` rows**: a `LIMIT` larger than the
+  budget — or an `ORDER BY` with no `LIMIT` at all — comes back short, and
+  raising `brindle.ef_search` is how you see further. The ceiling is what buys
+  the ordering guarantee, since producing more rows means widening the search,
+  and a wider graph search can turn up a row nearer than one already returned.
 - Rows inserted after `CREATE INDEX` are picked up automatically — `INSERT` and
   `UPDATE` no longer error, and the new vectors are findable through an index
   scan without a `REINDEX`. Each insert rewrites the stored graph, so the cost

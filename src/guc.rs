@@ -28,9 +28,9 @@ pub fn init() {
     GucRegistry::define_int_guc(
         "brindle.ef_search",
         "Candidate pool size for brindle index scans.",
-        "Larger values raise recall and cost; the pool is widened to the \
-         requested LIMIT when that is larger. Applies per query, so it can be \
-         raised for one statement without rebuilding the index.",
+        "Larger values raise recall and cost. This is also the ceiling on how \
+         many rows a scan can return: a LIMIT above it comes back short, so \
+         raise this to see further. Applies per query, and needs no rebuild.",
         &EF_SEARCH,
         MIN_EF_SEARCH,
         MAX_EF_SEARCH,

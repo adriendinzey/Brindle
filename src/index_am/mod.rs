@@ -416,10 +416,12 @@ unsafe extern "C" fn amcostestimate(
     // under the level distribution (1/ln m) is log_m(n). Presetting this stops
     // genericcostestimate from assuming every index tuple is visited, which is
     // what lets a `LIMIT k` plan prefer this index over sorting the whole table.
-    // TODO: fold in `brindle.ef_search`, which now sizes the scan's candidate
-    // budget and so its work, along with the cost of loading the graph while
-    // storage still rebuilds it once per scan. Both raise the estimate, so a
-    // tuned-up session currently looks cheaper to the planner than it is.
+    // TODO: fold in `brindle.ef_search` on both axes. It sizes the scan's work,
+    // so a tuned-up session looks cheaper here than it is — and it is now also a
+    // ceiling on the *rows* a scan yields, which this estimate does not model at
+    // all: selectivity stays 1.0, so a scan returning `ef_search` rows is costed
+    // as returning every matching one, and plans above it are sized off that
+    // number. The graph load, still rebuilt once per scan, is missing too.
     let m = HnswParams::default().m.max(2) as f64;
     let tuples = (*(*path).indexinfo).tuples.max(1.0);
     let entry_level = (tuples.ln() / m.ln()).floor().max(0.0);
