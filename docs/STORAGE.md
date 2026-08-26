@@ -102,9 +102,9 @@ struct in the page's content area for the reason
 Element tuples and neighbor chunks live on **separate pages**, tracked by two
 insert pointers in the metapage. The separation costs at most one extra page on
 a tiny index and buys three things: a sequential sweep of vectors (used by
-exhaustive scan fallback, by vacuum, and by build) reads no adjacency bytes; an edge
-update never dirties a vector page; and vector pages stay dense, which is what
-the distance loop scans.
+vacuum, by build, and by the statistics a cleanup pass reports) reads no
+adjacency bytes; an edge update never dirties a vector page; and vector pages
+stay dense, which is what the distance loop scans.
 
 ### 3.1 Page special space
 
@@ -197,11 +197,11 @@ metapage is where it lives now, and an insert advances it under the writer lock.
 
 `node_count` and `deleted_count` are **hints**: they feed planner statistics and
 the compaction trigger, and a crash may leave them one behind. They may
-*schedule* work — decide when a scan switches to an exhaustive sweep, when
-compaction is worth running — but they may never *bound a result set*. Every
-count a correct answer depends on comes from a sweep of the element pages
-([§ 6.3](#63-sequential-sweep)). [§ 6.2](#62-index-scan) spells out the one
-place where confusing the two would drop rows.
+*schedule* work — when compaction is worth running, what to report to `ANALYZE` —
+but they never decide a query's result. Nothing a correct answer depends on is
+read from them; a count that has to be exact comes from a sweep of the element
+pages ([§ 6.3](#63-sequential-sweep)), which is a vacuum and statistics path, not
+a query one ([§ 6.2](#62-index-scan)).
 
 ### 3.3 Element tuple
 
@@ -533,16 +533,17 @@ relaxed — not in the default scan path.
 
 Two paths need every element and no adjacency: vacuum, and the statistics a
 cleanup pass reports. (A third, the exhaustive fallback that used to end a
-widening scan, is gone — see [§ 6.2](#62-search).) Both
-three sweep element pages in block order, and per page walk line pointers
+widening scan, is gone — see [§ 6.2](#62-index-scan).) Both
+sweep element pages in block order, and per page walk line pointers
 1..`PageGetMaxOffsetNumber`, skipping items whose `kind` is not `ELEMENT` and
 skipping `PageIsNew` pages entirely ([§ 3.1](#31-page-special-space)). Sweeping
 is sequential I/O over exactly the vector bytes, which is why elements and
 neighbor chunks are on separate pages.
 
-A sweep is the authoritative source for counts and for the live set; the
-metapage counters are hints, and [§ 6.2](#62-index-scan) is the reason that
-distinction is not academic.
+A sweep is the authoritative source for counts and for the live set; the metapage
+counters are hints. Since [§ 6.2](#62-index-scan) no longer has a query depending
+on either, the distinction now matters for vacuum and statistics rather than for
+whether an answer is right.
 
 ---
 
@@ -811,10 +812,13 @@ storage tests should be written against.
 - **I7** Every item fits its page: no element tuple or neighbor chunk spans
   pages, and the metapage struct fits the content area. Build and insert verify
   the size and error before writing.
-- **I8** `node_count` and `deleted_count` are hints: they may schedule work but
-  never bound a result set. In particular a scan may mark itself drained only on
-  the strength of a sweep, never of a counter — a stale counter must cost an
-  extra sweep, never a missing row.
+- **I8** `node_count` and `deleted_count` are hints: they may schedule work —
+  when to compact, what to report to `ANALYZE` — but never decide a query's
+  result. A stale counter costs accuracy in a plan or an extra pass in vacuum,
+  never a wrong answer. (This invariant used to require a scan to sweep the
+  element pages before declaring itself drained, back when an unfiltered
+  `ORDER BY` promised every row. A scan no longer promises that, and must not
+  sweep: see [§ 6.2](#62-index-scan).)
 - **I8b** `entry_level` is the level of the node `entry_block`/`entry_offset`
   names, and every element's `dim` equals the metapage's. Both are redundant by
   construction and are checked on read, not trusted.

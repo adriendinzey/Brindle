@@ -50,6 +50,9 @@ versions may break).
 
 ### Known limitations
 
+- A scan returns at most `brindle.ef_search` rows, so a larger `LIMIT` — or an
+  `ORDER BY` with none — comes back short. Raise the setting to see further. The
+  ceiling is what makes the ordering guarantee hold.
 - Every `INSERT` or `UPDATE` of an indexed row rewrites the whole stored graph,
   so write cost grows with index size. Writes are correct and immediately
   searchable, but a bulk load is still far faster as `COPY` followed by
