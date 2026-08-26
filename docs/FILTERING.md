@@ -48,21 +48,53 @@ option and GUC.
 ### (b) predicate-filtered expansion at search time
 
 During greedy search, when expanding a node's neighbor list, Brindle evaluates the
-predicate on each neighbor and **only enqueues matching neighbors** into the
-candidate set — but it still *uses* non-matching neighbors as stepping stones
-(optionally one hop further, ACORN's "predicate subgraph traversal") to preserve
-reachability. Net effect: the `ef_search` budget is spent almost entirely on nodes
-that can actually be answers.
+predicate on each neighbor and **only admits matching neighbors** to the result
+set — but it still *uses* non-matching neighbors as stepping stones (ACORN's
+"predicate subgraph traversal") to preserve reachability. Net effect: the
+`ef_search` budget is spent entirely on nodes that can actually be answers.
 
 ```
 for each candidate c popped from the frontier:
-    for n in neighbors(c):                  # neighbors() may be γ-dense
-        if visited(n): continue
-        if predicate.matches(n):            # cheap check against stored attrs
-            push n into results + frontier
-        elif allow_bridge(n):               # ACORN: hop over a non-match once
-            push n into frontier only        # not into results
+    matching = 0
+    for n in neighbors(c):                   # neighbors() may be γ-dense
+        if predicate.matches(n):             # cheap check against stored attrs
+            consider(n); matching += 1       # frontier, and results if live
+
+    if matching < m:                         # too thin to stay navigable
+        for n in the non-matching neighbors: # at most m of them
+            for nn in neighbors(n):          # ACORN: hop over n, never past nn
+                if predicate.matches(nn):
+                    consider(nn); matching += 1
+                if matching >= m: break
+
+    if matching == 0 and detours_left:       # no match within two hops at all
+        for n in neighbors(c):
+            consider(n)                      # routes only; never returned
 ```
+
+**Why it terminates and stays cheap.** One expansion reaches at most two hops — a
+node arrived at across a bridge is not itself bridged over *within that
+expansion*, though it expands normally once it is popped — so each expansion is
+bounded work. What terminates the search is the visited set: a node joins the
+frontier only on first sight, so there are at most *n* expansions. The two-hop
+scan also stops as soon as it has produced `m` matching neighbors, so an
+unselective predicate pays essentially nothing. What bridging mostly spends is
+*predicate evaluations* rather than distance computations: a two-hop node is
+scored only if it matches, and Tier-1 attributes are tested inline without
+touching a vector.
+
+The last clause is the escape hatch for the case γ was supposed to prevent: under
+a very selective predicate a node can have no match anywhere in its two-hop
+neighborhood. Walking on through non-matching nodes (which still can never be
+returned) beats returning nothing. Unlike the two-hop scan, this branch *does*
+score non-matching nodes — that is how it walks through them — so the allowance
+is charged per node **enqueued**, not per stranded node. Charging per stranded
+node would let one unit of allowance queue an entire neighbor list, each member of
+which then pays a two-hop scan of its own when popped: work quadratic in the
+degree, and so worst on exactly the γ-dense graphs the feature is built around.
+With the per-node charge, an unsatisfiable predicate over a 20 000-node graph
+costs ~0.9 ms and ~36 k predicate evaluations per query, and that bill is flat in
+the size of the graph.
 
 ## 3. How predicates reach the index
 

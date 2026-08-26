@@ -11,6 +11,11 @@
 //! edges are bidirectional *at insertion* but a later prune may drop one side —
 //! the maintained invariant is the degree cap, not strict symmetry.
 //!
+//! Search is optionally *predicate-aware* ([`Hnsw::search_filtered`]): a node
+//! that fails the predicate is never returned, but is still traversed as a
+//! bridge to its own neighbors, so a selective filter cannot strand the matching
+//! nodes behind non-matching ones.
+//!
 //! The degree caps scale with an edge-density multiplier `gamma` (γ) following
 //! ACORN (<https://arxiv.org/abs/2403.04871>): a graph built with γ > 1 keeps
 //! ~`m·γ` neighbors per node, so the subgraph of nodes surviving a selective
@@ -20,7 +25,7 @@ use std::cmp::{Ordering, Reverse};
 use std::collections::{BinaryHeap, HashSet};
 
 use crate::distance::DistanceError;
-use crate::filter::AttrValue;
+use crate::filter::{AttrValue, Predicate};
 use crate::vector::Metric;
 
 /// Errors from index operations.
@@ -121,6 +126,56 @@ impl Ord for Cand {
 impl PartialOrd for Cand {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
+    }
+}
+
+/// The mutable state of one layer's beam search: every node already considered,
+/// the frontier still to expand (nearest first), and the result set (farthest
+/// first, capped at `ef`).
+///
+/// Frontier membership and result membership are deliberately separate: a
+/// tombstoned or non-matching node may route the search without ever being
+/// eligible to come back as an answer.
+struct Beam {
+    visited: HashSet<usize>,
+    frontier: BinaryHeap<Reverse<Cand>>,
+    results: BinaryHeap<Cand>,
+    ef: usize,
+    /// Remaining allowance for routing *through* non-matching nodes when a
+    /// filtered expansion turns up no matching neighbor at all. Spending the
+    /// caller's own budget bounds that fallback, so a predicate nothing
+    /// satisfies still finishes promptly instead of sweeping the graph.
+    detours: usize,
+}
+
+impl Beam {
+    fn new(ef: usize) -> Self {
+        Self {
+            visited: HashSet::with_capacity(ef.max(1) * 8),
+            frontier: BinaryHeap::new(),
+            results: BinaryHeap::new(),
+            ef,
+            detours: ef,
+        }
+    }
+
+    /// Distance of the farthest result held, or infinity while none are held.
+    #[inline]
+    fn farthest(&self) -> f32 {
+        self.results.peek().map(|x| x.dist).unwrap_or(f32::INFINITY)
+    }
+
+    /// Queue `cand` for expansion, recording it as a result only when
+    /// `admissible`.
+    #[inline]
+    fn push(&mut self, cand: Cand, admissible: bool) {
+        self.frontier.push(Reverse(cand));
+        if admissible {
+            self.results.push(cand);
+            if self.results.len() > self.ef {
+                self.results.pop();
+            }
+        }
     }
 }
 
@@ -310,57 +365,193 @@ impl Hnsw {
         (-r.ln() * self.ml).floor() as usize
     }
 
+    /// Whether `predicate` requires the predicate-aware traversal path. Both
+    /// `None` and the match-all predicate take the plain HNSW path, so adding
+    /// filtering support left unfiltered search bit-for-bit unchanged.
+    #[inline]
+    fn is_filtered(predicate: Option<&Predicate>) -> bool {
+        !matches!(predicate, None | Some(Predicate::All))
+    }
+
+    /// Whether node `id` satisfies `predicate` — vacuously true without one.
+    #[inline]
+    fn node_matches(&self, id: usize, predicate: Option<&Predicate>) -> bool {
+        match predicate {
+            None => true,
+            Some(p) => p.matches(self.attrs(id)),
+        }
+    }
+
+    /// Whether `id` may be *returned*: live, and satisfying the predicate.
+    /// Routing through a node is a separate, laxer question.
+    #[inline]
+    fn admissible(&self, id: usize, predicate: Option<&Predicate>) -> bool {
+        !self.deleted[id] && self.node_matches(id, predicate)
+    }
+
+    /// Score `id` and fold it into `beam`, unless it was already considered or
+    /// is too far to improve on the results already held. Reports whether it
+    /// actually joined the frontier.
+    fn visit(
+        &self,
+        query: &[f32],
+        id: usize,
+        predicate: Option<&Predicate>,
+        beam: &mut Beam,
+    ) -> Result<bool, HnswError> {
+        if !beam.visited.insert(id) {
+            return Ok(false);
+        }
+        let d = self.metric.distance(query, &self.vectors[id])?;
+        if beam.results.len() < beam.ef || d < beam.farthest() {
+            beam.push(Cand { dist: d, id }, self.admissible(id, predicate));
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    /// Fold `id`'s neighbors into `beam`.
+    ///
+    /// Unfiltered this is plain HNSW: every neighbor is a candidate. Under a
+    /// predicate only matching neighbors can be answers, and a selective
+    /// predicate can leave a node with none at all — the matching subgraph
+    /// fragments and greedy search dead-ends. ACORN's fix, implemented here:
+    /// when the neighbor list yields fewer than `m` matching nodes, hop *over*
+    /// the non-matching neighbors and take *their* neighbors instead, so
+    /// traversal crosses filtered-out regions rather than stopping at them.
+    ///
+    /// Two bounds keep that from degenerating into a breadth-first sweep: one
+    /// expansion reaches at most two hops (a node arrived at across a bridge is
+    /// not itself bridged over *within that expansion*, though it expands
+    /// normally once popped), and at most `m` bridges are taken per node,
+    /// stopping early as soon as `m` matching neighbors have been produced. Each
+    /// expansion is therefore bounded work; what terminates the search itself is
+    /// `visited` — a node joins the frontier only on first sight.
+    ///
+    /// Two hops is not always far enough — under a very selective predicate a
+    /// node can have no match anywhere in its two-hop neighborhood. Rather than
+    /// return nothing at all, such a node routes on through its non-matching
+    /// neighbors (which still can never be returned), limited by the beam's
+    /// detour allowance.
+    ///
+    /// Bridging trades predicate evaluations for distance computations: a
+    /// two-hop node is scored only if it matches, and inline attributes are
+    /// tested without touching a vector. The detour is the exception — it scores
+    /// non-matching neighbors precisely in order to walk through them.
+    fn expand(
+        &self,
+        query: &[f32],
+        id: usize,
+        layer: usize,
+        predicate: Option<&Predicate>,
+        beam: &mut Beam,
+        bridges: &mut Vec<usize>,
+    ) -> Result<(), HnswError> {
+        let neighbors = self.neighbors(id, layer);
+        if !Self::is_filtered(predicate) {
+            for &n in neighbors {
+                self.visit(query, n, predicate, beam)?;
+            }
+            return Ok(());
+        }
+
+        // Both bounds scale with the graph's own base degree, so bridging costs
+        // a small multiple of the work an unfiltered expansion already does.
+        let target = self.m;
+        let max_bridges = self.m;
+
+        // The non-matching neighbors are collected as they are classified rather
+        // than re-tested on a second pass; `bridges` is owned by the enclosing
+        // layer search, so it is reused across expansions instead of allocating.
+        bridges.clear();
+        let mut matching = 0usize;
+        for &n in neighbors {
+            if self.node_matches(n, predicate) {
+                matching += 1;
+                self.visit(query, n, predicate, beam)?;
+            } else if bridges.len() < max_bridges {
+                bridges.push(n);
+            }
+        }
+
+        for &bridge in bridges.iter() {
+            if matching >= target {
+                break;
+            }
+            for &nn in self.neighbors(bridge, layer) {
+                if matching >= target {
+                    break;
+                }
+                if self.node_matches(nn, predicate) {
+                    matching += 1;
+                    self.visit(query, nn, predicate, beam)?;
+                }
+            }
+        }
+
+        if matching == 0 {
+            // Stranded: nothing matches within two hops. Keep walking through
+            // the non-matching nodes themselves — greedily, so the walk still
+            // heads toward the query.
+            //
+            // The allowance is charged per node *enqueued*, not per stranded
+            // node: it is popping one of these that costs a two-hop scan, so
+            // charging once per expansion would let a single unit queue a whole
+            // neighbor list — γ² work per unit, and the denser the graph the
+            // worse the bill.
+            for &n in neighbors {
+                if beam.detours == 0 {
+                    break;
+                }
+                if self.visit(query, n, predicate, beam)? {
+                    beam.detours -= 1;
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Greedy beam search within one layer (HNSW SEARCH-LAYER). Returns up to `ef`
     /// nearest candidates to `query`, ascending by distance.
+    ///
+    /// With a predicate, only matching nodes are returned and the `ef` budget is
+    /// spent on those alone; [`Hnsw::expand`] covers how traversal still reaches
+    /// them across non-matching regions.
     fn search_layer(
         &self,
         query: &[f32],
         entry_points: &[usize],
         ef: usize,
         layer: usize,
+        predicate: Option<&Predicate>,
     ) -> Result<Vec<Cand>, HnswError> {
-        let mut visited: HashSet<usize> = HashSet::with_capacity(ef.max(1) * 8);
-        let mut frontier: BinaryHeap<Reverse<Cand>> = BinaryHeap::new(); // nearest on top
-        let mut results: BinaryHeap<Cand> = BinaryHeap::new(); // farthest on top
+        let filtered = Self::is_filtered(predicate);
+        let mut beam = Beam::new(ef);
+        // Scratch for `expand`'s bridge list, hoisted here so the filtered path
+        // allocates once per layer search rather than once per expansion.
+        let mut bridges: Vec<usize> = Vec::new();
 
         for &ep in entry_points {
-            if visited.insert(ep) {
+            if beam.visited.insert(ep) {
                 let d = self.metric.distance(query, &self.vectors[ep])?;
-                let c = Cand { dist: d, id: ep };
-                frontier.push(Reverse(c)); // route through any node, incl. tombstoned
-                if !self.deleted[ep] {
-                    results.push(c);
-                    if results.len() > ef {
-                        results.pop();
-                    }
-                }
+                // A seed routes even when tombstoned or non-matching: it may be
+                // the only way into the region that does match.
+                beam.push(Cand { dist: d, id: ep }, self.admissible(ep, predicate));
             }
         }
 
-        while let Some(Reverse(c)) = frontier.pop() {
-            let farthest = results.peek().map(|x| x.dist).unwrap_or(f32::INFINITY);
-            if c.dist > farthest {
+        while let Some(Reverse(c)) = beam.frontier.pop() {
+            // A filtered search admits only matching nodes, so a result set that
+            // is not yet full means the budget is still unspent and its farthest
+            // entry is no cutoff. Unfiltered, the original rule stands and
+            // existing graphs and query results reproduce exactly.
+            if c.dist > beam.farthest() && (!filtered || beam.results.len() >= ef) {
                 break;
             }
-            for &n in self.neighbors(c.id, layer) {
-                if visited.insert(n) {
-                    let d = self.metric.distance(query, &self.vectors[n])?;
-                    let farthest = results.peek().map(|x| x.dist).unwrap_or(f32::INFINITY);
-                    if results.len() < ef || d < farthest {
-                        let nc = Cand { dist: d, id: n };
-                        frontier.push(Reverse(nc)); // route through tombstoned nodes
-                        if !self.deleted[n] {
-                            results.push(nc);
-                            if results.len() > ef {
-                                results.pop();
-                            }
-                        }
-                    }
-                }
-            }
+            self.expand(query, c.id, layer, predicate, &mut beam, &mut bridges)?;
         }
 
-        let mut out = results.into_vec();
+        let mut out = beam.results.into_vec();
         out.sort_unstable();
         Ok(out)
     }
@@ -464,7 +655,7 @@ impl Hnsw {
         // Greedy descent from the top down to just above the new node's level.
         if max_layer > level {
             for lc in ((level + 1)..=max_layer).rev() {
-                let w = self.search_layer(&query, &ep_ids, 1, lc)?;
+                let w = self.search_layer(&query, &ep_ids, 1, lc, None)?;
                 if let Some(nearest) = w.first() {
                     ep_ids = vec![nearest.id];
                 }
@@ -474,7 +665,7 @@ impl Hnsw {
         // Connect at each layer from min(level, max_layer) down to 0.
         let start = level.min(max_layer);
         for lc in (0..=start).rev() {
-            let w = self.search_layer(&query, &ep_ids, self.ef_construction, lc)?;
+            let w = self.search_layer(&query, &ep_ids, self.ef_construction, lc, None)?;
             let max_deg = self.max_degree(lc);
             let selected = self.select_neighbors_heuristic(&w, max_deg)?;
 
@@ -516,6 +707,38 @@ impl Hnsw {
         k: usize,
         ef_search: usize,
     ) -> Result<Vec<(f32, usize)>, HnswError> {
+        self.search_inner(query, k, ef_search, None)
+    }
+
+    /// Approximate k-nearest-neighbor search restricted to nodes whose stored
+    /// attributes satisfy `predicate`. Same contract as [`Hnsw::search`], with
+    /// one guarantee added: a node that fails the predicate is never returned.
+    ///
+    /// The `ef_search` budget is spent on matching nodes alone, and traversal
+    /// bridges over non-matching ones to reach them, which is what holds recall
+    /// up where post-filtering — searching blind, then discarding — collapses.
+    /// [`Predicate::All`] takes the unfiltered fast path.
+    ///
+    /// Recall under a *very* selective predicate is what the graph's `gamma` is
+    /// for: bridging can reconnect a thinned graph, but building dense enough to
+    /// not need it is cheaper at query time.
+    pub fn search_filtered(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef_search: usize,
+        predicate: &Predicate,
+    ) -> Result<Vec<(f32, usize)>, HnswError> {
+        self.search_inner(query, k, ef_search, Some(predicate))
+    }
+
+    fn search_inner(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef_search: usize,
+        predicate: Option<&Predicate>,
+    ) -> Result<Vec<(f32, usize)>, HnswError> {
         let entry = match self.entry_point {
             Some(e) => e,
             None => return Ok(Vec::new()),
@@ -532,14 +755,17 @@ impl Hnsw {
 
         let mut ep_ids = vec![entry];
         for lc in (1..=self.max_layer).rev() {
-            let w = self.search_layer(query, &ep_ids, 1, lc)?;
+            // The upper layers exist to navigate, not to answer: descend through
+            // the graph as built and apply the predicate only on layer 0, where
+            // results are actually collected.
+            let w = self.search_layer(query, &ep_ids, 1, lc, None)?;
             if let Some(nearest) = w.first() {
                 ep_ids = vec![nearest.id];
             }
         }
 
         let ef = ef_search.max(k);
-        let mut w = self.search_layer(query, &ep_ids, ef, 0)?;
+        let mut w = self.search_layer(query, &ep_ids, ef, 0, predicate)?;
         w.truncate(k);
         Ok(w.into_iter().map(|c| (c.dist, c.id)).collect())
     }
@@ -646,7 +872,18 @@ impl std::fmt::Display for HnswDecodeError {
 impl std::error::Error for HnswDecodeError {}
 
 const CODEC_MAGIC: u32 = 0x4248_4E57; // "BHNW"
-const CODEC_VERSION: u16 = 1;
+/// Bumped to 2 when attribute rows joined the payload. Version 1 blobs are
+/// rejected rather than read as attribute-free: a filtered scan over silently
+/// missing attributes returns *zero rows* instead of failing, so a loud
+/// `UnsupportedVersion` (rebuild the index) is the safer incompatibility. No
+/// release ever wrote a v1 blob.
+const CODEC_VERSION: u16 = 2;
+
+// Attribute value tags. `Null` carries no payload; the numeric variants carry
+// 8 little-endian bytes, floats as raw bits so a `NaN` survives the round trip.
+const ATTR_TAG_NULL: u8 = 0;
+const ATTR_TAG_INT: u8 = 1;
+const ATTR_TAG_FLOAT: u8 = 2;
 
 /// Bounds-checked little-endian reader over untrusted bytes. Every accessor
 /// errors (never panics) past the end of the buffer.
@@ -708,13 +945,23 @@ impl<'a> ByteReader<'a> {
 }
 
 impl Hnsw {
-    /// Upper bound on the byte length of this graph's serialization. Exact for
-    /// a freshly built graph (degree caps hold); a safe over-estimate after
-    /// pruning only leaves neighbor lists shorter. Use it to size a buffer
+    /// Upper bound on the byte length of this graph's serialization, walking
+    /// the real per-node layer and attribute counts rather than assuming the
+    /// degree caps — a node above layer 0 carries one neighbor list per level,
+    /// which a per-node constant understates. Exact unless a row holds `Null`s,
+    /// which encode to 1 byte where this budgets 9. Use it to size a buffer
     /// before [`Hnsw::to_bytes_into`].
     pub fn serialized_len_hint(&self) -> usize {
-        let per_node = 13 + self.dim * 4 + (self.m0_cap + 2) * 8;
-        72 + self.vectors.len() * per_node
+        // Header, then per node: tombstone flag, level count, vector, attribute
+        // count, each layer's own count, and the ids and values themselves.
+        let mut total = 76 + self.vectors.len() * (17 + self.dim * 4);
+        for (layers, row) in self.links.iter().zip(&self.attrs) {
+            for layer in layers {
+                total += 8 + layer.len() * 8;
+            }
+            total += row.len() * 9;
+        }
+        total
     }
 
     /// Serialize the graph to a self-contained, versioned little-endian blob.
@@ -730,14 +977,6 @@ impl Hnsw {
     /// graph into a larger buffer (e.g. a length-prefixed on-disk payload)
     /// without allocating a standalone graph blob first.
     pub fn to_bytes_into(&self, out: &mut Vec<u8>) {
-        // This interim codec persists graph structure only, not attribute rows:
-        // build-produced graphs carry none, and predicate persistence is a
-        // later feature. Trip loudly if an attr-bearing graph reaches here
-        // before the format is extended.
-        debug_assert!(
-            self.attrs.iter().all(|a| a.is_empty()),
-            "codec v1 does not persist attribute rows"
-        );
         out.reserve(self.serialized_len_hint());
         out.extend_from_slice(&CODEC_MAGIC.to_le_bytes());
         out.extend_from_slice(&CODEC_VERSION.to_le_bytes());
@@ -763,6 +1002,20 @@ impl Hnsw {
                 out.extend_from_slice(&(layer.len() as u64).to_le_bytes());
                 for &neighbor in layer {
                     out.extend_from_slice(&(neighbor as u64).to_le_bytes());
+                }
+            }
+            out.extend_from_slice(&(self.attrs[id].len() as u64).to_le_bytes());
+            for value in &self.attrs[id] {
+                match value {
+                    AttrValue::Null => out.push(ATTR_TAG_NULL),
+                    AttrValue::Int(v) => {
+                        out.push(ATTR_TAG_INT);
+                        out.extend_from_slice(&v.to_le_bytes());
+                    }
+                    AttrValue::Float(v) => {
+                        out.push(ATTR_TAG_FLOAT);
+                        out.extend_from_slice(&v.to_bits().to_le_bytes());
+                    }
                 }
             }
         }
@@ -839,10 +1092,11 @@ impl Hnsw {
         // hold, so a corrupt count can't trigger a huge allocation. Same
         // pattern below for per-node level and link counts. `saturating_add`
         // because `vector_bytes` can be near `usize::MAX` on a crafted blob.
-        let min_node_bytes = 17usize.saturating_add(vector_bytes);
+        let min_node_bytes = 25usize.saturating_add(vector_bytes);
         let plausible_n = n.min(r.remaining() / min_node_bytes);
         let mut vectors: Vec<Vec<f32>> = Vec::with_capacity(plausible_n);
         let mut links: Vec<Vec<Vec<usize>>> = Vec::with_capacity(plausible_n);
+        let mut attrs: Vec<Vec<AttrValue>> = Vec::with_capacity(plausible_n);
         let mut deleted: Vec<bool> = Vec::with_capacity(plausible_n);
         for _ in 0..n {
             deleted.push(match r.u8()? {
@@ -883,6 +1137,28 @@ impl Hnsw {
                 node_links.push(layer);
             }
             links.push(node_links);
+
+            let attr_count = r.len()?;
+            // Every value costs at least a tag byte, so a count exceeding what
+            // is left is corrupt — checked before reserving, like the counts above.
+            if attr_count > r.remaining() {
+                return Err(HnswDecodeError::Truncated);
+            }
+            // The reservation is clamped separately, because that check alone is
+            // weaker here than for the fixed-width counts: an all-`Null` row is
+            // 1 byte per value but 16 bytes per value in memory, so the count on
+            // its own would let a crafted blob reserve 16x the bytes it supplies.
+            // A `Null`-heavy row simply grows the vector instead.
+            let mut row = Vec::with_capacity(attr_count.min(r.remaining() / 9));
+            for _ in 0..attr_count {
+                row.push(match r.u8()? {
+                    ATTR_TAG_NULL => AttrValue::Null,
+                    ATTR_TAG_INT => AttrValue::Int(r.u64()? as i64),
+                    ATTR_TAG_FLOAT => AttrValue::Float(f64::from_bits(r.u64()?)),
+                    _ => return Err(HnswDecodeError::Invalid("bad attribute tag")),
+                });
+            }
+            attrs.push(row);
         }
         if !r.done() {
             return Err(HnswDecodeError::Invalid("trailing bytes"));
@@ -922,9 +1198,7 @@ impl Hnsw {
             seed,
             vectors,
             links,
-            // Build-produced graphs carry no attribute rows; reconstruct the
-            // parallel table empty so `attrs(id)` stays consistent.
-            attrs: vec![Vec::new(); n],
+            attrs,
             deleted,
             entry_point,
             max_layer,
@@ -936,6 +1210,8 @@ impl Hnsw {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::filter::Atom;
+    use std::ops::Bound;
 
     /// Build an index over `n` deterministic random vectors of dimension `dim`.
     fn build(n: usize, dim: usize, seed: u64) -> (Hnsw, Vec<Vec<f32>>) {
@@ -1379,6 +1655,109 @@ mod tests {
     }
 
     #[test]
+    fn serialized_len_hint_bounds_the_real_encoding() {
+        // It sizes the buffer callers reserve, so an under-estimate is a silent
+        // realloc; the multi-layer and attribute terms are the easy ones to get
+        // wrong, so cover graphs deep enough to have upper layers.
+        for &(n, dim, gamma) in &[(1usize, 4usize, 1.0f32), (200, 16, 1.0), (200, 12, 4.0)] {
+            let (h, _) = build_gamma(n, dim, 7, gamma);
+            assert!(
+                h.to_bytes().len() <= h.serialized_len_hint(),
+                "hint {} under-estimated {} bytes (n={n}, dim={dim}, gamma={gamma})",
+                h.serialized_len_hint(),
+                h.to_bytes().len()
+            );
+        }
+        let empty = Hnsw::new(HnswParams::default());
+        assert!(empty.to_bytes().len() <= empty.serialized_len_hint());
+
+        let mut attrs = Hnsw::new(HnswParams::default());
+        attrs
+            .insert_with_attrs(
+                vec![1.0, 2.0],
+                vec![AttrValue::Int(1), AttrValue::Null, AttrValue::Float(2.0)],
+            )
+            .expect("insert");
+        assert!(attrs.to_bytes().len() <= attrs.serialized_len_hint());
+    }
+
+    #[test]
+    fn bytes_round_trip_preserves_attributes() {
+        let mut h = Hnsw::new(HnswParams::default());
+        let rows = [
+            vec![AttrValue::Int(42), AttrValue::Float(9.5)],
+            vec![AttrValue::Null],
+            Vec::new(), // a node inserted without attributes
+            vec![
+                AttrValue::Int(i64::MIN),
+                AttrValue::Int(i64::MAX),
+                AttrValue::Float(f64::NAN),
+                AttrValue::Float(f64::NEG_INFINITY),
+            ],
+        ];
+
+        for (i, row) in rows.iter().enumerate() {
+            h.insert_with_attrs(vec![i as f32, 1.0], row.clone())
+                .expect("insert");
+        }
+
+        let restored = Hnsw::from_bytes(&h.to_bytes()).expect("decode");
+        for id in 0..rows.len() {
+            let (before, after) = (h.attrs(id), restored.attrs(id));
+            assert_eq!(before.len(), after.len(), "row {id} changed length");
+            for (b, a) in before.iter().zip(after) {
+                match (b, a) {
+                    // NaN is never equal to itself, so compare the bits the
+                    // codec actually promises to preserve.
+                    (AttrValue::Float(x), AttrValue::Float(y)) => {
+                        assert_eq!(x.to_bits(), y.to_bits(), "row {id} float changed")
+                    }
+                    _ => assert_eq!(b, a, "row {id} value changed"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn round_tripped_index_answers_filtered_search() {
+        // The failure this guards is silent: without persisted attributes every
+        // node decodes attribute-free, so a predicate matches nothing and a
+        // filtered scan returns zero rows rather than erroring.
+        let (h, mut rng) = build_labeled(400, 16, 1.0);
+        let restored = Hnsw::from_bytes(&h.to_bytes()).expect("decode");
+        let pred = selectivity(10);
+        for _ in 0..10 {
+            let q: Vec<f32> = (0..16).map(|_| next_f64(&mut rng) as f32).collect();
+            let after = restored
+                .search_filtered(&q, 10, 64, &pred)
+                .expect("filtered search");
+            assert!(!after.is_empty(), "round-tripped index matched nothing");
+            assert_eq!(
+                after,
+                h.search_filtered(&q, 10, 64, &pred)
+                    .expect("filtered search"),
+                "filtered results changed across a round-trip"
+            );
+        }
+    }
+
+    #[test]
+    fn decode_rejects_bad_attribute_tag() {
+        let mut h = Hnsw::new(HnswParams::default());
+        h.insert_with_attrs(vec![1.0, 2.0], vec![AttrValue::Int(7)])
+            .expect("insert");
+        let mut bytes = h.to_bytes();
+        // The lone attribute's tag is the last 9 bytes' first byte.
+        let tag = bytes.len() - 9;
+        assert_eq!(bytes[tag], ATTR_TAG_INT);
+        bytes[tag] = 0xEE;
+        assert!(matches!(
+            Hnsw::from_bytes(&bytes),
+            Err(HnswDecodeError::Invalid("bad attribute tag"))
+        ));
+    }
+
+    #[test]
     fn bytes_round_trip_empty_index() {
         let h = Hnsw::new(HnswParams::default());
         let restored = Hnsw::from_bytes(&h.to_bytes()).expect("decode");
@@ -1501,6 +1880,336 @@ mod tests {
         assert!(
             recall(100) >= recall(10),
             "more ef_search should not reduce recall"
+        );
+    }
+
+    // ---- predicate-aware (filtered) search -------------------------------
+
+    /// A labelled index: `n` random vectors, node `i` tagged `Int(i % 100)` in
+    /// column 0, so `col0 < b` selects a `b%` share that is uncorrelated with
+    /// vector position. Returns the index and the PRNG state, so queries drawn
+    /// afterwards stay deterministic and disjoint from the data.
+    fn build_labeled(n: usize, dim: usize, gamma: f32) -> (Hnsw, u64) {
+        let mut rng = 0x51EC_71F1u64;
+        let mut h = Hnsw::new(HnswParams {
+            m: 16,
+            ef_construction: 100,
+            gamma,
+            metric: Metric::L2,
+            seed: 4242,
+        });
+        for i in 0..n {
+            let v: Vec<f32> = (0..dim).map(|_| next_f64(&mut rng) as f32).collect();
+            h.insert_with_attrs(v, vec![AttrValue::Int((i % 100) as i64)])
+                .expect("insert");
+        }
+        (h, rng)
+    }
+
+    /// `col0 < percent` — matches `percent`% of a [`build_labeled`] index.
+    fn selectivity(percent: i64) -> Predicate {
+        Predicate::And(vec![Atom::Range {
+            col: 0,
+            lo: Bound::Unbounded,
+            hi: Bound::Excluded(AttrValue::Int(percent)),
+        }])
+    }
+
+    /// Filtered recall@k for predicate-aware search vs naive post-filtering, both
+    /// given the same `ef`. The ceiling is the exact top-k *among matching nodes*.
+    fn filtered_recall(h: &Hnsw, rng: &mut u64, pred: &Predicate, ef: usize) -> (f64, f64) {
+        let (dim, k, queries) = (h.dim(), 10usize, 20usize);
+        let (mut aware_hits, mut post_hits, mut total) = (0usize, 0usize, 0usize);
+
+        for _ in 0..queries {
+            let q: Vec<f32> = (0..dim).map(|_| next_f64(rng) as f32).collect();
+            let truth: HashSet<usize> = h
+                .brute_force(&q, h.len())
+                .expect("brute force")
+                .into_iter()
+                .filter(|&(_, id)| pred.matches(h.attrs(id)))
+                .map(|(_, id)| id)
+                .take(k)
+                .collect();
+            total += truth.len();
+
+            let aware = h.search_filtered(&q, k, ef, pred).expect("filtered search");
+            assert!(
+                aware.iter().all(|&(_, id)| pred.matches(h.attrs(id))),
+                "filtered search returned a non-matching node"
+            );
+            aware_hits += aware.iter().filter(|(_, id)| truth.contains(id)).count();
+
+            // Naive post-filter: spend the same budget blind, then discard the
+            // non-matches from what came back.
+            post_hits += h
+                .search(&q, ef, ef)
+                .expect("search")
+                .iter()
+                .filter(|&&(_, id)| pred.matches(h.attrs(id)))
+                .take(k)
+                .filter(|(_, id)| truth.contains(id))
+                .count();
+        }
+        (
+            aware_hits as f64 / total as f64,
+            post_hits as f64 / total as f64,
+        )
+    }
+
+    #[test]
+    fn filtered_search_returns_only_matching_nodes() {
+        let (h, mut rng) = build_labeled(600, 16, 1.0);
+        let pred = selectivity(10);
+        for _ in 0..10 {
+            let q: Vec<f32> = (0..16).map(|_| next_f64(&mut rng) as f32).collect();
+            let res = h
+                .search_filtered(&q, 10, 64, &pred)
+                .expect("filtered search");
+            assert!(!res.is_empty(), "filtered search found nothing");
+            for &(_, id) in &res {
+                assert!(
+                    pred.matches(h.attrs(id)),
+                    "node {id} was returned but does not match: {:?}",
+                    h.attrs(id)
+                );
+            }
+        }
+    }
+
+    /// FNV-1a over the ids `search` returns for a fixed graph and query set.
+    /// Guards the *query* path the way [`graph_fingerprint`] guards the build
+    /// path: a change after `search_layer` — truncation, ordering, tie-breaks —
+    /// moves this without moving the graph. Ids only, not distances, so it does
+    /// not turn into a float-formatting test.
+    fn search_fingerprint(h: &Hnsw) -> u64 {
+        const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+        const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+        let mut hash = FNV_OFFSET;
+        let mut mix = |x: u64| {
+            for b in x.to_le_bytes() {
+                hash ^= b as u64;
+                hash = hash.wrapping_mul(FNV_PRIME);
+            }
+        };
+        let mut rng = 0x00C0_FFEEu64;
+        for _ in 0..20 {
+            let q: Vec<f32> = (0..16).map(|_| next_f64(&mut rng) as f32).collect();
+            for &(k, ef) in &[(1usize, 1usize), (10, 64), (25, 200)] {
+                let res = h.search(&q, k, ef).expect("search");
+                mix(res.len() as u64);
+                for (rank, &(_, id)) in res.iter().enumerate() {
+                    mix(rank as u64);
+                    mix(id as u64);
+                }
+            }
+        }
+        hash
+    }
+
+    /// Captured by running [`search_fingerprint`] against the search code as it
+    /// stood before predicates existed. Unlike the match-all equality test
+    /// below — where both sides run the same branch by construction — this pins
+    /// unfiltered results to what they were *before* filtering was added. A
+    /// deliberate change to unfiltered search must update the constant and say
+    /// so in the commit message.
+    const SEARCH_REFERENCE_FINGERPRINT: u64 = 0x4746_07C6_BEFA_E8F9;
+
+    #[test]
+    fn unfiltered_search_reproduces_pre_filter_results() {
+        let (mut h, _) = build(200, 16, 42);
+        // Tombstones included: they are the one case where the filtered and
+        // unfiltered termination rules could diverge without the graph changing.
+        for id in (0..h.len()).step_by(7) {
+            h.delete(id).expect("delete");
+        }
+        assert_eq!(
+            search_fingerprint(&h),
+            SEARCH_REFERENCE_FINGERPRINT,
+            "unfiltered search results drifted from their pre-filter behavior"
+        );
+    }
+
+    #[test]
+    fn match_all_predicate_reproduces_unfiltered_search() {
+        let (mut h, mut rng) = build_labeled(400, 16, 1.0);
+        // Tombstones are where the filtered and unfiltered termination rules
+        // could most easily diverge, so hold the fast path to equality with them
+        // present.
+        for id in (0..h.len()).step_by(7) {
+            h.delete(id).expect("delete");
+        }
+        for _ in 0..10 {
+            let q: Vec<f32> = (0..16).map(|_| next_f64(&mut rng) as f32).collect();
+            assert_eq!(
+                h.search_filtered(&q, 10, 64, &Predicate::All)
+                    .expect("filtered search"),
+                h.search(&q, 10, 64).expect("search"),
+                "the match-all predicate diverged from unfiltered search"
+            );
+        }
+    }
+
+    #[test]
+    fn filtered_search_never_returns_tombstoned_matches() {
+        let (mut h, mut rng) = build_labeled(400, 16, 1.0);
+        let pred = selectivity(50);
+        let buried: Vec<usize> = (0..h.len())
+            .filter(|&id| pred.matches(h.attrs(id)) && id % 3 == 0)
+            .collect();
+        for &id in &buried {
+            h.delete(id).expect("delete");
+        }
+        let dead: HashSet<usize> = buried.into_iter().collect();
+        for _ in 0..10 {
+            let q: Vec<f32> = (0..16).map(|_| next_f64(&mut rng) as f32).collect();
+            for (_, id) in h
+                .search_filtered(&q, 10, 64, &pred)
+                .expect("filtered search")
+            {
+                assert!(!dead.contains(&id), "returned tombstoned node {id}");
+            }
+        }
+    }
+
+    #[test]
+    fn unsatisfiable_predicate_terminates_and_returns_nothing() {
+        let (h, mut rng) = build_labeled(600, 16, 1.0);
+        // No node carries this label, so every neighbor is a bridge and nothing
+        // can ever enter the result set — the case where unbounded bridging
+        // would sweep the whole graph, or not terminate at all.
+        let pred = Predicate::And(vec![Atom::Eq {
+            col: 0,
+            value: AttrValue::Int(4242),
+        }]);
+        for _ in 0..5 {
+            let q: Vec<f32> = (0..16).map(|_| next_f64(&mut rng) as f32).collect();
+            assert!(h
+                .search_filtered(&q, 10, 64, &pred)
+                .expect("filtered search")
+                .is_empty());
+        }
+    }
+
+    #[test]
+    fn bridging_reaches_a_lone_match() {
+        // One node in 200 qualifies. Its neighbors are, almost surely, all
+        // filtered out — so it is reachable only by hopping over them.
+        let (mut h, mut rng) = (
+            Hnsw::new(HnswParams {
+                m: 16,
+                ef_construction: 100,
+                gamma: 1.0,
+                metric: Metric::L2,
+                seed: 31,
+            }),
+            0x0BAD_5EEDu64,
+        );
+        let n = 200usize;
+        let needle = 137usize;
+        for i in 0..n {
+            let v: Vec<f32> = (0..16).map(|_| next_f64(&mut rng) as f32).collect();
+            h.insert_with_attrs(v, vec![AttrValue::Int((i == needle) as i64)])
+                .expect("insert");
+        }
+        let pred = Predicate::And(vec![Atom::Eq {
+            col: 0,
+            value: AttrValue::Int(1),
+        }]);
+        for _ in 0..10 {
+            let q: Vec<f32> = (0..16).map(|_| next_f64(&mut rng) as f32).collect();
+            let res = h
+                .search_filtered(&q, 10, 64, &pred)
+                .expect("filtered search");
+            assert_eq!(
+                res.iter().map(|&(_, id)| id).collect::<Vec<_>>(),
+                vec![needle],
+                "the only matching node was not reached"
+            );
+        }
+    }
+
+    #[test]
+    fn empty_conjunction_matches_everything() {
+        // Vacuously true, so it takes the *filtered* path while admitting every
+        // node — the combination most likely to expose a bookkeeping bug.
+        let (h, mut rng) = build_labeled(400, 16, 1.0);
+        let pred = Predicate::And(Vec::new());
+        for _ in 0..5 {
+            let q: Vec<f32> = (0..16).map(|_| next_f64(&mut rng) as f32).collect();
+            let res = h
+                .search_filtered(&q, 10, 64, &pred)
+                .expect("filtered search");
+            assert_eq!(res.len(), 10);
+            let exact = h.brute_force(&q, 1).expect("brute force");
+            assert_eq!(res[0], exact[0], "nearest neighbor missed");
+        }
+    }
+
+    #[test]
+    fn selective_filter_keeps_recall_over_tombstones() {
+        // The case that pays for the filtered search continuing past a
+        // partly-filled result heap. A tombstoned *matching* node satisfies the
+        // predicate, so it never triggers a detour, yet it can never fill the
+        // budget either — stopping at the first candidate beyond the farthest
+        // live match therefore truncates the search exactly where matches are
+        // scarcest. Dropping that clause measures ~0.85 here, below this bar.
+        let (mut h, mut rng) = build_labeled(2000, 16, 1.0);
+        // Every third node, and 100 is not a multiple of 3, so a matching row
+        // survives to be found.
+        for id in (0..h.len()).step_by(3) {
+            h.delete(id).expect("delete");
+        }
+        let (aware, _) = filtered_recall(&h, &mut rng, &selectivity(1), 64);
+        assert!(
+            aware >= 0.9,
+            "recall@10 at 1% selectivity over tombstones: {aware:.3}"
+        );
+    }
+
+    /// The differentiator, in numbers. As the filter tightens, naive
+    /// post-filtering spends its budget on rows it then throws away; predicate-
+    /// aware traversal keeps spending it on rows that qualify.
+    ///
+    /// Measured on a γ = 1 graph — the *unfavourable* case. Densification is the
+    /// other half of ACORN's answer, so a graph with no spare edges is where
+    /// bridging has to carry recall on its own. Numbers observed at the time of
+    /// writing are quoted per case; the bars sit below them with margin.
+    ///
+    /// The 1% bar is what pins the two-hop bridge specifically: delete the bridge
+    /// loop and this case falls to ~0.61, well under it. Keep that in mind before
+    /// relaxing it — a softer bound there would let the bridge rot untested.
+    #[test]
+    fn filtered_recall_beats_post_filtering() {
+        let (h, mut rng) = build_labeled(2000, 16, 1.0);
+        let ef = 64;
+
+        // Half the index qualifies: post-filtering copes fine here, so the bar is
+        // that predicate-awareness costs nothing to get its wins elsewhere.
+        // Observed: aware 1.000, post 1.000.
+        let (aware, post) = filtered_recall(&h, &mut rng, &selectivity(50), ef);
+        assert!(aware >= 0.95, "recall@10 at 50% selectivity: {aware:.3}");
+        assert!(
+            aware >= post - 0.02,
+            "50% selectivity: aware {aware:.3} regressed against post-filter {post:.3}"
+        );
+
+        // One row in ten: post-filtering is already losing a third of the answers.
+        // Observed: aware 0.995, post 0.625.
+        let (aware, post) = filtered_recall(&h, &mut rng, &selectivity(10), ef);
+        assert!(aware >= 0.9, "recall@10 at 10% selectivity: {aware:.3}");
+        assert!(
+            aware >= post + 0.25,
+            "10% selectivity: aware {aware:.3} vs post-filter {post:.3} at ef={ef}"
+        );
+
+        // One row in a hundred: post-filtering has collapsed.
+        // Observed: aware 0.970, post 0.060.
+        let (aware, post) = filtered_recall(&h, &mut rng, &selectivity(1), ef);
+        assert!(aware >= 0.9, "recall@10 at 1% selectivity: {aware:.3}");
+        assert!(
+            aware >= post + 0.5,
+            "1% selectivity: aware {aware:.3} vs post-filter {post:.3} at ef={ef}"
         );
     }
 }
