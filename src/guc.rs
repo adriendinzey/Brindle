@@ -13,8 +13,9 @@ static EF_SEARCH: GucSetting<i32> = GucSetting::<i32>::new(DEFAULT_EF_SEARCH);
 
 const DEFAULT_EF_SEARCH: i32 = 64;
 
-/// A candidate pool below the requested `k` cannot return `k` neighbors, so the
-/// search widens it anyway; 1 is simply the smallest value that means anything.
+/// 1 is simply the smallest pool that means anything. Note it is a floor on the
+/// setting, not on a scan's output: a scan searches at exactly this pool and
+/// returns what it finds, so setting it to 1 gets you one row.
 const MIN_EF_SEARCH: i32 = 1;
 
 /// `ef_search` sizes a scan's candidate heap and visited set, so it is the one
@@ -28,9 +29,9 @@ pub fn init() {
     GucRegistry::define_int_guc(
         "brindle.ef_search",
         "Candidate pool size for brindle index scans.",
-        "Larger values raise recall and cost; the pool is widened to the \
-         requested LIMIT when that is larger. Applies per query, so it can be \
-         raised for one statement without rebuilding the index.",
+        "Larger values raise recall and cost. This is also the ceiling on how \
+         many rows a scan can return: a LIMIT above it comes back short, so \
+         raise this to see further. Applies per query, and needs no rebuild.",
         &EF_SEARCH,
         MIN_EF_SEARCH,
         MAX_EF_SEARCH,
