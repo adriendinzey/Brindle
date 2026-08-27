@@ -466,6 +466,11 @@ mod tests {
         assert_eq!(approx.len(), K);
         assert_eq!(exact.len(), K);
 
+        // A flat 0.9 on purpose, unlike the calibrated sweep below: this fixture
+        // is 8-dimensional, where the graph finds the exact answer whatever
+        // state it is in, so the number here cannot discriminate quality and is
+        // only asserting that the narrow `real[]` path returns sane rows at all.
+        // Calibrating it would be calibrating noise.
         let hits = approx.iter().filter(|id| exact.contains(id)).count();
         assert!(
             hits * 10 >= K * 9,
@@ -500,7 +505,7 @@ mod tests {
     const RECALL_K: [usize; 4] = [1, 10, 25, 50];
 
     /// The candidate budget the sweep measures at, pinned rather than inherited:
-    /// the threshold below is calibrated against this value, and a session or
+    /// [`RECALL_FLOORS`] is calibrated against this value, and a session or
     /// cluster setting left elsewhere would quietly turn the gate into a
     /// measurement of something else — a high budget hiding a real regression, a
     /// low one failing for an unrelated reason.
@@ -510,40 +515,95 @@ mod tests {
     /// measure that ceiling rather than the graph's quality.
     const SWEEP_EF_SEARCH: usize = 64;
 
-    /// Mean overlap@k the index must reach against the exact ordering, at
-    /// [`SWEEP_EF_SEARCH`] over [`RECALL_ROWS`] rows of [`RECALL_DIM`]
-    /// dimensions.
+    /// Mean overlap@k the index must reach against the exact ordering, one floor
+    /// per swept depth, at [`SWEEP_EF_SEARCH`] over [`RECALL_ROWS`] rows of
+    /// [`RECALL_DIM`] dimensions.
     ///
-    /// 0.9 is the usual bar for a usable ANN index. Measured on this fixture the
-    /// graph sits well above it, at k = 1 / 10 / 25 / 50:
+    /// A single flat bar cannot do this job. Recall falls with depth — the walk
+    /// has more chances to miss — so one number is either too loose at `k = 50`
+    /// or impossible at `k = 1`. These floors are calibrated per depth against
+    /// what the graph actually achieves, and against what a *degraded* graph
+    /// achieves, by rebuilding the fixture with a smaller `m` (`WITH (m = N)`,
+    /// i.e. fewer neighbors kept per node) and re-running:
     ///
-    /// | metric | recall |
-    /// |---|---|
-    /// | L2 | 1.000 / 1.000 / 0.995 / 0.993 |
-    /// | cosine | 1.000 / 1.000 / 1.000 / 0.999 |
+    /// | build          | L2 @1/@10/@25/@50             | cosine                        |
+    /// |----------------|-------------------------------|-------------------------------|
+    /// | `m = 16` ships | 1.000 / 1.000 / 0.995 / 0.993 | 1.000 / 1.000 / 1.000 / 0.999 |
+    /// | `m = 12`       | 1.000 / 1.000 / 0.981 / 0.975 | 1.000 / 0.993 / 0.997 / 0.987 |
+    /// | `m = 8`        | 1.000 / 0.967 / 0.952 / 0.944 | 1.000 / 0.987 / 0.976 / 0.952 |
+    /// | `m = 4`        | 0.867 / 0.860 / 0.805 / 0.745 | 0.933 / 0.893 / 0.816 / 0.760 |
     ///
-    /// Recall falls with depth because the graph walk has more chances to miss:
-    /// `k = 50` is where this fixture is genuinely approximating rather than
-    /// finding the exact answer, which is what makes it the useful depth.
+    /// Inner product is held to the same floors: 1.000 / 0.993 / 0.997 / 0.996
+    /// shipped, 1.000 / 0.987 / 0.987 / 0.963 halved. Note how narrowly it
+    /// catches that halving: at `k = 50` it lands 0.007 *below* the floor,
+    /// against 0.026 for L2 and 0.018 for cosine. It detects the same regression
+    /// on about a third of the margin — the weakest of the three signals, not a
+    /// redundant one.
     ///
-    /// What the bar catches, measured by rebuilding this fixture with a smaller
-    /// `m` — `WITH (m = ...)`, i.e. fewer neighbors kept per node — and running
-    /// the sweep again:
+    /// Every figure here is identical on PostgreSQL 16 and 17, the two majors
+    /// CI builds; the fixture comes from `setseed`, whose generator did not
+    /// change between them. It did change in 16, so these floors are calibrated
+    /// for 16 and 17 and a run on an older supported major would be measuring a
+    /// different fixture against them.
     ///
-    /// | build | worst recall across the four `k` | verdict |
-    /// |---|---|---|
-    /// | `m = 16` (default) | 0.993 | passes |
-    /// | `m = 8` | 0.944 | passes — a halved graph clears the bar |
-    /// | `m = 4` | 0.745 | fails, but cosine still reports 0.933 at `k = 1` |
+    /// Two things fall out of that table. Depth is where the signal is: at
+    /// `k = 1` even a quarter-connectivity graph scores 0.933 under cosine, so
+    /// no floor there can discriminate — 0.90 stays the conventional bar for a
+    /// usable index rather than a regression detector. And the useful floor sits
+    /// between what a healthy graph scores and what a halved one does — at
+    /// `k = 50`, between 0.993 and 0.944.
     ///
-    /// So this gate catches an index that is broken or badly degraded, not one
-    /// that is merely worse — and `k = 1` is the least sensitive depth, not a
-    /// cheap stand-in for the sweep.
+    /// The deep floors sit at 0.97, roughly the midpoint of that gap, and that
+    /// one number does the work at every depth below the top: a halved graph is
+    /// caught on all three metrics — L2 at `k = 10`, `25` and `50`, cosine and
+    /// inner product at `k = 50`. Raising `k = 10` to 0.98 was tried and
+    /// reverted: it caught nothing extra, because halved cosine and halved inner
+    /// product both score 0.987 there and clear either bar, while it cut the
+    /// shipped inner product's headroom to 0.013 — two missed rows out of 150.
+    /// Detection here comes from depth, not from a tighter bar at a shallow `k`.
     ///
-    /// The remaining margin absorbs CI variation across Postgres versions: the
-    /// fixture's values come from Postgres' PRNG, which is only guaranteed
-    /// stable within a major.
-    const MIN_RECALL: f64 = 0.9;
+    /// The shipped index clears these by 2 to 3 points. A tighter bar would also
+    /// catch `m = 12`, at the price of a gate that trips on ordinary variation;
+    /// that trade is the reason these are floors and not targets — they answer
+    /// "is the graph still sound", not "is it exactly as good as it was".
+    const RECALL_FLOORS: [(usize, f64); RECALL_K.len()] =
+        [(1, 0.90), (10, 0.97), (25, 0.97), (50, 0.97)];
+
+    /// The floor for `k` — looked up in [`RECALL_FLOORS`] rather than defaulted,
+    /// so adding a depth to the sweep without calibrating one fails loudly here
+    /// instead of quietly inheriting a neighbor's number.
+    fn mean_floor(k: usize) -> f64 {
+        RECALL_FLOORS
+            .iter()
+            .find(|(depth, _)| *depth == k)
+            .map(|(_, floor)| *floor)
+            .unwrap_or_else(|| panic!("recall@{k} has no calibrated floor"))
+    }
+
+    /// No single query may fall below this, whatever the mean says.
+    ///
+    /// Be precise about what that buys, because the obvious justification is
+    /// wrong: a *fully* collapsed query does not need this floor. One query at
+    /// zero drags the mean to 0.933 at `k = 10`, 0.931 at `k = 25`, 0.929 at
+    /// `k = 50` — under every floor above, so the mean catches it alone. What
+    /// this adds is the band the mean tolerates: a single query between roughly
+    /// 0.62 and 0.80 at `k = 50`, or 0.585 and 0.80 at `k = 25`, passes on the
+    /// mean and fails here. That is "one query lost a fifth to two-fifths of its
+    /// neighbours while the other fourteen stayed healthy" — a lopsided graph
+    /// rather than a uniformly worse one, which is a shape the mean is built to
+    /// hide.
+    ///
+    /// The shipped index's worst single query is 0.900 — inner product at
+    /// `k = 10`. That is one missed row of headroom, not ten comfortable points:
+    /// a single query's recall is quantised to `1/k`, so at `k = 10` the next
+    /// step down is exactly this floor.
+    ///
+    /// Not applied at `k = 1`, where the quantum is the entire measurement:
+    /// `overlap/k` there is 0.0 or 1.0, so any floor in between demands a
+    /// perfect nearest neighbour from every query — stricter than the 0.90 mean
+    /// this depth is deliberately held to, and a red build for the single miss
+    /// that mean exists to tolerate.
+    const MIN_QUERY_RECALL: f64 = 0.80;
 
     /// Deterministic query points, from a small xorshift rather than Postgres'
     /// PRNG: the fixture's own values come from `setseed`, and a query set that
@@ -586,9 +646,11 @@ mod tests {
         .expect("create index");
     }
 
-    /// Sweep one metric: assert mean recall@k clears [`MIN_RECALL`] for every
-    /// `k`, and that the two sides of the comparison are what they claim to be —
-    /// the approximate query answered by the index, the exact one not.
+    /// Sweep one metric: assert mean recall@k clears its floor in
+    /// [`RECALL_FLOORS`] for every `k`, that no single query falls below
+    /// [`MIN_QUERY_RECALL`], and that the two sides of the comparison are what
+    /// they claim to be — the approximate query answered by the index, the exact
+    /// one not.
     fn assert_recall_sweep(
         table: &str,
         operator: &str,
@@ -650,6 +712,7 @@ mod tests {
         }
 
         let mut hits = [0.0; RECALL_K.len()];
+        let mut worst = [1.0_f64; RECALL_K.len()];
         for query in &queries {
             let query = literal(query);
             let approx = ordered_ids(&approximate(&query, widest));
@@ -668,30 +731,46 @@ mod tests {
                 // test whose job is to notice the scan misbehaving.
                 let truth: HashSet<i32> = exact[..*k].iter().copied().collect();
                 let found: HashSet<i32> = approx[..*k].iter().copied().collect();
-                hits[slot] += found.intersection(&truth).count() as f64;
+                let overlap = found.intersection(&truth).count() as f64;
+                hits[slot] += overlap;
+                // Tracked alongside the mean because a mean over 15 queries can
+                // absorb one collapsed query, which is what a region of the
+                // graph falling out of reach looks like from here.
+                worst[slot] = worst[slot].min(overlap / *k as f64);
             }
         }
 
-        let recalls: Vec<(usize, f64)> = RECALL_K
+        let recalls: Vec<(usize, f64, f64)> = RECALL_K
             .iter()
             .enumerate()
-            .map(|(slot, k)| (*k, hits[slot] / (k * queries.len()) as f64))
+            .map(|(slot, k)| (*k, hits[slot] / (k * queries.len()) as f64, worst[slot]))
             .collect();
         // Report the whole sweep whichever `k` fails: one weak `k` next to the
         // others is the difference between "the graph is off" and "this depth
         // is where it thins out".
         let summary: Vec<String> = recalls
             .iter()
-            .map(|(k, recall)| format!("recall@{k} {recall:.3}"))
+            .map(|(k, mean, worst)| format!("recall@{k} {mean:.3} (worst query {worst:.3})"))
             .collect();
 
-        for (k, recall) in &recalls {
+        for (k, recall, worst) in &recalls {
+            let floor = mean_floor(*k);
             assert!(
-                *recall >= MIN_RECALL,
-                "{table}: mean recall@{k} below {MIN_RECALL} over {} queries [{}]",
+                *recall >= floor,
+                "{table}: mean recall@{k} below {floor} over {} queries [{}]",
                 queries.len(),
                 summary.join(", ")
             );
+            // Skipped at the shallowest depth, where this floor would assert a
+            // perfect nearest neighbour rather than the absence of a collapse.
+            if *k > 1 {
+                assert!(
+                    *worst >= MIN_QUERY_RECALL,
+                    "{table}: one query's recall@{k} fell to {worst:.3}, below \
+                     {MIN_QUERY_RECALL} — the mean can hide a single collapsed query [{}]",
+                    summary.join(", ")
+                );
+            }
         }
     }
 
@@ -713,6 +792,32 @@ mod tests {
             "t_sweep_cos",
             "<=>",
             "brindle_vector_cosine_distance",
+            vector_literal,
+        );
+    }
+
+    /// Inner product held to the same floors as the other two, which is worth a
+    /// caveat rather than a shrug: `<#>` is not a metric — no triangle
+    /// inequality — and HNSW's greedy walk is built on the assumption of one, so
+    /// a graph ordered by inner product can behave much worse than the same data
+    /// under L2. On this fixture it does not, because the vectors are centred on
+    /// the origin with similar magnitudes, which keeps inner product close to
+    /// cosine. A dataset whose magnitudes vary wildly is where the two diverge,
+    /// and this gate would not see it: what this asserts is that the opclass
+    /// wiring and the graph are sound, not that inner product is safe in
+    /// general.
+    #[pg_test]
+    fn inner_product_index_recall_clears_the_threshold() {
+        create_recall_fixture(
+            "t_sweep_ip",
+            "brindle_vector",
+            "::brindle_vector",
+            "brindle_vector_ip_ops",
+        );
+        assert_recall_sweep(
+            "t_sweep_ip",
+            "<#>",
+            "brindle_vector_negative_inner_product",
             vector_literal,
         );
     }
