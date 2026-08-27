@@ -499,16 +499,8 @@ mod tests {
     /// than the graph's quality.
     const RECALL_K: [usize; 4] = [1, 10, 25, 50];
 
-    /// Each swept depth and the mean recall it must clear. Kept beside
-    /// [`RECALL_K`] rather than folded into it because the depths are also used
-    /// for things that have nothing to do with thresholds, and the floors carry
-    /// a calibration story of their own — see [`MIN_QUERY_RECALL`]'s neighbour
-    /// above it.
-    const RECALL_FLOORS: [(usize, f64); RECALL_K.len()] =
-        [(1, 0.90), (10, 0.98), (25, 0.97), (50, 0.97)];
-
     /// The candidate budget the sweep measures at, pinned rather than inherited:
-    /// the threshold below is calibrated against this value, and a session or
+    /// [`RECALL_FLOORS`] is calibrated against this value, and a session or
     /// cluster setting left elsewhere would quietly turn the gate into a
     /// measurement of something else — a high budget hiding a real regression, a
     /// low one failing for an unrelated reason.
@@ -518,9 +510,9 @@ mod tests {
     /// measure that ceiling rather than the graph's quality.
     const SWEEP_EF_SEARCH: usize = 64;
 
-    /// Mean overlap@k the index must reach against the exact ordering, per `k`,
-    /// at [`SWEEP_EF_SEARCH`] over [`RECALL_ROWS`] rows of [`RECALL_DIM`]
-    /// dimensions.
+    /// Mean overlap@k the index must reach against the exact ordering, one floor
+    /// per swept depth, at [`SWEEP_EF_SEARCH`] over [`RECALL_ROWS`] rows of
+    /// [`RECALL_DIM`] dimensions.
     ///
     /// A single flat bar cannot do this job. Recall falls with depth — the walk
     /// has more chances to miss — so one number is either too loose at `k = 50`
@@ -529,8 +521,8 @@ mod tests {
     /// achieves, by rebuilding the fixture with a smaller `m` (`WITH (m = N)`,
     /// i.e. fewer neighbors kept per node) and re-running:
     ///
-    /// | build          | L2 @1/@10/@25/@50           | cosine                      |
-    /// |----------------|-----------------------------|-----------------------------|
+    /// | build          | L2 @1/@10/@25/@50             | cosine                        |
+    /// |----------------|-------------------------------|-------------------------------|
     /// | `m = 16` ships | 1.000 / 1.000 / 0.995 / 0.993 | 1.000 / 1.000 / 1.000 / 0.999 |
     /// | `m = 12`       | 1.000 / 1.000 / 0.981 / 0.975 | 1.000 / 0.993 / 0.997 / 0.987 |
     /// | `m = 8`        | 1.000 / 0.967 / 0.952 / 0.944 | 1.000 / 0.987 / 0.976 / 0.952 |
@@ -539,20 +531,27 @@ mod tests {
     /// Inner product on the shipped build sits with them at
     /// 1.000 / 0.993 / 0.997 / 0.996. Every figure here is identical on
     /// PostgreSQL 16 and 17 — the fixture comes from `setseed`, whose generator
-    /// has not changed across those majors — so the margins below are headroom
+    /// has not changed across those majors — so the margins here are headroom
     /// against future drift, not against present noise.
     ///
     /// Two things fall out of that table. Depth is where the signal is: at
-    /// `k = 1` even a quarter-connectivity graph scores 0.933, so no floor there
-    /// can discriminate, while `k = 50` separates every build. And the useful
-    /// floor sits between what a healthy graph scores and what a halved one
-    /// does — at `k = 50`, between 0.993 and 0.944.
+    /// `k = 1` even a quarter-connectivity graph scores 0.933 under cosine, so
+    /// no floor there can discriminate — 0.90 stays the conventional bar for a
+    /// usable index rather than a regression detector. And the useful floor sits
+    /// between what a healthy graph scores and what a halved one does — at
+    /// `k = 50`, between 0.993 and 0.944.
     ///
-    /// The floors below take the midpoint of that gap at each depth, which
-    /// catches a halved graph at `k = 25` and `k = 50` while leaving the shipped
-    /// index roughly two points of headroom. A tighter bar would also catch
-    /// `m = 12`, at the price of a gate that trips on ordinary variation; that
-    /// trade is the reason these are floors and not targets.
+    /// The deep floors take roughly the midpoint of that gap, which catches a
+    /// halved graph on every metric — L2 trips first at `k = 10`, cosine and
+    /// inner product at `k = 50`. The shipped index clears them by 2 to 3
+    /// points, except inner product at `k = 10` (0.993 against 0.98), which is
+    /// the tightest margin here and the first place to look if this gate ever
+    /// goes red without a real regression behind it. A tighter bar would also
+    /// catch `m = 12`, at the price of a gate that trips on ordinary variation;
+    /// that trade is the reason these are floors and not targets.
+    const RECALL_FLOORS: [(usize, f64); RECALL_K.len()] =
+        [(1, 0.90), (10, 0.98), (25, 0.97), (50, 0.97)];
+
     /// The floor for `k` — looked up in [`RECALL_FLOORS`] rather than defaulted,
     /// so adding a depth to the sweep without calibrating one fails loudly here
     /// instead of quietly inheriting a neighbor's number.
@@ -569,6 +568,10 @@ mod tests {
     /// an unreachable region of the graph looks like from the outside — a
     /// failure mode with a different shape from "quality drifted down", and one
     /// nothing else in the suite looks for.
+    ///
+    /// The shipped index's worst single query across all three metrics and every
+    /// depth is 0.900 (inner product at `k = 10`), so this sits a clear ten
+    /// points under what the graph actually does.
     const MIN_QUERY_RECALL: f64 = 0.80;
 
     /// Deterministic query points, from a small xorshift rather than Postgres'
@@ -612,9 +615,11 @@ mod tests {
         .expect("create index");
     }
 
-    /// Sweep one metric: assert mean recall@k clears [`MIN_RECALL`] for every
-    /// `k`, and that the two sides of the comparison are what they claim to be —
-    /// the approximate query answered by the index, the exact one not.
+    /// Sweep one metric: assert mean recall@k clears its floor in
+    /// [`RECALL_FLOORS`] for every `k`, that no single query falls below
+    /// [`MIN_QUERY_RECALL`], and that the two sides of the comparison are what
+    /// they claim to be — the approximate query answered by the index, the exact
+    /// one not.
     fn assert_recall_sweep(
         table: &str,
         operator: &str,
