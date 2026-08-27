@@ -528,11 +528,17 @@ mod tests {
     /// | `m = 8`        | 1.000 / 0.967 / 0.952 / 0.944 | 1.000 / 0.987 / 0.976 / 0.952 |
     /// | `m = 4`        | 0.867 / 0.860 / 0.805 / 0.745 | 0.933 / 0.893 / 0.816 / 0.760 |
     ///
-    /// Inner product on the shipped build sits with them at
-    /// 1.000 / 0.993 / 0.997 / 0.996. Every figure here is identical on
-    /// PostgreSQL 16 and 17 — the fixture comes from `setseed`, whose generator
-    /// has not changed across those majors — so the margins here are headroom
-    /// against future drift, not against present noise.
+    /// Inner product is held to the same floors: 1.000 / 0.993 / 0.997 / 0.996
+    /// shipped, 1.000 / 0.987 / 0.987 / 0.963 halved. Note it clears the
+    /// `k = 50` floor by 0.007 when halved, against 0.026 for L2 and 0.018 for
+    /// cosine — it detects the same regression with roughly a third of the
+    /// margin, so it is the weakest of the three signals, not a redundant one.
+    ///
+    /// Every figure here is identical on PostgreSQL 16 and 17, the two majors
+    /// CI builds; the fixture comes from `setseed`, whose generator did not
+    /// change between them. It did change in 16, so these floors are calibrated
+    /// for 16 and 17 and a run on an older supported major would be measuring a
+    /// different fixture against them.
     ///
     /// Two things fall out of that table. Depth is where the signal is: at
     /// `k = 1` even a quarter-connectivity graph scores 0.933 under cosine, so
@@ -548,7 +554,8 @@ mod tests {
     /// the tightest margin here and the first place to look if this gate ever
     /// goes red without a real regression behind it. A tighter bar would also
     /// catch `m = 12`, at the price of a gate that trips on ordinary variation;
-    /// that trade is the reason these are floors and not targets.
+    /// that trade is the reason these are floors and not targets — they answer
+    /// "is the graph still sound", not "is it exactly as good as it was".
     const RECALL_FLOORS: [(usize, f64); RECALL_K.len()] =
         [(1, 0.90), (10, 0.98), (25, 0.97), (50, 0.97)];
 
@@ -569,9 +576,16 @@ mod tests {
     /// failure mode with a different shape from "quality drifted down", and one
     /// nothing else in the suite looks for.
     ///
-    /// The shipped index's worst single query across all three metrics and every
-    /// depth is 0.900 (inner product at `k = 10`), so this sits a clear ten
-    /// points under what the graph actually does.
+    /// The shipped index's worst single query is 0.900 — inner product at
+    /// `k = 10`. That is one missed row of headroom, not ten comfortable points:
+    /// a single query's recall is quantised to `1/k`, so at `k = 10` the next
+    /// step down is exactly this floor.
+    ///
+    /// Not applied at `k = 1`, where the quantum is the entire measurement:
+    /// `overlap/k` there is 0.0 or 1.0, so any floor in between demands a
+    /// perfect nearest neighbour from every query — stricter than the 0.90 mean
+    /// this depth is deliberately held to, and a red build for the single miss
+    /// that mean exists to tolerate.
     const MIN_QUERY_RECALL: f64 = 0.80;
 
     /// Deterministic query points, from a small xorshift rather than Postgres'
@@ -730,12 +744,16 @@ mod tests {
                 queries.len(),
                 summary.join(", ")
             );
-            assert!(
-                *worst >= MIN_QUERY_RECALL,
-                "{table}: one query's recall@{k} fell to {worst:.3}, below \
-                 {MIN_QUERY_RECALL} — the mean can hide a single collapsed query [{}]",
-                summary.join(", ")
-            );
+            // Skipped at the shallowest depth, where this floor would assert a
+            // perfect nearest neighbour rather than the absence of a collapse.
+            if *k > 1 {
+                assert!(
+                    *worst >= MIN_QUERY_RECALL,
+                    "{table}: one query's recall@{k} fell to {worst:.3}, below \
+                     {MIN_QUERY_RECALL} — the mean can hide a single collapsed query [{}]",
+                    summary.join(", ")
+                );
+            }
         }
     }
 
