@@ -466,6 +466,11 @@ mod tests {
         assert_eq!(approx.len(), K);
         assert_eq!(exact.len(), K);
 
+        // A flat 0.9 on purpose, unlike the calibrated sweep below: this fixture
+        // is 8-dimensional, where the graph finds the exact answer whatever
+        // state it is in, so the number here cannot discriminate quality and is
+        // only asserting that the narrow `real[]` path returns sane rows at all.
+        // Calibrating it would be calibrating noise.
         let hits = approx.iter().filter(|id| exact.contains(id)).count();
         assert!(
             hits * 10 >= K * 9,
@@ -529,10 +534,11 @@ mod tests {
     /// | `m = 4`        | 0.867 / 0.860 / 0.805 / 0.745 | 0.933 / 0.893 / 0.816 / 0.760 |
     ///
     /// Inner product is held to the same floors: 1.000 / 0.993 / 0.997 / 0.996
-    /// shipped, 1.000 / 0.987 / 0.987 / 0.963 halved. Note it clears the
-    /// `k = 50` floor by 0.007 when halved, against 0.026 for L2 and 0.018 for
-    /// cosine — it detects the same regression with roughly a third of the
-    /// margin, so it is the weakest of the three signals, not a redundant one.
+    /// shipped, 1.000 / 0.987 / 0.987 / 0.963 halved. Note how narrowly it
+    /// catches that halving: at `k = 50` it lands 0.007 *below* the floor,
+    /// against 0.026 for L2 and 0.018 for cosine. It detects the same regression
+    /// on about a third of the margin — the weakest of the three signals, not a
+    /// redundant one.
     ///
     /// Every figure here is identical on PostgreSQL 16 and 17, the two majors
     /// CI builds; the fixture comes from `setseed`, whose generator did not
@@ -547,17 +553,21 @@ mod tests {
     /// between what a healthy graph scores and what a halved one does — at
     /// `k = 50`, between 0.993 and 0.944.
     ///
-    /// The deep floors take roughly the midpoint of that gap, which catches a
-    /// halved graph on every metric — L2 trips first at `k = 10`, cosine and
-    /// inner product at `k = 50`. The shipped index clears them by 2 to 3
-    /// points, except inner product at `k = 10` (0.993 against 0.98), which is
-    /// the tightest margin here and the first place to look if this gate ever
-    /// goes red without a real regression behind it. A tighter bar would also
+    /// The deep floors sit at 0.97, roughly the midpoint of that gap, and that
+    /// one number does the work at every depth below the top: a halved graph is
+    /// caught on all three metrics — L2 at `k = 10`, `25` and `50`, cosine and
+    /// inner product at `k = 50`. Raising `k = 10` to 0.98 was tried and
+    /// reverted: it caught nothing extra, because halved cosine and halved inner
+    /// product both score 0.987 there and clear either bar, while it cut the
+    /// shipped inner product's headroom to 0.013 — two missed rows out of 150.
+    /// Detection here comes from depth, not from a tighter bar at a shallow `k`.
+    ///
+    /// The shipped index clears these by 2 to 3 points. A tighter bar would also
     /// catch `m = 12`, at the price of a gate that trips on ordinary variation;
     /// that trade is the reason these are floors and not targets — they answer
     /// "is the graph still sound", not "is it exactly as good as it was".
     const RECALL_FLOORS: [(usize, f64); RECALL_K.len()] =
-        [(1, 0.90), (10, 0.98), (25, 0.97), (50, 0.97)];
+        [(1, 0.90), (10, 0.97), (25, 0.97), (50, 0.97)];
 
     /// The floor for `k` — looked up in [`RECALL_FLOORS`] rather than defaulted,
     /// so adding a depth to the sweep without calibrating one fails loudly here
@@ -570,11 +580,18 @@ mod tests {
             .unwrap_or_else(|| panic!("recall@{k} has no calibrated floor"))
     }
 
-    /// No single query may fall below this, whatever the mean says. Fifteen
-    /// queries average away one collapsed query, and a collapsed query is what
-    /// an unreachable region of the graph looks like from the outside — a
-    /// failure mode with a different shape from "quality drifted down", and one
-    /// nothing else in the suite looks for.
+    /// No single query may fall below this, whatever the mean says.
+    ///
+    /// Be precise about what that buys, because the obvious justification is
+    /// wrong: a *fully* collapsed query does not need this floor. One query at
+    /// zero drags the mean to 0.933 at `k = 10`, 0.931 at `k = 25`, 0.929 at
+    /// `k = 50` — under every floor above, so the mean catches it alone. What
+    /// this adds is the band the mean tolerates: a single query between roughly
+    /// 0.62 and 0.80 at `k = 50`, or 0.585 and 0.80 at `k = 25`, passes on the
+    /// mean and fails here. That is "one query lost a fifth to two-fifths of its
+    /// neighbours while the other fourteen stayed healthy" — a lopsided graph
+    /// rather than a uniformly worse one, which is a shape the mean is built to
+    /// hide.
     ///
     /// The shipped index's worst single query is 0.900 — inner product at
     /// `k = 10`. That is one missed row of headroom, not ten comfortable points:
