@@ -270,10 +270,13 @@ ORDER BY l.ef;
 -- run-to-run drift here is larger than the difference being measured. Pairing
 -- each query against its own ef = 1 timing cancels the per-scan fixed cost —
 -- graph deserialization and planning, which is what the storage claim rests on.
--- One thing does not cancel: the control returns a single row where every other
--- point returns k, so each delta still carries k-1 heap fetches. That inflates
--- the search cost slightly rather than flattering it, so the conclusion drawn
--- from this table is conservative, but the number is not the pure search delta.
+-- Two things do not cancel, and they pull in opposite directions: the control
+-- returns a single row where every other point returns k, so each delta carries
+-- k-1 extra heap fetches, while the control's own graph walk is subtracted along
+-- with the fixed cost. Which residual dominates is not measured here, so treat
+-- this as the search cost to within a few tenths of a millisecond rather than as
+-- a bound in either direction. The conclusion it supports needs only the order
+-- of magnitude.
 WITH paired AS (
     SELECT t.ef,
            t.elapsed_ms - base.elapsed_ms AS delta_ms

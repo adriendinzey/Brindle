@@ -52,6 +52,9 @@ fi
 # with "unbound variable" instead of the clearer errors below.
 : "${PGRX_HOME:=$HOME/.pgrx}"
 
+# clustered_flag is deliberately unquoted at the psql call below: it must expand
+# to no argument at all when empty, which "$clustered_flag" would not do.
+# shellcheck disable=SC2086
 case "${SHAPE:-uniform}" in
   clustered) clustered_flag="--set=clustered=1" ;;
   uniform)   clustered_flag="" ;;
