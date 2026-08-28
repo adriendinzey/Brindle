@@ -52,9 +52,6 @@ fi
 # with "unbound variable" instead of the clearer errors below.
 : "${PGRX_HOME:=$HOME/.pgrx}"
 
-# clustered_flag is deliberately unquoted at the psql call below: it must expand
-# to no argument at all when empty, which "$clustered_flag" would not do.
-# shellcheck disable=SC2086
 case "${SHAPE:-uniform}" in
   clustered) clustered_flag="--set=clustered=1" ;;
   uniform)   clustered_flag="" ;;
@@ -101,6 +98,9 @@ Brindle index baseline
   queries  $QUERIES per ef_search point, k = $K
 EOF
 
+# clustered_flag is deliberately unquoted: it must expand to no argument at all
+# when SHAPE is uniform, which "$clustered_flag" would not do.
+# shellcheck disable=SC2086
 "$bindir/psql" --host "$host" --port "$port" --dbname "$db" --quiet --no-psqlrc \
   --set=ON_ERROR_STOP=1 \
   --set=rows="$ROWS" --set=dims="$DIMS" \
