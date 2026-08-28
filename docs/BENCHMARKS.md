@@ -16,9 +16,10 @@ SHAPE=clustered PGVECTOR=1 scripts/bench_index.sh   # clustered + comparison
 PGVECTOR=1 scripts/bench_index.sh                   # uniform + comparison
 ```
 
-**Every table in this file comes from those two runs.** Several figures in the
-prose do not, and each says so where it appears: the pgvector recall table
-across repeated builds, which is multi-run by construction because its subject
+**Every measurement in this file comes from those two runs.** A few figures are
+deliberately drawn from outside them, and each says so where it appears: the
+pgvector recall table across repeated builds, which is multi-run by construction
+because its subject
 is how far a randomised build moves; the run-to-run ranges quoted for build
 time and for the paired search-cost medians, which exist precisely to show how
 far those move; the plpgsql timing floor of ~0.016 ms; and the check that
@@ -37,8 +38,8 @@ That "one run set" rule is not pedantry. An earlier draft of this file quoted
 build times and latencies from three different runs under a single commit
 stamp, and the figures contradicted each other — the same configuration
 appeared as 110.6 s, 112.6 s and 113.6 s in three places, and a p50 appeared as
-both 85.1 ms and 86.6 ms. Every table below comes from the two runs named
-above.
+both 85.1 ms and 86.6 ms. Every measurement below comes from the two runs named
+above, and the handful of figures that do not are labelled where they appear.
 
 Nothing here runs in CI. Timing on a shared runner is noise, and no number in
 this file should ever gate a merge.
@@ -279,8 +280,8 @@ Recorded because a comparison whose asymmetries are hidden is worse than none.
   not an advantage.
 - **Harness overhead.** The plpgsql timing loop has a floor of about 0.016 ms,
   measured separately from the two runs above. That is 0.02% of Brindle's 82 ms
-  but roughly 4% of pgvector's 0.45 ms, so the
-  latency ratios above are if anything conservative. (It cancels entirely from
+  but roughly 4% of pgvector's 0.45 ms, so the latency ratios above are if
+  anything conservative. (It cancels entirely from
   the paired search-cost table, which is one more reason to prefer it.)
 - **Warm cache throughout.** Both sides. A cold-cache comparison would be more
   informative about storage, and becomes meaningful once Brindle's is paged.
