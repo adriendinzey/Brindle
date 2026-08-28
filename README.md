@@ -23,7 +23,10 @@ filters — and adds first-class **hybrid** (vector + lexical) ranking via
 Reciprocal Rank Fusion.
 
 > **Status: early development (Phase 0).** This is a learning-grade project built
-> in the open. It is *not* production-ready and makes no performance claims yet.
+> in the open, and *not* production-ready. It makes no performance claims: the
+> first measured baseline is in [docs/BENCHMARKS.md](docs/BENCHMARKS.md), and it
+> shows queries about two orders of magnitude slower than pgvector, almost
+> entirely because every scan still deserializes the whole index.
 > See [docs/ROADMAP.md](docs/ROADMAP.md) for what works today.
 
 > ⚠️ **On Windows, build inside WSL2 on the Linux-native filesystem.** Clone to

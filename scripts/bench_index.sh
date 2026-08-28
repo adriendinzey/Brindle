@@ -2,8 +2,10 @@
 #
 # Brindle index performance baseline: build time, query latency, recall.
 #
-# Runs against the worktree's own Postgres (the one scripts/pgx.sh manages), so
-# it never touches a shared cluster and can run while other tasks are building.
+# Runs against the worktree's own Postgres data directory (the one scripts/pgx.sh
+# manages). Note the *install prefix* is still shared: `cargo pgrx install` writes
+# brindle.so into ~/.pgrx/<ver>/pgrx-install, which every worktree's Postgres
+# loads from — so do not run this while another task is installing or testing.
 #
 # Usage:
 #   scripts/bench_index.sh                    # 100k x 128, 100 queries, k = 10
@@ -14,14 +16,17 @@
 #   DIMS     vector dimensions                  (default 128)
 #   QUERIES  query vectors per ef_search point  (default 100)
 #   K        neighbors requested per query      (default 10)
+#   PGVECTOR set to 1 to also run the matched pgvector comparison (needs the
+#            vector extension installed into the same Postgres)
 #   SHAPE    set to "clustered" for 100 gaussian-ish clusters; unset means
 #            uniform random, which in high dimensions is the worst case a graph
 #            index can face and says more about the fixture than the index
 #   PG       Postgres major to use              (default 17)
 #
-# The ef_search sweep lives in benches/sql/index_baseline.sql. Every point in it
-# is above K on purpose: a scan returns at most ef_search rows, so a sweep point
-# below K would measure that ceiling rather than the graph.
+# The ef_search sweep lives in benches/sql/index_baseline.sql. Every point that
+# reports recall is above K on purpose: a scan returns at most ef_search rows, so
+# a sweep point below K would measure that ceiling rather than the graph. The one
+# point below K (ef = 1) is a latency control and deliberately reports no recall.
 #
 # This is a local baseline, not a CI gate. Timing on a shared runner is noise,
 # and nothing here should ever gate a merge.
@@ -43,6 +48,15 @@ if [[ -f "$repo_root/.cargo/worktree-env" ]]; then
   # shellcheck disable=SC1091
   . "$repo_root/.cargo/worktree-env"
 fi
+# Outside a task worktree PGRX_HOME is unset, and `set -u` would kill the script
+# with "unbound variable" instead of the clearer errors below.
+: "${PGRX_HOME:=$HOME/.pgrx}"
+
+case "${SHAPE:-uniform}" in
+  clustered) clustered_flag="--set=clustered=1" ;;
+  uniform)   clustered_flag="" ;;
+  *) echo "error: SHAPE must be 'uniform' or 'clustered', got '$SHAPE'" >&2; exit 1 ;;
+esac
 
 pg_config="$(cargo pgrx info pg-config "pg$PG" 2>/dev/null || true)"
 if [[ -z "$pg_config" ]]; then
@@ -77,7 +91,7 @@ db="brindle_bench"
 cat <<EOF
 
 Brindle index baseline
-  commit   $(git rev-parse --short HEAD)$(git diff --quiet || echo ' (dirty)')
+  commit   $(git rev-parse --short HEAD)$([[ -n "$(git status --porcelain)" ]] && echo ' (dirty tree)')
   postgres $("$bindir/postgres" --version | awk '{print $3}')
   rows     $ROWS x $DIMS dims
   queries  $QUERIES per ef_search point, k = $K
@@ -87,8 +101,16 @@ EOF
   --set=ON_ERROR_STOP=1 \
   --set=rows="$ROWS" --set=dims="$DIMS" \
   --set=queries="$QUERIES" --set=k="$K" \
-  ${SHAPE:+--set=clustered=1} \
+  ${clustered_flag} \
   --file benches/sql/index_baseline.sql
+
+if [[ "${PGVECTOR:-0}" == "1" ]]; then
+  echo
+  echo "==> pgvector comparison (same rows, same queries, same ground truth)"
+  "$bindir/psql" --host "$host" --port "$port" --dbname "$db" --quiet --no-psqlrc \
+    --set=ON_ERROR_STOP=1 --set=k="$K" \
+    --file benches/sql/pgvector_compare.sql
+fi
 
 echo
 echo "==> done. Postgres is still running; stop it with:"

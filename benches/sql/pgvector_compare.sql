@@ -48,6 +48,27 @@ CREATE TABLE pgv_timings (phase text, ef int, elapsed_ms double precision);
 CREATE TABLE pgv_recall (ef int, query_id int, hits int);
 
 -- Matched to brindle's defaults: m = 16, ef_construction = 64.
+--
+-- Timed twice, because the honest build comparison needs both. pgvector's build
+-- is parallel (max_parallel_maintenance_workers, default 2), and brindle's is
+-- single-threaded, so the default-settings number compares a 3-backend build
+-- against a 1-backend one. The serial number is the like-for-like figure; the
+-- parallel one is what a user actually gets from pgvector today. Reporting only
+-- the first would overstate the gap, reporting only the second would understate
+-- what pgvector delivers.
+DO $$
+DECLARE started timestamptz;
+BEGIN
+    SET LOCAL max_parallel_maintenance_workers = 0;
+    started := clock_timestamp();
+    CREATE INDEX pgv_idx_serial ON pgv_vectors USING hnsw (embedding vector_l2_ops)
+        WITH (m = 16, ef_construction = 64);
+    INSERT INTO pgv_timings
+    VALUES ('build_serial', NULL, extract(epoch FROM clock_timestamp() - started) * 1000);
+END $$;
+
+DROP INDEX pgv_idx_serial;
+
 DO $$
 DECLARE started timestamptz;
 BEGIN
@@ -56,6 +77,24 @@ BEGIN
         WITH (m = 16, ef_construction = 64);
     INSERT INTO pgv_timings
     VALUES ('build', NULL, extract(epoch FROM clock_timestamp() - started) * 1000);
+END $$;
+
+-- The measured query must actually use pgvector's index, for the same reason
+-- the brindle side asserts it.
+DO $$
+DECLARE q vector; line text; uses_index bool := false;
+BEGIN
+    SELECT embedding::text::vector INTO q FROM bench_queries ORDER BY id LIMIT 1;
+    PERFORM set_config('hnsw.ef_search', '64', false);
+    FOR line IN EXPLAIN (COSTS OFF)
+        SELECT id FROM pgv_vectors ORDER BY embedding <-> q
+        LIMIT current_setting('bench.k')::int
+    LOOP
+        IF line LIKE '%Index Scan using pgv_idx%' THEN uses_index := true; END IF;
+    END LOOP;
+    IF NOT uses_index THEN
+        RAISE EXCEPTION 'the pgvector query does not use pgv_idx';
+    END IF;
 END $$;
 
 DO $$
@@ -89,9 +128,10 @@ BEGIN
 END $$;
 
 \echo ''
-\echo '=== pgvector: build ==='
-SELECT round((elapsed_ms / 1000.0)::numeric, 1) AS build_seconds
-FROM pgv_timings WHERE phase = 'build';
+\echo '=== pgvector: build (parallel as shipped, and serial for like-for-like) ==='
+SELECT max(elapsed_ms) FILTER (WHERE phase = 'build') / 1000.0 AS parallel_seconds,
+       max(elapsed_ms) FILTER (WHERE phase = 'build_serial') / 1000.0 AS serial_seconds
+FROM pgv_timings;
 
 \echo ''
 \echo '=== pgvector: query latency and recall by ef_search ==='

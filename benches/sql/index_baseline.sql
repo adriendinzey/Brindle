@@ -112,6 +112,26 @@ CREATE TABLE bench_truth (query_id int primary key, ids int[]);
 -- parameter the loops need is handed over as a setting instead.
 SELECT set_config('bench.k', :'k', false);
 
+-- The other half of the plan guard. The approximate side is asserted to use the
+-- index; this asserts the exact side does not. If an ordering path for the
+-- distance *function* ever appears, the "exact" baseline would quietly become
+-- approximate and recall would drift toward a meaningless 1.000.
+DO $$
+DECLARE q brindle_vector; line text; uses_index bool := false;
+BEGIN
+    SELECT embedding INTO q FROM bench_queries ORDER BY id LIMIT 1;
+    FOR line IN EXPLAIN (COSTS OFF)
+        SELECT id FROM bench_vectors
+        ORDER BY brindle_vector_l2_distance(embedding, q)
+        LIMIT current_setting('bench.k')::int
+    LOOP
+        IF line LIKE '%Index Scan using bench_idx%' THEN uses_index := true; END IF;
+    END LOOP;
+    IF uses_index THEN
+        RAISE EXCEPTION 'the ground-truth query is being answered by the index; it is not an exact baseline';
+    END IF;
+END $$;
+
 DO $$
 DECLARE
     k int := current_setting('bench.k')::int;
@@ -156,7 +176,12 @@ DECLARE
     started   timestamptz;
     found     int[];
 BEGIN
-    FOREACH ef IN ARRAY ARRAY[16, 32, 64, 128, 256] LOOP
+    -- ef_search = 1 is not a useful operating point; it is the control. The
+    -- search does almost nothing there, so whatever latency remains is the
+    -- fixed per-scan cost, and the difference against ef = 256 is what the
+    -- search itself costs. Without it, "deserialization dominates" would be an
+    -- inference from flat latency rather than a measurement.
+    FOREACH ef IN ARRAY ARRAY[1, 16, 32, 64, 128, 256] LOOP
         PERFORM set_config('brindle.ef_search', ef::text, false);
 
         FOR q IN SELECT id, embedding FROM bench_queries ORDER BY id LOOP
@@ -171,10 +196,16 @@ BEGIN
             VALUES ('query', ef,
                     extract(epoch FROM clock_timestamp() - started) * 1000);
 
-            INSERT INTO bench_recall
-            SELECT ef, q.id,
-                   (SELECT count(*) FROM unnest(found) f WHERE f = ANY (t.ids))
-            FROM bench_truth t WHERE t.query_id = q.id;
+            -- Recall only where the budget can actually serve k rows. At
+            -- ef_search < k the scan returns at most ef_search rows, so any
+            -- "recall" there measures that ceiling, not the graph — the exact
+            -- artifact this sweep exists to avoid plotting.
+            IF ef >= k THEN
+                INSERT INTO bench_recall
+                SELECT ef, q.id,
+                       (SELECT count(*) FROM unnest(found) f WHERE f = ANY (t.ids))
+                FROM bench_truth t WHERE t.query_id = q.id;
+            END IF;
         END LOOP;
     END LOOP;
 END $$;
@@ -200,11 +231,14 @@ WITH latency AS (
 ), quality AS (
     SELECT ef, avg(hits)::numeric / :k AS recall FROM bench_recall GROUP BY ef
 )
+-- LEFT JOIN, not JOIN: ef_search = 1 is a latency control with deliberately no
+-- recall figure, and it must still appear in the timing column.
 SELECT l.ef AS ef_search,
        round(l.p50::numeric, 2) AS p50_ms,
        round(l.p95::numeric, 2) AS p95_ms,
-       round(q.recall, 3) AS recall_at_k
-FROM latency l JOIN quality q USING (ef)
+       CASE WHEN q.recall IS NULL THEN '— (control)'
+            ELSE round(q.recall, 3)::text END AS recall_at_k
+FROM latency l LEFT JOIN quality q USING (ef)
 ORDER BY l.ef;
 
 \echo ''
@@ -212,9 +246,11 @@ ORDER BY l.ef;
 WITH q AS (SELECT embedding FROM bench_queries ORDER BY id LIMIT 1),
      d AS (SELECT brindle_vector_l2_distance(v.embedding, q.embedding) AS dist
            FROM bench_vectors v, q ORDER BY dist LIMIT 1000)
+-- max(), not array_agg()[1000]: the CTE's row order is not guaranteed, and this
+-- ratio is load-bearing for the uniform fixture's explanation.
 SELECT round(min(dist)::numeric, 3) AS nearest,
-       round((array_agg(dist))[1000]::numeric, 3) AS thousandth,
-       round(((array_agg(dist))[1000] / min(dist))::numeric, 3) AS ratio
+       round(max(dist)::numeric, 3) AS thousandth,
+       round((max(dist) / min(dist))::numeric, 3) AS ratio
 FROM d;
 
 \echo ''
