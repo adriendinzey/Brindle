@@ -23,9 +23,9 @@ filters — and adds first-class **hybrid** (vector + lexical) ranking via
 Reciprocal Rank Fusion.
 
 > **Status: early development (Phase 0).** This is a learning-grade project built
-> in the open, and *not* production-ready. It makes no performance claims: the
-> first measured baseline is in [docs/BENCHMARKS.md](docs/BENCHMARKS.md), and it
-> shows queries about two orders of magnitude slower than pgvector, almost
+> in the open, and *not* production-ready. Nothing in it has been optimized yet:
+> the first measured baseline is in [docs/BENCHMARKS.md](docs/BENCHMARKS.md), and
+> it shows queries about two orders of magnitude slower than pgvector, almost
 > entirely because every scan still deserializes the whole index.
 > See [docs/ROADMAP.md](docs/ROADMAP.md) for what works today.
 
