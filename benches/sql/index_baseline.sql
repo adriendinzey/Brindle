@@ -83,7 +83,7 @@ END $$;
 VACUUM ANALYZE bench_vectors;
 
 -- ---------------------------------------------------------------- build time
-CREATE TABLE bench_timings (phase text, ef int, elapsed_ms double precision);
+CREATE TABLE bench_timings (phase text, ef int, elapsed_ms double precision, query_id int);
 
 DO $$
 DECLARE started timestamptz;
@@ -92,7 +92,7 @@ BEGIN
     CREATE INDEX bench_idx ON bench_vectors USING brindle (embedding);
     INSERT INTO bench_timings
     VALUES ('build', NULL,
-            extract(epoch FROM clock_timestamp() - started) * 1000);
+            extract(epoch FROM clock_timestamp() - started) * 1000, NULL);
 END $$;
 
 -- ------------------------------------------------------- latency and recall
@@ -172,34 +172,41 @@ DO $$
 DECLARE
     k         int := current_setting('bench.k')::int;
     ef        int;
+    efs       int[] := ARRAY[1, 16, 32, 64, 128, 256];
     q         record;
     started   timestamptz;
     found     int[];
+    warm      int;
 BEGIN
-    -- ef_search = 1 is not a useful operating point; it is the control. The
-    -- search does almost nothing there, so whatever latency remains is the
-    -- fixed per-scan cost, and the difference against ef = 256 is what the
-    -- search itself costs. Without it, "deserialization dominates" would be an
-    -- inference from flat latency rather than a measurement.
-    FOREACH ef IN ARRAY ARRAY[1, 16, 32, 64, 128, 256] LOOP
-        PERFORM set_config('brindle.ef_search', ef::text, false);
+    -- Warm first, and with a real query: the plan guard above uses EXPLAIN
+    -- without ANALYZE, which never executes anything. Without this the first
+    -- timed scan of the run pays for a cold buffer cache and lands entirely in
+    -- whichever ef point happens to be measured first.
+    PERFORM set_config('brindle.ef_search', '64', false);
+    FOR q IN SELECT id, embedding FROM bench_queries ORDER BY id LIMIT 5 LOOP
+        SELECT count(*) INTO warm
+        FROM (SELECT id FROM bench_vectors ORDER BY embedding <-> q.embedding LIMIT k) s;
+    END LOOP;
 
-        FOR q IN SELECT id, embedding FROM bench_queries ORDER BY id LOOP
-            -- Timed region is the index scan alone: the exact side is already
-            -- computed, and nothing else runs between the two clock reads.
+    -- Query outer, ef inner. Sweeping ef in blocks would hand the first block a
+    -- colder cache than the last, and the difference between two ef points is
+    -- the whole measurement below — interleaving makes every point share cache
+    -- state, so a per-query pair is a fair comparison.
+    FOR q IN SELECT id, embedding FROM bench_queries ORDER BY id LOOP
+        FOREACH ef IN ARRAY efs LOOP
+            PERFORM set_config('brindle.ef_search', ef::text, false);
+
             started := clock_timestamp();
             SELECT array_agg(id) INTO found
             FROM (SELECT id FROM bench_vectors
                   ORDER BY embedding <-> q.embedding
                   LIMIT k) s;
             INSERT INTO bench_timings
-            VALUES ('query', ef,
-                    extract(epoch FROM clock_timestamp() - started) * 1000);
+            VALUES ('query', ef, extract(epoch FROM clock_timestamp() - started) * 1000,
+                    q.id);
 
-            -- Recall only where the budget can actually serve k rows. At
-            -- ef_search < k the scan returns at most ef_search rows, so any
-            -- "recall" there measures that ceiling, not the graph — the exact
-            -- artifact this sweep exists to avoid plotting.
+            -- Recall only where the budget can serve k rows. Below that the scan
+            -- returns fewer than k, so any "recall" measures the ceiling.
             IF ef >= k THEN
                 INSERT INTO bench_recall
                 SELECT ef, q.id,
@@ -220,9 +227,8 @@ FROM bench_timings WHERE phase = 'build';
 
 \echo ''
 \echo '=== query latency and recall by ef_search ==='
--- Aggregated separately and then joined: a join on ef alone would pair every
--- timing with every recall row, and a percentile over a cartesian product is a
--- number nobody can explain later.
+-- LEFT JOIN, not JOIN: ef_search = 1 is a latency control with deliberately no
+-- recall figure, and it must still appear in the timing column.
 WITH latency AS (
     SELECT ef,
            percentile_cont(0.5) WITHIN GROUP (ORDER BY elapsed_ms) AS p50,
@@ -231,8 +237,6 @@ WITH latency AS (
 ), quality AS (
     SELECT ef, avg(hits)::numeric / :k AS recall FROM bench_recall GROUP BY ef
 )
--- LEFT JOIN, not JOIN: ef_search = 1 is a latency control with deliberately no
--- recall figure, and it must still appear in the timing column.
 SELECT l.ef AS ef_search,
        round(l.p50::numeric, 2) AS p50_ms,
        round(l.p95::numeric, 2) AS p95_ms,
@@ -240,6 +244,28 @@ SELECT l.ef AS ef_search,
             ELSE round(q.recall, 3)::text END AS recall_at_k
 FROM latency l LEFT JOIN quality q USING (ef)
 ORDER BY l.ef;
+
+\echo ''
+\echo '=== what the search itself costs (paired against ef_search = 1) ==='
+-- Comparing p50 columns across ef points cannot see a sub-millisecond signal:
+-- run-to-run drift here is larger than the difference being measured. Pairing
+-- each query against its own ef = 1 timing cancels the per-scan fixed cost —
+-- graph deserialization, planning, the heap fetch — and leaves only the extra
+-- search work, which is what the storage claim rests on.
+WITH paired AS (
+    SELECT t.ef,
+           t.elapsed_ms - base.elapsed_ms AS delta_ms
+    FROM bench_timings t
+    JOIN bench_timings base
+      ON base.query_id = t.query_id AND base.ef = 1 AND base.phase = 'query'
+    WHERE t.phase = 'query' AND t.ef > 1
+)
+SELECT ef AS ef_search,
+       round(percentile_cont(0.5) WITHIN GROUP (ORDER BY delta_ms)::numeric, 3)
+           AS median_extra_ms,
+       round(percentile_cont(0.95) WITHIN GROUP (ORDER BY delta_ms)::numeric, 3)
+           AS p95_extra_ms
+FROM paired GROUP BY ef ORDER BY ef;
 
 \echo ''
 \echo '=== distance concentration (how hard this fixture is) ==='
