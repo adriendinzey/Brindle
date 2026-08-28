@@ -44,7 +44,7 @@ END $$;
 
 VACUUM ANALYZE pgv_vectors;
 
-CREATE TABLE pgv_timings (phase text, ef int, elapsed_ms double precision);
+CREATE TABLE pgv_timings (phase text, ef int, elapsed_ms double precision, query_id int);
 CREATE TABLE pgv_recall (ef int, query_id int, hits int);
 
 -- Matched to brindle's defaults: m = 16, ef_construction = 64.
@@ -64,7 +64,7 @@ BEGIN
     CREATE INDEX pgv_idx_serial ON pgv_vectors USING hnsw (embedding vector_l2_ops)
         WITH (m = 16, ef_construction = 64);
     INSERT INTO pgv_timings
-    VALUES ('build_serial', NULL, extract(epoch FROM clock_timestamp() - started) * 1000);
+    VALUES ('build_serial', NULL, extract(epoch FROM clock_timestamp() - started) * 1000, NULL);
 END $$;
 
 DROP INDEX pgv_idx_serial;
@@ -76,7 +76,7 @@ BEGIN
     CREATE INDEX pgv_idx ON pgv_vectors USING hnsw (embedding vector_l2_ops)
         WITH (m = 16, ef_construction = 64);
     INSERT INTO pgv_timings
-    VALUES ('build', NULL, extract(epoch FROM clock_timestamp() - started) * 1000);
+    VALUES ('build', NULL, extract(epoch FROM clock_timestamp() - started) * 1000, NULL);
 END $$;
 
 -- The measured query must actually use pgvector's index, for the same reason
@@ -100,29 +100,51 @@ END $$;
 DO $$
 DECLARE
     k       int := current_setting('bench.k')::int;
+    efs     int[] := ARRAY[16, 32, 64, 128, 256];
     ef      int;
     q       record;
     started timestamptz;
     found   int[];
+    warm    int;
 BEGIN
-    FOREACH ef IN ARRAY ARRAY[16, 32, 64, 128, 256] LOOP
-        PERFORM set_config('hnsw.ef_search', ef::text, false);
+    -- Warmed and interleaved for the same reasons index_baseline.sql is, and it
+    -- has to be: a comparison whose two sides are measured under different
+    -- protocols compares the protocols as much as the implementations. The plan
+    -- guard above uses EXPLAIN without ANALYZE and executes nothing, and
+    -- sweeping ef in blocks would hand the first block a cold cache — which is
+    -- the lowest ef point, so it would land as an apparent cost of the *widest*
+    -- searches being cheap by comparison.
+    PERFORM set_config('hnsw.ef_search', '64', false);
+    FOR q IN SELECT id, embedding::text::vector AS embedding
+             FROM bench_queries ORDER BY id LIMIT 5 LOOP
+        SELECT count(*) INTO warm
+        FROM (SELECT id FROM pgv_vectors ORDER BY embedding <-> q.embedding LIMIT k) s;
+    END LOOP;
 
-        FOR q IN SELECT id, embedding::text::vector AS embedding
-                 FROM bench_queries ORDER BY id LOOP
+    FOR q IN SELECT id, embedding::text::vector AS embedding
+             FROM bench_queries ORDER BY id LOOP
+        FOREACH ef IN ARRAY efs LOOP
+            PERFORM set_config('hnsw.ef_search', ef::text, false);
+
             started := clock_timestamp();
             SELECT array_agg(id) INTO found
             FROM (SELECT id FROM pgv_vectors
                   ORDER BY embedding <-> q.embedding
                   LIMIT k) s;
             INSERT INTO pgv_timings
-            VALUES ('query', ef, extract(epoch FROM clock_timestamp() - started) * 1000);
+            VALUES ('query', ef, extract(epoch FROM clock_timestamp() - started) * 1000, q.id);
 
-            -- Against the same ground truth brindle was scored on.
-            INSERT INTO pgv_recall
-            SELECT ef, q.id,
-                   (SELECT count(*) FROM unnest(found) f WHERE f = ANY (t.ids))
-            FROM bench_truth t WHERE t.query_id = q.id;
+            -- Against the same ground truth brindle was scored on, and under the
+            -- same rule: a sweep point below k measures the budget ceiling
+            -- rather than the graph, so it reports timing only. pgvector does
+            -- not truncate the way brindle does, but scoring the two sides by
+            -- different rules is how a comparison stops being one.
+            IF ef >= k THEN
+                INSERT INTO pgv_recall
+                SELECT ef, q.id,
+                       (SELECT count(*) FROM unnest(found) f WHERE f = ANY (t.ids))
+                FROM bench_truth t WHERE t.query_id = q.id;
+            END IF;
         END LOOP;
     END LOOP;
 END $$;
@@ -147,8 +169,9 @@ WITH latency AS (
 SELECT l.ef AS ef_search,
        round(l.p50::numeric, 2) AS p50_ms,
        round(l.p95::numeric, 2) AS p95_ms,
-       round(q.recall, 3) AS recall_at_k
-FROM latency l JOIN quality q USING (ef)
+       CASE WHEN q.recall IS NULL THEN '— (below k)'
+            ELSE round(q.recall, 3)::text END AS recall_at_k
+FROM latency l LEFT JOIN quality q USING (ef)
 ORDER BY l.ef;
 
 \echo ''

@@ -66,12 +66,13 @@ if [[ -z "$pg_config" ]]; then
 fi
 bindir="$("$pg_config" --bindir)"
 # pgrx derives the running port from base_port in PGRX_HOME/config.toml, and
-# exposes no command to print it — read it the same way pgrx does.
-port="$(awk -v major="$PG" '/^base_port/ { print $3 + major }' "$PGRX_HOME/config.toml")"
-if [[ -z "$port" ]]; then
-  echo "error: could not read base_port from $PGRX_HOME/config.toml" >&2
-  exit 1
-fi
+# exposes no command to print it — read it the same way pgrx does. A stock
+# config.toml has no base_port key at all (only [configs]); pgrx falls back to
+# 28800 there, and so must this, or the script dies outside a task worktree —
+# exactly the case the PGRX_HOME default above exists to support. `|| true`
+# keeps a missing file from tripping `set -e` before the check below.
+base_port="$(awk '/^base_port/ { print $3 }' "$PGRX_HOME/config.toml" 2>/dev/null || true)"
+port=$(( ${base_port:-28800} + PG ))
 
 echo "==> installing the extension into pg$PG"
 cargo pgrx install --release --pg-config "$pg_config" >/dev/null
