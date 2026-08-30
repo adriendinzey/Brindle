@@ -48,7 +48,7 @@ this file should ever gate a merge.
 
 | | |
 |---|---|
-| Commit | `65660ed` |
+| Commit | `65660ed` for the measurements; later commits on this branch changed the decoder's validation and the harness, not the measured path |
 | Machine | Intel i7-9700K @ 3.6 GHz, 8 cores, 15 GB RAM, WSL2 (kernel 6.18) |
 | PostgreSQL | 17.10, pgrx-managed, default `postgresql.conf` |
 | Build | `cargo build --release`, no `target-cpu` flag (baseline x86-64) |
@@ -120,21 +120,31 @@ The first version of this file measured 82–83 ms per clustered query. The grap
 was then stored as one `Vec` per node's vector plus one per node per layer of
 neighbors — roughly 400 000 allocations rebuilt on every scan, because a scan
 decodes the whole graph before it can walk it. Storing it flat (one buffer
-strided by `dim`, neighbor lists in fixed-width slots) cut the decode from
-56–60 ms to 25.9 ms.
+strided by `dim`, neighbor lists in fixed-width slots) is where the latency win
+comes from. A second change stopped assembling the whole 80 MB blob before
+decoding it, and decodes straight from the index pages instead.
 
-Flat storage alone made the **tail worse**, not better: p95 went to 125–181 ms
-against the original 87–91 ms. Two large contiguous arrays per scan, on top of
-the 80 MB buffer the pages were still being copied into, is a lot of large
-allocation per query, and large allocations are erratic in a way a median hides.
-Decoding straight from the pages removes that buffer, and with it the
-regression — p95 is now 68–80 ms, better than where it started.
+**Recall did not move by a digit through either change**, which is the point: the
+graph is identical, only its representation and its route into memory changed.
 
-Both changes are visible above and neither moved recall by a digit, which is the
-point: the graph is identical, only its representation and its route into memory
-changed. **The remaining ~62 ms is still the whole index being read and decoded
-per scan**, so the conclusion the first baseline drew is unchanged — it is just
-62 ms of evidence for paged storage now instead of 82.
+An earlier draft of this section claimed the flat layout *alone* made the tail
+nearly twice as bad and that the page-streaming change repaired it. **That does
+not reproduce** — repeated runs of the intermediate commit put its p95 in line
+with the finished branch, and the single measurement behind the claim was an
+outlier this file had no business publishing under its own rule about single
+runs. What the streaming change is worth is not latency: it removes an 80 MB
+allocation from every scan, which is peak backend memory rather than wall clock,
+and it is the page-at-a-time shape paged storage needs.
+
+Absolute latency on this machine also moves several percent between sessions —
+the same `main` commit measured 82–83 ms here and 92–93 ms in an independent
+reviewer's run — so compare figures within a run set, never across them.
+
+**The remaining ~62 ms is still the whole index being read and decoded per
+scan**, so the conclusion the first baseline drew is unchanged. It is 62 ms of
+evidence for paged storage now instead of 82. How that splits between reading
+10 000 pages through the buffer manager and this file's own decode has not been
+measured, and should be before anyone sizes the work to remove it.
 
 ## What the search itself costs
 
@@ -245,7 +255,7 @@ decimals across every run of this benchmark. pgvector's build is randomised,
 and its recall moves between builds. Across the eleven clustered builds run
 during this work:
 
-| `ef_search` | Brindle (every run) | pgvector (observed across 9 builds) |
+| `ef_search` | Brindle (every run) | pgvector (observed across 11 builds) |
 |---|---|---|
 | 16 | 0.814 | 0.797 – 0.834 |
 | 32 | 0.932 | 0.922 – 0.954 |
@@ -301,7 +311,7 @@ Recorded because a comparison whose asymmetries are hidden is worse than none.
   setting entirely and allocates in backend memory — a defect on Brindle's side,
   not an advantage.
 - **Harness overhead.** The plpgsql timing loop has a floor of about 0.016 ms,
-  measured separately from the two runs above. That is 0.02% of Brindle's 82 ms
+  measured separately from the two runs above. That is 0.03% of Brindle's 62 ms
   but roughly 3% of pgvector's 0.57 ms, so the latency ratios above are if
   anything conservative. (It cancels entirely from
   the paired search-cost table, which is one more reason to prefer it.)

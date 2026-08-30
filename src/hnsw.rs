@@ -93,6 +93,25 @@ impl HnswParams {
     /// γ ≈ 1000, so 1024 covers the documented use cases while keeping the
     /// γ-scaled degree caps (and the allocations sized from them) bounded.
     pub const MAX_GAMMA: f32 = 1024.0;
+
+    /// Largest `m` a graph may declare. Matches the ceiling enforced when an
+    /// index is created, so no index that exists can fail to decode.
+    pub const MAX_M: usize = 128;
+
+    /// Ceiling on the layer-0 degree cap `2·m·γ`.
+    ///
+    /// `m` and `γ` are each bounded, but it is their *product* that sizes link
+    /// storage, and on the decode path both arrive inside the payload. Fixed
+    /// stride means a node reserves its full cap whether or not it uses it, so
+    /// this is the number that turns a small blob into a large allocation. The
+    /// same ceiling is enforced when an index is created.
+    pub const MAX_LAYER0_DEGREE: usize = 2048;
+
+    /// Ceiling on a graph's top layer. Levels are drawn geometrically, so even
+    /// at the smallest permitted `m` the chance of reaching this is ~2⁻⁶⁴: a
+    /// payload claiming more is corrupt, and each extra layer a node claims
+    /// reserves another stride of link slots.
+    pub const MAX_LAYER: usize = 64;
 }
 
 impl Default for HnswParams {
@@ -1191,7 +1210,13 @@ impl Hnsw {
             Metric::from_code(r.u8()?).ok_or(HnswDecodeError::Invalid("unknown metric code"))?;
         let _reserved = r.u8()?;
         let m = r.read_len()?;
-        if m < 2 {
+        // Bounded on both sides. The upper bound is not cosmetic: `m` and
+        // `gamma` below size the link storage, and that is the one allocation
+        // here the payload's own length does not constrain. A Rust allocation
+        // that fails aborts the process instead of raising an error a session
+        // can catch, so an unbounded one turns a corrupt index into a crash of
+        // every backend.
+        if !(2..=HnswParams::MAX_M).contains(&m) {
             return Err(HnswDecodeError::Invalid("m out of range"));
         }
         let gamma = f32::from_bits(r.u32()?);
@@ -1201,12 +1226,18 @@ impl Hnsw {
         // Same derivation `new()` uses, so a decoded graph's degree caps and ef
         // floor match a freshly built one's.
         let (_, m_cap, m0_cap, ml, ef_floor) = Self::derived_params(m, gamma);
+        if m0_cap > HnswParams::MAX_LAYER0_DEGREE {
+            return Err(HnswDecodeError::Invalid("degree cap out of range"));
+        }
         let ef_construction = r.read_len()?;
         if ef_construction < ef_floor {
             return Err(HnswDecodeError::Invalid("ef_construction below floor"));
         }
         let dim = r.read_len()?;
         let max_layer = r.read_len()?;
+        if max_layer > HnswParams::MAX_LAYER {
+            return Err(HnswDecodeError::Invalid("top layer out of range"));
+        }
         let seed = r.u64()?;
         let rng = r.u64()?;
         // Encoded graphs come from `new()`, which never produces a zero seed
@@ -1553,6 +1584,52 @@ mod tests {
             assert_eq!(piecewise.vectors, whole.vectors, "chunk size {chunk}");
             assert_eq!(piecewise.entry_point, whole.entry_point);
             assert_eq!(src.remaining(), 0, "chunk size {chunk} left bytes unread");
+        }
+    }
+
+    /// Header for a blob that is well-formed up to the fields under test, so a
+    /// case fails on the bound it targets rather than on framing.
+    fn header(m: u64, gamma: f32, max_layer: u64, n: u64) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(&CODEC_MAGIC.to_le_bytes());
+        b.extend_from_slice(&CODEC_VERSION.to_le_bytes());
+        b.push(Metric::L2.code());
+        b.push(0);
+        b.extend_from_slice(&m.to_le_bytes());
+        b.extend_from_slice(&gamma.to_bits().to_le_bytes());
+        b.extend_from_slice(&64u64.to_le_bytes()); // ef_construction
+        b.extend_from_slice(&2u64.to_le_bytes()); // dim
+        b.extend_from_slice(&max_layer.to_le_bytes());
+        b.extend_from_slice(&1u64.to_le_bytes()); // seed
+        b.extend_from_slice(&1u64.to_le_bytes()); // rng
+        b.extend_from_slice(&0u64.to_le_bytes()); // entry point
+        b.extend_from_slice(&n.to_le_bytes());
+        b
+    }
+
+    #[test]
+    fn rejects_headers_that_would_size_a_huge_allocation() {
+        // Link storage is sized from `m` and `gamma`, which arrive in the blob,
+        // and fixed stride reserves a node's whole cap whether or not it uses
+        // it — so these fields, unlike the rest, are not bounded by how many
+        // bytes the payload actually supplies. A Rust allocation that fails
+        // aborts the process rather than raising a catchable error, which for
+        // an extension means every backend dies and the server enters crash
+        // recovery. A handful of bytes must not be able to ask for terabytes.
+        for (label, blob) in [
+            ("m beyond the ceiling", header(1 << 40, 1024.0, 0, 1)),
+            (
+                "m times gamma beyond the degree cap",
+                header(128, 1024.0, 0, 1),
+            ),
+            ("top layer beyond the ceiling", header(16, 1.0, 1 << 40, 1)),
+        ] {
+            let err = Hnsw::from_bytes(&blob)
+                .expect_err(&format!("{label}: should be rejected, not decoded"));
+            assert!(
+                matches!(err, HnswDecodeError::Invalid(_)),
+                "{label}: expected a validation error, got {err:?}"
+            );
         }
     }
 

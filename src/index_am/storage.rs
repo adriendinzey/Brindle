@@ -256,8 +256,9 @@ pub unsafe fn write_index_blob(
 /// flips a byte the encoding already carries — so the tail-clearing pass below
 /// exists for the compaction that will reclaim tombstoned nodes. Leftover pages
 /// are re-initialized empty rather than truncated away: shrinking a relation
-/// needs a lock this path doesn't hold, and [`read_index_blob`] concatenates
-/// only each page's used bytes, so an empty tail page contributes nothing.
+/// needs a lock this path doesn't hold, and the read path consumes only each
+/// page's used bytes and stops at the length the metapage declares, so an empty
+/// tail page contributes nothing.
 ///
 /// # Safety
 /// `index` must be an open index relation this backend may write, and the
