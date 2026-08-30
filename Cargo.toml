@@ -50,6 +50,10 @@ criterion = { version = "0.5", default-features = false, features = [
 name = "distance"
 harness = false
 
+[[bench]]
+name = "graph_decode"
+harness = false
+
 [profile.dev]
 panic = "unwind"
 

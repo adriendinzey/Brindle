@@ -208,13 +208,33 @@ pub struct Hnsw {
     ml: f64,
     dim: usize,
     seed: u64,
-    // Invariant: `vectors`, `links`, and `deleted` are parallel arrays indexed by
-    // node id, and nodes are never removed (delete only tombstones), so every id
-    // stored in `links` or `entry_point` remains a valid index for all three.
-    // This is what makes the raw `[id]` indexing on the search/insert paths
-    // panic-free.
-    vectors: Vec<Vec<f32>>,
-    links: Vec<Vec<Vec<usize>>>,
+    /// Node count. Kept explicitly because `vectors` is now flat, so its length
+    /// no longer identifies the node count when `dim` is 0.
+    n: usize,
+    // Invariant: node ids index `vectors`, `layer_base`, `attrs` and `deleted` in
+    // parallel, and nodes are never removed (delete only tombstones), so every id
+    // stored in `links` or `entry_point` stays valid for all of them. This is what
+    // makes the raw indexing on the search/insert paths panic-free.
+    //
+    // Storage is flat: `vectors` holds every node's components end to end, strided
+    // by `dim`, and neighbor lists live in fixed-width slots rather than in a
+    // `Vec` per node per layer. Rebuilding a nested shape cost one allocation per
+    // node per layer on every load, which dominated the decode.
+    vectors: Vec<f32>,
+    /// Prefix sum of per-node layer counts, `n + 1` entries: node `id` owns
+    /// layers `layer_base[id] .. layer_base[id + 1]`. Both a node's layer count
+    /// and its slot offset derive from this, so neither needs its own array.
+    layer_base: Vec<u32>,
+    /// Live neighbor count per (node, layer), indexed by `layer_base[id] + layer`.
+    link_counts: Vec<u32>,
+    /// Neighbor ids in fixed-width slots. A layer's width is its degree cap plus
+    /// one: `insert` appends before pruning, so a list is transiently one over.
+    ///
+    /// Slots past a layer's live count hold **unspecified** bytes — pruning
+    /// shortens a list without clearing what it left behind, and a decoded graph
+    /// zero-fills instead. Only `neighbors` defines the graph's value; comparing
+    /// this array raw would see differences that carry no meaning.
+    links: Vec<u32>,
     /// Filterable attribute rows parallel to `vectors`, keyed by node id and set
     /// at insert time. Empty for nodes inserted without attributes; consulted by
     /// predicate-aware traversal, never by graph construction.
@@ -288,7 +308,10 @@ impl Hnsw {
             ml,
             dim: 0,
             seed,
+            n: 0,
             vectors: Vec::new(),
+            layer_base: vec![0],
+            link_counts: Vec::new(),
             links: Vec::new(),
             attrs: Vec::new(),
             deleted: Vec::new(),
@@ -299,11 +322,11 @@ impl Hnsw {
     }
 
     pub fn len(&self) -> usize {
-        self.vectors.len()
+        self.n
     }
 
     pub fn is_empty(&self) -> bool {
-        self.vectors.is_empty()
+        self.n == 0
     }
 
     pub fn dim(&self) -> usize {
@@ -349,12 +372,88 @@ impl Hnsw {
         }
     }
 
+    /// Width of one neighbor slot run. One over the degree cap, because `insert`
+    /// appends a neighbor and only then prunes back to the cap.
     #[inline]
-    fn neighbors(&self, id: usize, layer: usize) -> &[usize] {
-        self.links[id]
-            .get(layer)
-            .map(|v| v.as_slice())
-            .unwrap_or(&[])
+    fn slot_width(&self, layer: usize) -> usize {
+        self.max_degree(layer) + 1
+    }
+
+    /// Layers node `id` participates in.
+    #[inline]
+    fn levels(&self, id: usize) -> usize {
+        (self.layer_base[id + 1] - self.layer_base[id]) as usize
+    }
+
+    /// Start of node `id`'s slot run in `links`. Every earlier node contributed
+    /// one layer-0 run plus one upper-layer run per level above 0, and
+    /// `layer_base[id] - id` is exactly that count of upper layers.
+    #[inline]
+    fn link_base(&self, id: usize) -> usize {
+        let upper = self.layer_base[id] as usize - id;
+        id * self.slot_width(0) + upper * self.slot_width(1)
+    }
+
+    /// Start of node `id`'s slots for `layer`.
+    #[inline]
+    fn layer_slot(&self, id: usize, layer: usize) -> usize {
+        let within = if layer == 0 {
+            0
+        } else {
+            self.slot_width(0) + (layer - 1) * self.slot_width(1)
+        };
+        self.link_base(id) + within
+    }
+
+    #[inline]
+    fn vector(&self, id: usize) -> &[f32] {
+        let start = id * self.dim;
+        &self.vectors[start..start + self.dim]
+    }
+
+    #[inline]
+    fn neighbors(&self, id: usize, layer: usize) -> &[u32] {
+        if id >= self.n || layer >= self.levels(id) {
+            return &[];
+        }
+        let start = self.layer_slot(id, layer);
+        let count = self.link_counts[self.layer_base[id] as usize + layer] as usize;
+        &self.links[start..start + count]
+    }
+
+    /// Replace node `id`'s neighbor list at `layer`. `ids` must fit the slot
+    /// width, which holds because callers pass a list the degree cap bounded.
+    fn set_neighbors(&mut self, id: usize, layer: usize, ids: &[u32]) {
+        let start = self.layer_slot(id, layer);
+        self.links[start..start + ids.len()].copy_from_slice(ids);
+        self.link_counts[self.layer_base[id] as usize + layer] = ids.len() as u32;
+    }
+
+    /// Append one neighbor to node `id`'s list at `layer`, returning the new
+    /// length. The slot run is one wider than the degree cap, so an append onto
+    /// a full list still fits and the caller prunes immediately after.
+    fn push_neighbor(&mut self, id: usize, layer: usize, neighbor: u32) -> usize {
+        let idx = self.layer_base[id] as usize + layer;
+        let count = self.link_counts[idx] as usize;
+        let start = self.layer_slot(id, layer);
+        self.links[start + count] = neighbor;
+        self.link_counts[idx] = (count + 1) as u32;
+        count + 1
+    }
+
+    /// Append a node's storage across the flat arrays and return its id.
+    fn push_node(&mut self, vector: &[f32], attrs: Vec<AttrValue>, levels: usize) -> usize {
+        let id = self.n;
+        self.vectors.extend_from_slice(vector);
+        self.attrs.push(attrs);
+        self.deleted.push(false);
+        let end = self.layer_base[id] + levels as u32;
+        self.layer_base.push(end);
+        self.link_counts.resize(self.link_counts.len() + levels, 0);
+        let slots = self.slot_width(0) + (levels - 1) * self.slot_width(1);
+        self.links.resize(self.links.len() + slots, 0);
+        self.n += 1;
+        id
     }
 
     fn random_level(&mut self) -> usize {
@@ -402,7 +501,7 @@ impl Hnsw {
         if !beam.visited.insert(id) {
             return Ok(false);
         }
-        let d = self.metric.distance(query, &self.vectors[id])?;
+        let d = self.metric.distance(query, self.vector(id))?;
         if beam.results.len() < beam.ef || d < beam.farthest() {
             beam.push(Cand { dist: d, id }, self.admissible(id, predicate));
             return Ok(true);
@@ -450,7 +549,7 @@ impl Hnsw {
         let neighbors = self.neighbors(id, layer);
         if !Self::is_filtered(predicate) {
             for &n in neighbors {
-                self.visit(query, n, predicate, beam)?;
+                self.visit(query, n as usize, predicate, beam)?;
             }
             return Ok(());
         }
@@ -466,6 +565,7 @@ impl Hnsw {
         bridges.clear();
         let mut matching = 0usize;
         for &n in neighbors {
+            let n = n as usize;
             if self.node_matches(n, predicate) {
                 matching += 1;
                 self.visit(query, n, predicate, beam)?;
@@ -482,6 +582,7 @@ impl Hnsw {
                 if matching >= target {
                     break;
                 }
+                let nn = nn as usize;
                 if self.node_matches(nn, predicate) {
                     matching += 1;
                     self.visit(query, nn, predicate, beam)?;
@@ -503,7 +604,7 @@ impl Hnsw {
                 if beam.detours == 0 {
                     break;
                 }
-                if self.visit(query, n, predicate, beam)? {
+                if self.visit(query, n as usize, predicate, beam)? {
                     beam.detours -= 1;
                 }
             }
@@ -533,7 +634,7 @@ impl Hnsw {
 
         for &ep in entry_points {
             if beam.visited.insert(ep) {
-                let d = self.metric.distance(query, &self.vectors[ep])?;
+                let d = self.metric.distance(query, self.vector(ep))?;
                 // A seed routes even when tombstoned or non-matching: it may be
                 // the only way into the region that does match.
                 beam.push(Cand { dist: d, id: ep }, self.admissible(ep, predicate));
@@ -574,9 +675,7 @@ impl Hnsw {
             }
             let mut keep = true;
             for &r in &selected {
-                let d = self
-                    .metric
-                    .distance(&self.vectors[cand.id], &self.vectors[r])?;
+                let d = self.metric.distance(self.vector(cand.id), self.vector(r))?;
                 if d < cand.dist {
                     keep = false;
                     break;
@@ -629,15 +728,8 @@ impl Hnsw {
             });
         }
 
-        let id = self.vectors.len();
         let level = self.random_level();
-
-        self.vectors.push(vector);
-        self.attrs.push(attrs);
-        self.deleted.push(false);
-        let mut node_links: Vec<Vec<usize>> = Vec::with_capacity(level + 1);
-        node_links.resize_with(level + 1, Vec::new);
-        self.links.push(node_links);
+        let id = self.push_node(&vector, attrs, level + 1);
 
         let entry = match self.entry_point {
             None => {
@@ -648,7 +740,7 @@ impl Hnsw {
             Some(e) => e,
         };
 
-        let query = self.vectors[id].clone();
+        let query = self.vector(id).to_vec();
         let max_layer = self.max_layer;
         let mut ep_ids = vec![entry];
 
@@ -669,17 +761,24 @@ impl Hnsw {
             let max_deg = self.max_degree(lc);
             let selected = self.select_neighbors_heuristic(&w, max_deg)?;
 
-            self.links[id][lc] = selected.clone();
+            let chosen: Vec<u32> = selected.iter().map(|&n| n as u32).collect();
+            self.set_neighbors(id, lc, &chosen);
             for &n in &selected {
-                self.links[n][lc].push(id);
-                if self.links[n][lc].len() > max_deg {
-                    let nbase = self.vectors[n].clone();
-                    let mut cands = Vec::with_capacity(self.links[n][lc].len());
-                    for &nn in &self.links[n][lc] {
-                        let d = self.metric.distance(&nbase, &self.vectors[nn])?;
+                // Append then prune, which is why a slot run is one wider than
+                // the cap: the pruned set is chosen from the same candidates the
+                // nested layout considered, so the resulting graph is identical.
+                let len = self.push_neighbor(n, lc, id as u32);
+                if len > max_deg {
+                    let nbase = self.vector(n).to_vec();
+                    let mut cands = Vec::with_capacity(len);
+                    for &nn in self.neighbors(n, lc) {
+                        let nn = nn as usize;
+                        let d = self.metric.distance(&nbase, self.vector(nn))?;
                         cands.push(Cand { dist: d, id: nn });
                     }
-                    self.links[n][lc] = self.select_neighbors_heuristic(&cands, max_deg)?;
+                    let kept = self.select_neighbors_heuristic(&cands, max_deg)?;
+                    let kept: Vec<u32> = kept.into_iter().map(|x| x as u32).collect();
+                    self.set_neighbors(n, lc, &kept);
                 }
             }
 
@@ -779,13 +878,13 @@ impl Hnsw {
                 got: query.len(),
             });
         }
-        let mut all: Vec<Cand> = Vec::with_capacity(self.vectors.len());
-        for (id, v) in self.vectors.iter().enumerate() {
+        let mut all: Vec<Cand> = Vec::with_capacity(self.n);
+        for id in 0..self.n {
             if self.deleted[id] {
                 continue;
             }
             all.push(Cand {
-                dist: self.metric.distance(query, v)?,
+                dist: self.metric.distance(query, self.vector(id))?,
                 id,
             });
         }
@@ -824,7 +923,7 @@ impl Hnsw {
         let mut live: Vec<(Vec<f32>, Vec<AttrValue>)> = Vec::with_capacity(self.live_len());
         for (id, &deleted) in self.deleted.iter().enumerate() {
             if !deleted {
-                live.push((self.vectors[id].clone(), self.attrs[id].clone()));
+                live.push((self.vector(id).to_vec(), self.attrs[id].clone()));
             }
         }
         let mut fresh = Hnsw::new(HnswParams {
@@ -954,12 +1053,12 @@ impl Hnsw {
     pub fn serialized_len_hint(&self) -> usize {
         // Header, then per node: tombstone flag, level count, vector, attribute
         // count, each layer's own count, and the ids and values themselves.
-        let mut total = 76 + self.vectors.len() * (17 + self.dim * 4);
-        for (layers, row) in self.links.iter().zip(&self.attrs) {
-            for layer in layers {
-                total += 8 + layer.len() * 8;
+        let mut total = 76 + self.n * (17 + self.dim * 4);
+        for id in 0..self.n {
+            for layer in 0..self.levels(id) {
+                total += 8 + self.neighbors(id, layer).len() * 8;
             }
-            total += row.len() * 9;
+            total += self.attrs[id].len() * 9;
         }
         total
     }
@@ -991,16 +1090,17 @@ impl Hnsw {
         out.extend_from_slice(&self.rng.to_le_bytes());
         let entry = self.entry_point.map_or(u64::MAX, |e| e as u64);
         out.extend_from_slice(&entry.to_le_bytes());
-        out.extend_from_slice(&(self.vectors.len() as u64).to_le_bytes());
-        for id in 0..self.vectors.len() {
+        out.extend_from_slice(&(self.n as u64).to_le_bytes());
+        for id in 0..self.n {
             out.push(u8::from(self.deleted[id]));
-            out.extend_from_slice(&(self.links[id].len() as u64).to_le_bytes());
-            for x in &self.vectors[id] {
+            out.extend_from_slice(&(self.levels(id) as u64).to_le_bytes());
+            for x in self.vector(id) {
                 out.extend_from_slice(&x.to_le_bytes());
             }
-            for layer in &self.links[id] {
-                out.extend_from_slice(&(layer.len() as u64).to_le_bytes());
-                for &neighbor in layer {
+            for layer in 0..self.levels(id) {
+                let ids = self.neighbors(id, layer);
+                out.extend_from_slice(&(ids.len() as u64).to_le_bytes());
+                for &neighbor in ids {
                     out.extend_from_slice(&(neighbor as u64).to_le_bytes());
                 }
             }
@@ -1094,8 +1194,16 @@ impl Hnsw {
         // because `vector_bytes` can be near `usize::MAX` on a crafted blob.
         let min_node_bytes = 25usize.saturating_add(vector_bytes);
         let plausible_n = n.min(r.remaining() / min_node_bytes);
-        let mut vectors: Vec<Vec<f32>> = Vec::with_capacity(plausible_n);
-        let mut links: Vec<Vec<Vec<usize>>> = Vec::with_capacity(plausible_n);
+        // Sized from `plausible_n` so the decode does not reallocate, and flat so
+        // it does not allocate per node at all. `links` is sized for the common
+        // case of a single layer; nodes above layer 0 grow it, which is rare.
+        let slot0 = m0_cap + 1;
+        let slot_up = m_cap + 1;
+        let mut vectors: Vec<f32> = Vec::with_capacity(plausible_n * dim);
+        let mut layer_base: Vec<u32> = Vec::with_capacity(plausible_n + 1);
+        layer_base.push(0);
+        let mut link_counts: Vec<u32> = Vec::with_capacity(plausible_n);
+        let mut links: Vec<u32> = Vec::with_capacity(plausible_n * slot0);
         let mut attrs: Vec<Vec<AttrValue>> = Vec::with_capacity(plausible_n);
         let mut deleted: Vec<bool> = Vec::with_capacity(plausible_n);
         for _ in 0..n {
@@ -1112,31 +1220,46 @@ impl Hnsw {
                 return Err(HnswDecodeError::Invalid("node above the top layer"));
             }
             let raw = r.take(vector_bytes)?;
-            let mut vector = Vec::with_capacity(dim);
-            for c in raw.as_chunks::<4>().0 {
-                vector.push(f32::from_le_bytes(*c));
-            }
-            vectors.push(vector);
+            vectors.extend(
+                raw.as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|c| f32::from_le_bytes(*c)),
+            );
             if levels > r.remaining() / 8 {
                 return Err(HnswDecodeError::Truncated);
             }
-            let mut node_links = Vec::with_capacity(levels);
-            for _ in 0..levels {
+            layer_base.push(
+                u32::try_from(link_counts.len() + levels)
+                    .map_err(|_| HnswDecodeError::Invalid("too many layers"))?,
+            );
+            let node_slots = slot0 + (levels - 1) * slot_up;
+            let node_start = links.len();
+            links.resize(node_start + node_slots, 0);
+            for layer in 0..levels {
                 let count = r.len()?;
+                let cap = if layer == 0 { m0_cap } else { m_cap };
+                if count > cap {
+                    return Err(HnswDecodeError::Invalid("neighbor list over degree cap"));
+                }
                 if count > r.remaining() / 8 {
                     return Err(HnswDecodeError::Truncated);
                 }
-                let mut layer = Vec::with_capacity(count);
-                for _ in 0..count {
+                let within = if layer == 0 {
+                    0
+                } else {
+                    slot0 + (layer - 1) * slot_up
+                };
+                let start = node_start + within;
+                for slot in 0..count {
                     let id = r.len()?;
                     if id >= n {
                         return Err(HnswDecodeError::Invalid("link target out of range"));
                     }
-                    layer.push(id);
+                    links[start + slot] = id as u32;
                 }
-                node_links.push(layer);
+                link_counts.push(count as u32);
             }
-            links.push(node_links);
 
             let attr_count = r.len()?;
             // Every value costs at least a tag byte, so a count exceeding what
@@ -1170,8 +1293,9 @@ impl Hnsw {
         // count, keeping search's top-down descent finite.
         match entry_point {
             Some(e) => {
-                // `len() - 1` cannot underflow: every node has ≥ 1 layer.
-                if links[e].len() - 1 != max_layer {
+                // `- 1` cannot underflow: every node has ≥ 1 layer.
+                let entry_levels = (layer_base[e + 1] - layer_base[e]) as usize;
+                if entry_levels - 1 != max_layer {
                     return Err(HnswDecodeError::Invalid(
                         "entry point does not own the top layer",
                     ));
@@ -1196,7 +1320,10 @@ impl Hnsw {
             ml,
             dim,
             seed,
+            n,
             vectors,
+            layer_base,
+            link_counts,
             links,
             attrs,
             deleted,
@@ -1249,9 +1376,11 @@ mod tests {
                 hash = hash.wrapping_mul(FNV_PRIME);
             }
         };
-        for layers in &h.links {
-            mix(layers.len() as u64);
-            for nbrs in layers {
+        for id in 0..h.len() {
+            let levels = h.levels(id);
+            mix(levels as u64);
+            for lc in 0..levels {
+                let nbrs = h.neighbors(id, lc);
                 mix(nbrs.len() as u64);
                 for &n in nbrs {
                     mix(n as u64);
@@ -1299,9 +1428,24 @@ mod tests {
         assert!(!h.is_empty());
     }
 
+    /// Live neighbor lists, which is what the graph's value *is*. The backing
+    /// slot array cannot be compared directly: its padding is unspecified, so a
+    /// raw comparison both fails on meaningless differences and could pass on a
+    /// wrong count that happened to leave matching bytes behind.
+    fn adjacency(h: &Hnsw) -> Vec<Vec<Vec<u32>>> {
+        (0..h.len())
+            .map(|id| {
+                (0..h.levels(id))
+                    .map(|lc| h.neighbors(id, lc).to_vec())
+                    .collect()
+            })
+            .collect()
+    }
+
     fn assert_degree_caps(h: &Hnsw) {
         for id in 0..h.len() {
-            for (lc, nbrs) in h.links[id].iter().enumerate() {
+            for lc in 0..h.levels(id) {
+                let nbrs = h.neighbors(id, lc);
                 assert!(
                     nbrs.len() <= h.max_degree(lc),
                     "node {id} layer {lc}: {} neighbors > cap {}",
@@ -1619,7 +1763,11 @@ mod tests {
         h.delete(17).unwrap();
         h.delete(42).unwrap();
         let restored = Hnsw::from_bytes(&h.to_bytes()).expect("decode");
-        assert_eq!(restored.links, h.links, "neighbor lists must round-trip");
+        assert_eq!(
+            adjacency(&restored),
+            adjacency(&h),
+            "neighbor lists must round-trip"
+        );
         assert_eq!(restored.entry_point, h.entry_point);
         assert_eq!(restored.vectors, h.vectors);
         assert_eq!(restored.deleted, h.deleted);
@@ -1651,7 +1799,7 @@ mod tests {
             (h.m_cap, h.m0_cap),
             "degree caps must survive the round-trip"
         );
-        assert_eq!(restored.links, h.links);
+        assert_eq!(adjacency(&restored), adjacency(&h));
     }
 
     #[test]
