@@ -48,7 +48,7 @@ this file should ever gate a merge.
 
 | | |
 |---|---|
-| Commit | `beaef9c` (the harness; later commits change only comments and prose, so a rerun prints a newer hash) |
+| Commit | `65660ed` |
 | Machine | Intel i7-9700K @ 3.6 GHz, 8 cores, 15 GB RAM, WSL2 (kernel 6.18) |
 | PostgreSQL | 17.10, pgrx-managed, default `postgresql.conf` |
 | Build | `cargo build --release`, no `target-cpu` flag (baseline x86-64) |
@@ -71,14 +71,14 @@ locally dense, globally separated.
 
 | `ef_search` | p50 | p95 | recall@10 |
 |---|---|---|---|
-| 1 (control) | 82.4 ms | 87.4 ms | — |
-| 16 | 82.3 ms | 91.2 ms | 0.814 |
-| 32 | 82.7 ms | 88.7 ms | 0.932 |
-| 64 | 82.8 ms | 88.4 ms | 0.966 |
-| 128 | 82.9 ms | 89.6 ms | 0.974 |
-| 256 | 82.7 ms | 89.1 ms | 0.974 |
+| 1 (control) | 62.5 ms | 74.7 ms | — |
+| 16 | 62.4 ms | 80.4 ms | 0.814 |
+| 32 | 62.8 ms | 73.8 ms | 0.932 |
+| 64 | 62.9 ms | 71.3 ms | 0.966 |
+| 128 | 62.9 ms | 68.3 ms | 0.974 |
+| 256 | 63.0 ms | 75.5 ms | 0.974 |
 
-Build: **112.5 s**, observed 112.5–116.3 s across runs on this machine — read
+Build: **113.1 s**, observed 112.5–116.3 s across runs on this machine — read
 it as "under two minutes", not to the tenth. Index: **77 MB** (heap: 56 MB).
 
 Recall reproduces to three decimals on every run — the build takes a fixed RNG
@@ -93,14 +93,14 @@ Every component independent and uniform.
 
 | `ef_search` | p50 | p95 | recall@10 |
 |---|---|---|---|
-| 1 (control) | 87.6 ms | 91.2 ms | — |
-| 16 | 88.0 ms | 92.1 ms | 0.146 |
-| 32 | 87.9 ms | 94.9 ms | 0.249 |
-| 64 | 88.3 ms | 92.5 ms | 0.375 |
-| 128 | 89.1 ms | 92.2 ms | 0.507 |
-| 256 | 90.4 ms | 94.8 ms | 0.663 |
+| 1 (control) | 64.2 ms | 71.4 ms | — |
+| 16 | 64.5 ms | 69.6 ms | 0.146 |
+| 32 | 64.4 ms | 81.4 ms | 0.249 |
+| 64 | 65.2 ms | 77.9 ms | 0.375 |
+| 128 | 65.6 ms | 73.9 ms | 0.507 |
+| 256 | 66.7 ms | 75.0 ms | 0.663 |
 
-Build: **252.3 s**. Index: **77 MB**.
+Build: **242.2 s**. Index: **77 MB**.
 
 Recall of 0.15 looks like a broken index. It isn't. In 128 uniform dimensions
 distances concentrate: the benchmark measures it directly, and the 1000th
@@ -113,6 +113,28 @@ This is the number to hold onto when reading anyone's ANN benchmark, including
 this one: **recall is a property of the dataset at least as much as of the
 index.** Realistic recall against public datasets with published ground truth
 belongs to the ann-benchmarks-style harness, not to this file.
+
+## What changed since the first baseline
+
+The first version of this file measured 82–83 ms per clustered query. The graph
+was then stored as one `Vec` per node's vector plus one per node per layer of
+neighbors — roughly 400 000 allocations rebuilt on every scan, because a scan
+decodes the whole graph before it can walk it. Storing it flat (one buffer
+strided by `dim`, neighbor lists in fixed-width slots) cut the decode from
+56–60 ms to 25.9 ms.
+
+Flat storage alone made the **tail worse**, not better: p95 went to 125–181 ms
+against the original 87–91 ms. Two large contiguous arrays per scan, on top of
+the 80 MB buffer the pages were still being copied into, is a lot of large
+allocation per query, and large allocations are erratic in a way a median hides.
+Decoding straight from the pages removes that buffer, and with it the
+regression — p95 is now 68–80 ms, better than where it started.
+
+Both changes are visible above and neither moved recall by a digit, which is the
+point: the graph is identical, only its representation and its route into memory
+changed. **The remaining ~62 ms is still the whole index being read and decoded
+per scan**, so the conclusion the first baseline drew is unchanged — it is just
+62 ms of evidence for paged storage now instead of 82.
 
 ## What the search itself costs
 
@@ -132,23 +154,22 @@ Median extra milliseconds over that same query's `ef_search = 1`:
 
 | `ef_search` | clustered | uniform |
 |---|---|---|
-| 16 | −0.10 ms | +0.46 ms |
-| 32 | +0.41 ms | +0.36 ms |
-| 64 | +0.37 ms | +0.81 ms |
-| 128 | +0.39 ms | +1.53 ms |
-| 256 | +0.36 ms | +2.47 ms |
+| 16 | +0.02 ms | +0.32 ms |
+| 32 | +0.34 ms | +0.40 ms |
+| 64 | +0.48 ms | +0.86 ms |
+| 128 | +0.58 ms | +1.28 ms |
+| 256 | +0.59 ms | +2.43 ms |
 
 **Read these as a scale, not as calibrated per-point values, and do not read
 the per-point shape at all.** Pairing removes the fixed cost, which is what
 makes a sub-millisecond signal visible; a few tenths of a millisecond of
-run-to-run movement survive it. Three runs of this same clustered measurement
-gave +0.91, +0.36 and +0.55 ms at `ef_search = 256` — one of them flat across
-the sweep, two of them rising. Any story told about the clustered curve's shape
-is a story about which run got written down. The negative cell is the same
-noise at a budget narrow enough that there is barely any search to pay for.
+run-to-run movement survive it. Four runs of this same clustered measurement
+gave +0.91, +0.36, +0.55 and +0.59 ms at `ef_search = 256` — one flat across the
+sweep, three rising. Any story told about the clustered curve's shape is a story
+about which run got written down.
 
 Two things do reproduce. **On the clustered fixture every median point is under
-a millisecond**, across all three runs — the p95 is a different story, below.
+a millisecond**, across all four runs — the p95 is a different story, below.
 **On the uniform fixture the cost grows with the budget** — roughly doubling as
 the budget doubles, out to +2.47 ms — because in 128 uniform dimensions the
 walk has no gradient to converge on and spends everything it is given, and
@@ -159,20 +180,19 @@ budget unused, and the recall column forbids it: recall climbs 0.814 → 0.966
 between `ef_search` 16 and 64, so the search is plainly finding more in that
 range, not coasting. Convergence is a fair description only from 128 to 256,
 where recall stops moving. Below that, the honest statement is narrower — the
-extra work is real but too small to measure reliably against an 82 ms constant.
+extra work is real but too small to measure reliably against a 62 ms constant.
 
 The conclusion needs none of that detail: at the widest budget measured, search
-is **around 1% of a query on the clustered fixture and under 3% on the uniform
-one** — "around", because the worst of the three clustered runs puts it at 1.1%
-and this file declines to privilege any one of them. Quoting it to two
-significant figures would repeat the mistake the table above warns about, since
-the numerator moves 2.5× between runs. The remaining 82–88 ms is deserializing
-the whole 77 MB graph, which the interim storage format does on every single
-scan. That is the concrete case for paged storage (`docs/STORAGE.md`), and the
-number that should move when it lands.
+is **around 1% of a query on the clustered fixture and under 4% on the uniform
+one**. Quoting it to two significant figures would repeat the mistake the table
+above warns about, since the numerator moves between runs. The remaining
+62–64 ms is reading and decoding the whole 77 MB graph, which the interim
+storage format does on every single scan. That is the concrete case for paged
+storage (`docs/STORAGE.md`), and the number that should move further when it
+lands.
 
-One caveat the medians hide: the same table's p95 paired deltas run 3–6 ms,
-several times the median. The "1% of a query" figure is a statement about the
+One caveat the medians hide: the same table's p95 paired deltas run 3–16 ms,
+many times the median. The "1% of a query" figure is a statement about the
 median query, and the tail is worse.
 
 ## Comparison with pgvector
@@ -189,29 +209,29 @@ side, which makes a comparison partly a comparison of protocols.
 
 | `ef_search` | Brindle p50 | pgvector p50 | Brindle recall | pgvector recall |
 |---|---|---|---|---|
-| 16 | 82.3 ms | 0.45 ms | 0.814 | 0.819 |
-| 32 | 82.7 ms | 0.49 ms | 0.932 | 0.942 |
-| 64 | 82.8 ms | 0.61 ms | 0.966 | 0.976 |
-| 128 | 82.9 ms | 0.77 ms | 0.974 | 0.982 |
-| 256 | 82.7 ms | 1.04 ms | 0.974 | 0.982 |
+| 16 | 62.4 ms | 0.57 ms | 0.814 | 0.815 |
+| 32 | 62.8 ms | 0.62 ms | 0.932 | 0.940 |
+| 64 | 62.9 ms | 0.73 ms | 0.966 | 0.977 |
+| 128 | 62.9 ms | 1.03 ms | 0.974 | 0.983 |
+| 256 | 63.0 ms | 1.33 ms | 0.974 | 0.983 |
 
 | | Brindle | pgvector |
 |---|---|---|
-| build, parallel (as shipped) | — | 17.5 s |
-| build, `max_parallel_maintenance_workers = 0` | 112.5 s | 38.6 s |
+| build, parallel (as shipped) | — | 19.8 s |
+| build, `max_parallel_maintenance_workers = 0` | 113.1 s | 45.4 s |
 | index size | 77 MB | 79 MB |
 
 **Latency: two orders of magnitude, and the ratio is not a constant.** It is
-183× at `ef_search = 16` and 80× at 256 — it *narrows* as the budget grows,
+109× at `ef_search = 16` and 47× at 256 — it *narrows* as the budget grows,
 because pgvector's cost scales with the search while Brindle's is dominated by
-a fixed 82 ms that the budget does not touch. At `ef_search = 64` it is 136×.
+a fixed 62 ms that the budget does not touch. At `ef_search = 64` it is 86×.
 M2's exit criterion asked for "the same order of magnitude, not necessarily
 faster yet", and this misses it by two.
 
-**Build: ~3× slower, not ~6×.** pgvector builds in parallel by default and
+**Build: ~2.5× slower, not ~6×.** pgvector builds in parallel by default and
 Brindle is single-threaded, so comparing defaults compares a three-backend
-build against a one-backend one. At matched single-threadedness it is 112.5 s
-against 38.6 s. (The serial setting was verified to take effect rather than
+build against a one-backend one. At matched single-threadedness it is 113.1 s
+against 45.4 s. (The serial setting was verified to take effect rather than
 assumed — an out-of-band check, not part of either run above: the build shows
 zero parallel workers in `pg_stat_activity` where the default run shows two.)
 
@@ -222,21 +242,23 @@ this run. Read the next section before quoting that gap as a value.
 
 Brindle's build takes a fixed RNG seed, and its recall is identical to three
 decimals across every run of this benchmark. pgvector's build is randomised,
-and its recall moves between builds. Across the nine clustered builds run
+and its recall moves between builds. Across the eleven clustered builds run
 during this work:
 
 | `ef_search` | Brindle (every run) | pgvector (observed across 9 builds) |
 |---|---|---|
-| 16 | 0.814 | 0.807 – 0.834 |
-| 32 | 0.932 | 0.927 – 0.954 |
+| 16 | 0.814 | 0.797 – 0.834 |
+| 32 | 0.932 | 0.922 – 0.954 |
 | 64 | **0.966** | **0.969 – 0.990** |
 | 128 | 0.974 | 0.976 – 0.995 |
 | 256 | 0.974 | 0.976 – 0.995 |
 
 **Those are observed minima and maxima over a sample, not bounds.** The
-distinction is not theoretical: a six-build range published in an earlier draft
-was escaped by the seventh build at one point and by the eighth at three of
-five. Expect the next build to fall outside this range too.
+distinction is not theoretical, and it keeps happening: a six-build range
+published in an earlier draft was escaped by the seventh build at one point, by
+the eighth at three of five, and by the tenth — an independent reviewer's — at
+two of five, which is why the low ends above moved again. Expect the next build
+to fall outside this range too.
 
 So the recall gap at `ef_search = 64` is somewhere around **0.003 to 0.024**,
 and any single-run figure for pgvector — including the 0.976 in the table above
@@ -249,11 +271,11 @@ Both implementations, same uniform fixture, same queries, same ground truth:
 
 | `ef_search` | Brindle | pgvector |
 |---|---|---|
-| 16 | 0.146 | 0.150 |
-| 32 | 0.249 | 0.224 |
-| 64 | 0.375 | 0.364 |
-| 128 | 0.507 | 0.501 |
-| 256 | 0.663 | 0.684 |
+| 16 | 0.146 | 0.133 |
+| 32 | 0.249 | 0.234 |
+| 64 | 0.375 | 0.379 |
+| 128 | 0.507 | 0.514 |
+| 256 | 0.663 | 0.674 |
 
 A mature implementation scores the same 0.15 as Brindle does on uniform 128-
 dimensional data. That is the strongest available evidence that the number
@@ -261,7 +283,7 @@ measures the dataset and not the index — and it is why the recall figures in
 this file should never be quoted without the fixture they came from.
 
 Both sides also build ~2× slower on this fixture than on the clustered one
-(Brindle 252.3 s against 112.5 s; pgvector 78.5 s serial against 38.6 s):
+(Brindle 242.2 s against 113.1 s; pgvector 81.9 s serial against 45.4 s):
 structure makes neighbour selection converge faster, for both implementations.
 
 ### Ways this comparison is still not apples to apples
@@ -280,7 +302,7 @@ Recorded because a comparison whose asymmetries are hidden is worse than none.
   not an advantage.
 - **Harness overhead.** The plpgsql timing loop has a floor of about 0.016 ms,
   measured separately from the two runs above. That is 0.02% of Brindle's 82 ms
-  but roughly 4% of pgvector's 0.45 ms, so the latency ratios above are if
+  but roughly 3% of pgvector's 0.57 ms, so the latency ratios above are if
   anything conservative. (It cancels entirely from
   the paired search-cost table, which is one more reason to prefer it.)
 - **Warm cache throughout.** Both sides. A cold-cache comparison would be more
@@ -301,8 +323,8 @@ Recorded because a comparison whose asymmetries are hidden is worse than none.
 ## Follow-ups this baseline argues for
 
 - **Paged storage (M4)** is now quantified rather than asserted: search is a low
-  single-digit percentage of a query and the remaining 82–88 ms is graph
-  deserialization, which is the entire latency gap against pgvector.
+  single-digit percentage of a query and the remaining 62–64 ms is reading and
+  decoding the graph, which is the entire latency gap against pgvector.
 - **Recall plateaus at 0.974 and more budget does not help.** Between
   `ef_search` 128 and 256 recall does not move. That ceiling is build quality,
   not search effort: at `ef_construction = 64` the graph does not contain the
