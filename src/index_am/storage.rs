@@ -19,7 +19,7 @@ use core::ffi::c_char;
 use pgrx::pg_sys;
 use pgrx::prelude::*;
 
-use crate::hnsw::Hnsw;
+use crate::hnsw::{GraphBytes, Hnsw, HnswDecodeError};
 
 /// Errors from decoding the blob payload framing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -324,11 +324,97 @@ unsafe fn read_page_contents(
     pg_sys::UnlockReleaseBuffer(buffer);
 }
 
-/// Read back the blob written by [`write_index_blob`] from the main fork.
+/// The stored blob, delivered a page at a time.
+///
+/// A graph worth measuring spans thousands of pages, which is far more than a
+/// backend may pin simultaneously, so the bytes cannot be borrowed all at once.
+/// Reading them page by page into the decoder — rather than concatenating them
+/// into one buffer first — is what keeps the load from copying the whole index
+/// twice: once into the blob, once out of it.
+struct PageBytes {
+    index: pg_sys::Relation,
+    /// Next block to fault in; `nblocks` means the pages are exhausted.
+    blkno: pg_sys::BlockNumber,
+    nblocks: pg_sys::BlockNumber,
+    /// Contents of the page currently being served.
+    page: Vec<u8>,
+    pos: usize,
+    /// Payload bytes not yet handed out, from the metapage's declared length.
+    left: usize,
+}
+
+impl PageBytes {
+    /// # Safety
+    /// `index` must be an open brindle index relation locked at least
+    /// AccessShare, with `nblocks` blocks in its main fork.
+    unsafe fn new(index: pg_sys::Relation, nblocks: pg_sys::BlockNumber, blob_len: usize) -> Self {
+        Self {
+            index,
+            blkno: 1, // block 0 is the metapage, already consumed by the caller
+            nblocks,
+            page: Vec::with_capacity(PAGE_CHUNK_CAPACITY),
+            pos: 0,
+            left: blob_len,
+        }
+    }
+
+    /// Fault in the next page. Returns false once none are left.
+    fn advance(&mut self) -> bool {
+        if self.blkno >= self.nblocks {
+            return false;
+        }
+        self.page.clear();
+        self.pos = 0;
+        // SAFETY: the relation is locked by the caller for the whole decode and
+        // `blkno` is below `nblocks`, so the block exists in the main fork.
+        unsafe { read_page_contents(self.index, self.blkno, &mut self.page) };
+        self.blkno += 1;
+        true
+    }
+}
+
+impl GraphBytes for PageBytes {
+    fn read_exact(&mut self, out: &mut [u8]) -> Result<(), HnswDecodeError> {
+        if out.len() > self.left {
+            return Err(HnswDecodeError::Truncated);
+        }
+        let mut filled = 0;
+        while filled < out.len() {
+            if self.pos == self.page.len() && !self.advance() {
+                return Err(HnswDecodeError::Truncated);
+            }
+            // A value may straddle a page boundary, so take what this page has
+            // and come back for the rest.
+            let take = (out.len() - filled).min(self.page.len() - self.pos);
+            if take == 0 {
+                return Err(HnswDecodeError::Truncated);
+            }
+            out[filled..filled + take].copy_from_slice(&self.page[self.pos..self.pos + take]);
+            self.pos += take;
+            filled += take;
+        }
+        self.left -= out.len();
+        Ok(())
+    }
+
+    fn remaining(&self) -> usize {
+        self.left
+    }
+}
+
+impl PageBytes {
+    /// Restrict how many further bytes this source will hand out. Used to fence
+    /// the graph off from the pointer table that follows it.
+    fn limit(&mut self, bytes: usize) {
+        self.left = bytes;
+    }
+}
+
+/// Validate the metapage and return `(block count, declared payload length)`.
 ///
 /// # Safety
 /// `index` must be an open brindle index relation locked at least AccessShare.
-pub unsafe fn read_index_blob(index: pg_sys::Relation) -> Vec<u8> {
+unsafe fn read_meta(index: pg_sys::Relation) -> (pg_sys::BlockNumber, usize) {
     let nblocks = pg_sys::RelationGetNumberOfBlocksInFork(index, pg_sys::ForkNumber::MAIN_FORKNUM);
     if nblocks == 0 {
         error!("brindle: index has no pages (never built?)");
@@ -356,18 +442,7 @@ pub unsafe fn read_index_blob(index: pg_sys::Relation) -> Vec<u8> {
         );
     }
 
-    let mut blob = Vec::with_capacity(blob_len);
-    for blkno in 1..nblocks {
-        read_page_contents(index, blkno, &mut blob);
-    }
-    if blob.len() != blob_len {
-        error!(
-            "brindle: index blob is {} bytes but metapage declared {}",
-            blob.len(),
-            blob_len
-        );
-    }
-    blob
+    (nblocks, blob_len)
 }
 
 /// Block whose heavyweight page lock arbitrates the stored image: share to read
@@ -395,12 +470,47 @@ pub unsafe fn load_index(index: pg_sys::Relation) -> (Hnsw, Vec<TidPair>) {
     // A writer already holding the exclusive lock re-enters here freely: the
     // lock manager never conflicts a request with the requester's own locks.
     pg_sys::LockPage(index, IMAGE_LOCK_BLOCK, pg_sys::ShareLock as i32);
-    let blob = read_index_blob(index);
-    pg_sys::UnlockPage(index, IMAGE_LOCK_BLOCK, pg_sys::ShareLock as i32);
+    let (nblocks, blob_len) = read_meta(index);
+    let mut src = PageBytes::new(index, nblocks, blob_len);
 
-    let (graph_bytes, tids) =
-        decode_index_payload(&blob).unwrap_or_else(|e| error!("brindle: {e}"));
-    let hnsw = Hnsw::from_bytes(graph_bytes).unwrap_or_else(|e| error!("brindle: {e}"));
+    // Same framing decode_index_payload performs, driven off the page walk so
+    // the whole blob never lands in memory at once.
+    let graph_len = src
+        .read_len()
+        .unwrap_or_else(|_| error!("brindle: {}", PayloadError::Truncated));
+    if graph_len > src.remaining() {
+        error!("brindle: {}", PayloadError::Truncated);
+    }
+    // Hand the decoder exactly the graph's bytes: it bounds its own allocations
+    // by what the source says is left, and the trailing pointer table is not
+    // part of that budget.
+    let after_graph = src.remaining() - graph_len;
+    src.limit(graph_len);
+    let hnsw = Hnsw::from_graph_bytes(&mut src).unwrap_or_else(|e| error!("brindle: {e}"));
+    if src.remaining() != 0 {
+        error!("brindle: graph is shorter than its declared length");
+    }
+    src.limit(after_graph);
+
+    let count = src
+        .read_len()
+        .unwrap_or_else(|_| error!("brindle: {}", PayloadError::Truncated));
+    if src.remaining() / 6 < count {
+        error!("brindle: {}", PayloadError::Truncated);
+    }
+    let mut tids: Vec<TidPair> = Vec::with_capacity(count);
+    let mut entry = [0u8; 6];
+    for _ in 0..count {
+        src.read_exact(&mut entry)
+            .unwrap_or_else(|_| error!("brindle: {}", PayloadError::Truncated));
+        let block = u32::from_le_bytes([entry[0], entry[1], entry[2], entry[3]]);
+        let offset = u16::from_le_bytes([entry[4], entry[5]]);
+        tids.push((block, offset));
+    }
+    if src.remaining() != 0 {
+        error!("brindle: {}", PayloadError::TrailingBytes);
+    }
+    pg_sys::UnlockPage(index, IMAGE_LOCK_BLOCK, pg_sys::ShareLock as i32);
     if hnsw.len() != tids.len() {
         error!(
             "brindle: corrupted index: {} graph nodes but {} heap pointers",

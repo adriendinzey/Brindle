@@ -1006,40 +1006,67 @@ impl<'a> ByteReader<'a> {
         self.pos = end;
         Ok(slice)
     }
+}
 
-    fn u8(&mut self) -> Result<u8, HnswDecodeError> {
-        Ok(self.take(1)?[0])
-    }
-
-    fn u16(&mut self) -> Result<u16, HnswDecodeError> {
-        let s = self.take(2)?;
-        Ok(u16::from_le_bytes([s[0], s[1]]))
-    }
-
-    fn u32(&mut self) -> Result<u32, HnswDecodeError> {
-        let s = self.take(4)?;
-        Ok(u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
-    }
-
-    fn u64(&mut self) -> Result<u64, HnswDecodeError> {
-        let s = self.take(8)?;
-        Ok(u64::from_le_bytes([
-            s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7],
-        ]))
-    }
-
-    /// A `u64` that must fit in `usize` (counts, ids, sizes).
-    fn len(&mut self) -> Result<usize, HnswDecodeError> {
-        usize::try_from(self.u64()?)
-            .map_err(|_| HnswDecodeError::Invalid("value exceeds address space"))
+impl GraphBytes for ByteReader<'_> {
+    fn read_exact(&mut self, out: &mut [u8]) -> Result<(), HnswDecodeError> {
+        out.copy_from_slice(self.take(out.len())?);
+        Ok(())
     }
 
     fn remaining(&self) -> usize {
         self.buf.len() - self.pos
     }
+}
+
+/// The serialized bytes of a graph, consumed strictly front to back.
+///
+/// A decoder cannot simply take a slice over the stored form: the storage layer
+/// keeps the blob across index pages, and a graph large enough to matter spans
+/// more pages than a backend may pin at once — so the bytes are delivered a
+/// buffer at a time rather than borrowed whole. Reading through this trait lets
+/// the same decoder serve a plain slice and a page walk, and lets the page walk
+/// avoid materializing the entire blob first.
+pub trait GraphBytes {
+    /// Fill `out` completely, or fail if fewer bytes remain.
+    fn read_exact(&mut self, out: &mut [u8]) -> Result<(), HnswDecodeError>;
+
+    /// Bytes not yet consumed. The decoder bounds its allocations by this, so an
+    /// implementation must never report more than it can actually supply.
+    fn remaining(&self) -> usize;
+
+    fn u8(&mut self) -> Result<u8, HnswDecodeError> {
+        let mut b = [0u8; 1];
+        self.read_exact(&mut b)?;
+        Ok(b[0])
+    }
+
+    fn u16(&mut self) -> Result<u16, HnswDecodeError> {
+        let mut b = [0u8; 2];
+        self.read_exact(&mut b)?;
+        Ok(u16::from_le_bytes(b))
+    }
+
+    fn u32(&mut self) -> Result<u32, HnswDecodeError> {
+        let mut b = [0u8; 4];
+        self.read_exact(&mut b)?;
+        Ok(u32::from_le_bytes(b))
+    }
+
+    fn u64(&mut self) -> Result<u64, HnswDecodeError> {
+        let mut b = [0u8; 8];
+        self.read_exact(&mut b)?;
+        Ok(u64::from_le_bytes(b))
+    }
+
+    /// A `u64` that must fit in `usize` (counts, ids, sizes).
+    fn read_len(&mut self) -> Result<usize, HnswDecodeError> {
+        usize::try_from(self.u64()?)
+            .map_err(|_| HnswDecodeError::Invalid("value exceeds address space"))
+    }
 
     fn done(&self) -> bool {
-        self.pos == self.buf.len()
+        self.remaining() == 0
     }
 }
 
@@ -1128,7 +1155,13 @@ impl Hnsw {
     /// neighbor choice) are trusted as-is, since a well-formed-but-worse graph
     /// only degrades recall, never safety.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, HnswDecodeError> {
-        let mut r = ByteReader::new(bytes);
+        Self::from_graph_bytes(&mut ByteReader::new(bytes))
+    }
+
+    /// Decode from any [`GraphBytes`] source. The storage layer uses this to
+    /// decode straight out of index pages, which avoids assembling the whole
+    /// serialized blob in memory only to read it once and drop it.
+    pub fn from_graph_bytes<S: GraphBytes + ?Sized>(r: &mut S) -> Result<Self, HnswDecodeError> {
         if r.u32()? != CODEC_MAGIC {
             return Err(HnswDecodeError::BadMagic);
         }
@@ -1139,7 +1172,7 @@ impl Hnsw {
         let metric =
             Metric::from_code(r.u8()?).ok_or(HnswDecodeError::Invalid("unknown metric code"))?;
         let _reserved = r.u8()?;
-        let m = r.len()?;
+        let m = r.read_len()?;
         if m < 2 {
             return Err(HnswDecodeError::Invalid("m out of range"));
         }
@@ -1150,12 +1183,12 @@ impl Hnsw {
         // Same derivation `new()` uses, so a decoded graph's degree caps and ef
         // floor match a freshly built one's.
         let (_, m_cap, m0_cap, ml, ef_floor) = Self::derived_params(m, gamma);
-        let ef_construction = r.len()?;
+        let ef_construction = r.read_len()?;
         if ef_construction < ef_floor {
             return Err(HnswDecodeError::Invalid("ef_construction below floor"));
         }
-        let dim = r.len()?;
-        let max_layer = r.len()?;
+        let dim = r.read_len()?;
+        let max_layer = r.read_len()?;
         let seed = r.u64()?;
         let rng = r.u64()?;
         // Encoded graphs come from `new()`, which never produces a zero seed
@@ -1164,7 +1197,7 @@ impl Hnsw {
             return Err(HnswDecodeError::Invalid("PRNG state must be nonzero"));
         }
         let entry_raw = r.u64()?;
-        let n = r.len()?;
+        let n = r.read_len()?;
         let entry_point = if entry_raw == u64::MAX {
             None
         } else {
@@ -1205,6 +1238,7 @@ impl Hnsw {
         let mut link_counts: Vec<u32> = Vec::with_capacity(plausible_n);
         let mut links: Vec<u32> = Vec::with_capacity(plausible_n * slot0);
         let mut attrs: Vec<Vec<AttrValue>> = Vec::with_capacity(plausible_n);
+        let mut scratch: Vec<u8> = Vec::new();
         let mut deleted: Vec<bool> = Vec::with_capacity(plausible_n);
         for _ in 0..n {
             deleted.push(match r.u8()? {
@@ -1212,16 +1246,22 @@ impl Hnsw {
                 1 => true,
                 _ => return Err(HnswDecodeError::Invalid("bad tombstone flag")),
             });
-            let levels = r.len()?;
+            let levels = r.read_len()?;
             if levels == 0 {
                 return Err(HnswDecodeError::Invalid("node with no layers"));
             }
             if levels - 1 > max_layer {
                 return Err(HnswDecodeError::Invalid("node above the top layer"));
             }
-            let raw = r.take(vector_bytes)?;
+            // Read through a reusable scratch buffer rather than borrowing: a
+            // page source has no contiguous slice to lend. The buffer is one
+            // vector wide and stays hot in cache, so this costs far less than
+            // assembling the whole blob to borrow from.
+            scratch.resize(vector_bytes, 0);
+            r.read_exact(&mut scratch)?;
             vectors.extend(
-                raw.as_chunks::<4>()
+                scratch
+                    .as_chunks::<4>()
                     .0
                     .iter()
                     .map(|c| f32::from_le_bytes(*c)),
@@ -1237,7 +1277,7 @@ impl Hnsw {
             let node_start = links.len();
             links.resize(node_start + node_slots, 0);
             for layer in 0..levels {
-                let count = r.len()?;
+                let count = r.read_len()?;
                 let cap = if layer == 0 { m0_cap } else { m_cap };
                 if count > cap {
                     return Err(HnswDecodeError::Invalid("neighbor list over degree cap"));
@@ -1252,7 +1292,7 @@ impl Hnsw {
                 };
                 let start = node_start + within;
                 for slot in 0..count {
-                    let id = r.len()?;
+                    let id = r.read_len()?;
                     if id >= n {
                         return Err(HnswDecodeError::Invalid("link target out of range"));
                     }
@@ -1261,7 +1301,7 @@ impl Hnsw {
                 link_counts.push(count as u32);
             }
 
-            let attr_count = r.len()?;
+            let attr_count = r.read_len()?;
             // Every value costs at least a tag byte, so a count exceeding what
             // is left is corrupt — checked before reserving, like the counts above.
             if attr_count > r.remaining() {
@@ -1440,6 +1480,62 @@ mod tests {
                     .collect()
             })
             .collect()
+    }
+
+    /// A byte source that hands out at most `chunk` bytes per call, so every
+    /// multi-byte value in the encoding straddles a boundary at some chunk size.
+    /// The storage layer's page walk has exactly this shape; this exercises the
+    /// decoder's half of it without a running server.
+    struct ChokedSource<'a> {
+        buf: &'a [u8],
+        pos: usize,
+        chunk: usize,
+    }
+
+    impl GraphBytes for ChokedSource<'_> {
+        fn read_exact(&mut self, out: &mut [u8]) -> Result<(), HnswDecodeError> {
+            if out.len() > self.buf.len() - self.pos {
+                return Err(HnswDecodeError::Truncated);
+            }
+            let mut filled = 0;
+            while filled < out.len() {
+                let take = (out.len() - filled).min(self.chunk);
+                out[filled..filled + take].copy_from_slice(&self.buf[self.pos..self.pos + take]);
+                self.pos += take;
+                filled += take;
+            }
+            Ok(())
+        }
+
+        fn remaining(&self) -> usize {
+            self.buf.len() - self.pos
+        }
+    }
+
+    #[test]
+    fn decodes_identically_from_a_fragmented_source() {
+        let (h, _) = build(200, 12, 9);
+        let bytes = h.to_bytes();
+        let whole = Hnsw::from_bytes(&bytes).expect("decode");
+
+        // 1 and 3 split every scalar; 7 lands mid-vector; a prime near the
+        // vector width keeps the seams from lining up with node boundaries.
+        for chunk in [1usize, 3, 7, 53] {
+            let mut src = ChokedSource {
+                buf: &bytes,
+                pos: 0,
+                chunk,
+            };
+            let piecewise = Hnsw::from_graph_bytes(&mut src).expect("decode");
+            assert_eq!(
+                adjacency(&piecewise),
+                adjacency(&whole),
+                "chunk size {chunk} changed the graph"
+            );
+            assert_eq!(piecewise.vectors, whole.vectors, "chunk size {chunk}");
+            assert_eq!(piecewise.entry_point, whole.entry_point);
+            assert_eq!(src.remaining(), 0, "chunk size {chunk} left bytes unread");
+        }
     }
 
     fn assert_degree_caps(h: &Hnsw) {
