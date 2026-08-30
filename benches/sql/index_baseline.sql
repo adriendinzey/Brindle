@@ -296,11 +296,16 @@ FROM paired GROUP BY ef ORDER BY ef;
 \echo '=== distance concentration (how hard this fixture is) ==='
 WITH q AS (SELECT embedding FROM bench_queries ORDER BY id LIMIT 1),
      d AS (SELECT brindle_vector_l2_distance(v.embedding, q.embedding) AS dist
-           FROM bench_vectors v, q ORDER BY dist LIMIT 1000)
--- max(), not array_agg()[1000]: the CTE's row order is not guaranteed, and this
--- ratio is load-bearing for the uniform fixture's explanation.
-SELECT round(min(dist)::numeric, 3) AS nearest,
-       round(max(dist)::numeric, 3) AS thousandth,
+           FROM bench_vectors v, q ORDER BY dist
+           -- ROWS is a knob, so the depth has to follow it: at a smaller
+           -- fixture a fixed 1000 silently reports the farthest vector in the
+           -- table under a label claiming otherwise, and this ratio carries the
+           -- write-up's argument that recall is a property of the dataset.
+           LIMIT LEAST(1000, :rows))
+-- max(), not array_agg()[n]: the CTE's row order is not guaranteed.
+SELECT LEAST(1000, :rows) AS depth,
+       round(min(dist)::numeric, 3) AS nearest,
+       round(max(dist)::numeric, 3) AS at_depth,
        round((max(dist) / min(dist))::numeric, 3) AS ratio
 FROM d;
 

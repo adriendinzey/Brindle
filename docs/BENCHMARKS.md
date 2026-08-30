@@ -225,8 +225,8 @@ side, which makes a comparison partly a comparison of protocols.
 109× at `ef_search = 16` and 47× at 256 — it *narrows* as the budget grows,
 because pgvector's cost scales with the search while Brindle's is dominated by
 a fixed 62 ms that the budget does not touch. At `ef_search = 64` it is 86×.
-M2's exit criterion asked for "the same order of magnitude, not necessarily
-faster yet", and this misses it by two.
+The bar this project set itself for a first queryable index was "the same order
+of magnitude, not necessarily faster yet", and this misses it by two.
 
 **Build: ~2.5× slower, not ~6×.** pgvector builds in parallel by default and
 Brindle is single-threaded, so comparing defaults compares a three-backend
@@ -322,7 +322,7 @@ Recorded because a comparison whose asymmetries are hidden is worse than none.
 
 ## Follow-ups this baseline argues for
 
-- **Paged storage (M4)** is now quantified rather than asserted: search is a low
+- **Paged storage** is now quantified rather than asserted: search is a low
   single-digit percentage of a query and the remaining 62–64 ms is reading and
   decoding the graph, which is the entire latency gap against pgvector.
 - **Recall plateaus at 0.974 and more budget does not help.** Between
