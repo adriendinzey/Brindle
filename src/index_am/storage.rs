@@ -92,22 +92,37 @@ pub fn decode_index_payload(blob: &[u8]) -> Result<(&[u8], Vec<TidPair>), Payloa
     }
     let (graph, rest) = rest.split_at(graph_len);
 
-    let (count, mut rest) = read_u64(rest)?;
-    let count = usize::try_from(count).map_err(|_| PayloadError::Truncated)?;
-    if rest.len() / 6 < count {
+    let mut rest: &[u8] = rest;
+    let tids = read_tid_table(&mut rest)?;
+    Ok((graph, tids))
+}
+
+/// Read the node-id → heap-TID table that follows the graph, and require the
+/// payload to end there.
+///
+/// Shared deliberately: `load_index` walks pages while the framing tests hand in
+/// a slice, and a second copy of this would let the tested path and the shipped
+/// one drift apart.
+fn read_tid_table<S: GraphBytes + ?Sized>(src: &mut S) -> Result<Vec<TidPair>, PayloadError> {
+    let count = src.read_len().map_err(|_| PayloadError::Truncated)?;
+    // Bound the reservation by what the source can actually supply, so a corrupt
+    // count cannot turn into a huge allocation.
+    if src.remaining() / 6 < count {
         return Err(PayloadError::Truncated);
     }
     let mut tids = Vec::with_capacity(count);
+    let mut entry = [0u8; 6];
     for _ in 0..count {
-        let block = u32::from_le_bytes([rest[0], rest[1], rest[2], rest[3]]);
-        let offset = u16::from_le_bytes([rest[4], rest[5]]);
+        src.read_exact(&mut entry)
+            .map_err(|_| PayloadError::Truncated)?;
+        let block = u32::from_le_bytes([entry[0], entry[1], entry[2], entry[3]]);
+        let offset = u16::from_le_bytes([entry[4], entry[5]]);
         tids.push((block, offset));
-        rest = &rest[6..];
     }
-    if !rest.is_empty() {
+    if src.remaining() != 0 {
         return Err(PayloadError::TrailingBytes);
     }
-    Ok((graph, tids))
+    Ok(tids)
 }
 
 fn read_u64(buf: &[u8]) -> Result<(u64, &[u8]), PayloadError> {
@@ -492,24 +507,7 @@ pub unsafe fn load_index(index: pg_sys::Relation) -> (Hnsw, Vec<TidPair>) {
     }
     src.limit(after_graph);
 
-    let count = src
-        .read_len()
-        .unwrap_or_else(|_| error!("brindle: {}", PayloadError::Truncated));
-    if src.remaining() / 6 < count {
-        error!("brindle: {}", PayloadError::Truncated);
-    }
-    let mut tids: Vec<TidPair> = Vec::with_capacity(count);
-    let mut entry = [0u8; 6];
-    for _ in 0..count {
-        src.read_exact(&mut entry)
-            .unwrap_or_else(|_| error!("brindle: {}", PayloadError::Truncated));
-        let block = u32::from_le_bytes([entry[0], entry[1], entry[2], entry[3]]);
-        let offset = u16::from_le_bytes([entry[4], entry[5]]);
-        tids.push((block, offset));
-    }
-    if src.remaining() != 0 {
-        error!("brindle: {}", PayloadError::TrailingBytes);
-    }
+    let tids = read_tid_table(&mut src).unwrap_or_else(|e| error!("brindle: {e}"));
     pg_sys::UnlockPage(index, IMAGE_LOCK_BLOCK, pg_sys::ShareLock as i32);
     if hnsw.len() != tids.len() {
         error!(

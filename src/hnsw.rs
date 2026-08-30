@@ -1019,6 +1019,24 @@ impl GraphBytes for ByteReader<'_> {
     }
 }
 
+/// Reads from a slice, so callers already holding the bytes — and the framing
+/// tests — drive exactly the same code as a page walk.
+impl GraphBytes for &[u8] {
+    fn read_exact(&mut self, out: &mut [u8]) -> Result<(), HnswDecodeError> {
+        if out.len() > self.len() {
+            return Err(HnswDecodeError::Truncated);
+        }
+        let (head, tail) = self.split_at(out.len());
+        out.copy_from_slice(head);
+        *self = tail;
+        Ok(())
+    }
+
+    fn remaining(&self) -> usize {
+        self.len()
+    }
+}
+
 /// The serialized bytes of a graph, consumed strictly front to back.
 ///
 /// A decoder cannot simply take a slice over the stored form: the storage layer
