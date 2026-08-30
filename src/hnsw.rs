@@ -37,6 +37,8 @@ pub enum HnswError {
     EmptyVector,
     /// An operation referenced a node id that doesn't exist.
     UnknownNode { id: usize },
+    /// The graph is full: node ids are 32-bit, so it cannot grow further.
+    NodeLimitReached { limit: usize },
 }
 
 impl std::fmt::Display for HnswError {
@@ -50,6 +52,12 @@ impl std::fmt::Display for HnswError {
             }
             HnswError::EmptyVector => write!(f, "vector must not be empty"),
             HnswError::UnknownNode { id } => write!(f, "unknown node id: {id}"),
+            HnswError::NodeLimitReached { limit } => {
+                write!(
+                    f,
+                    "graph is full: {limit} nodes is the ceiling for 32-bit ids"
+                )
+            }
         }
     }
 }
@@ -393,6 +401,9 @@ impl Hnsw {
 
     /// Width of one neighbor slot run. One over the degree cap, because `insert`
     /// appends a neighbor and only then prunes back to the cap.
+    /// Largest node count the `u32` ids and layer offsets can address.
+    pub const MAX_NODES: usize = u32::MAX as usize;
+
     #[inline]
     fn slot_width(&self, layer: usize) -> usize {
         self.max_degree(layer) + 1
@@ -461,7 +472,23 @@ impl Hnsw {
     }
 
     /// Append a node's storage across the flat arrays and return its id.
-    fn push_node(&mut self, vector: &[f32], attrs: Vec<AttrValue>, levels: usize) -> usize {
+    ///
+    /// Node ids and layer offsets are stored as `u32`, which caps a graph at
+    /// [`Hnsw::MAX_NODES`] nodes. That is far beyond what the interim
+    /// whole-image format can hold — every insert rewrites the entire index —
+    /// but the ceiling is the representation's, not the format's, so it is
+    /// checked here rather than assumed.
+    fn push_node(
+        &mut self,
+        vector: &[f32],
+        attrs: Vec<AttrValue>,
+        levels: usize,
+    ) -> Result<usize, HnswError> {
+        if self.n >= Self::MAX_NODES {
+            return Err(HnswError::NodeLimitReached {
+                limit: Self::MAX_NODES,
+            });
+        }
         let id = self.n;
         self.vectors.extend_from_slice(vector);
         self.attrs.push(attrs);
@@ -472,7 +499,7 @@ impl Hnsw {
         let slots = self.slot_width(0) + (levels - 1) * self.slot_width(1);
         self.links.resize(self.links.len() + slots, 0);
         self.n += 1;
-        id
+        Ok(id)
     }
 
     fn random_level(&mut self) -> usize {
@@ -748,7 +775,7 @@ impl Hnsw {
         }
 
         let level = self.random_level();
-        let id = self.push_node(&vector, attrs, level + 1);
+        let id = self.push_node(&vector, attrs, level + 1)?;
 
         let entry = match self.entry_point {
             None => {
@@ -1072,6 +1099,7 @@ pub trait GraphBytes {
     /// implementation must never report more than it can actually supply.
     fn remaining(&self) -> usize;
 
+    /// Read one little-endian value of the named width, advancing the source.
     fn u8(&mut self) -> Result<u8, HnswDecodeError> {
         let mut b = [0u8; 1];
         self.read_exact(&mut b)?;
@@ -1102,6 +1130,7 @@ pub trait GraphBytes {
             .map_err(|_| HnswDecodeError::Invalid("value exceeds address space"))
     }
 
+    /// Whether every byte has been consumed.
     fn done(&self) -> bool {
         self.remaining() == 0
     }

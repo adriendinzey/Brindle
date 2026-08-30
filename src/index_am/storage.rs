@@ -85,16 +85,28 @@ fn append_tid_table(out: &mut Vec<u8>, tids: &[TidPair]) {
 /// Split a blob produced by [`encode_index`] back into the serialized graph
 /// and the node-id → TID table.
 pub fn decode_index_payload(blob: &[u8]) -> Result<(&[u8], Vec<TidPair>), PayloadError> {
-    let (graph_len, rest) = read_u64(blob)?;
-    let graph_len = usize::try_from(graph_len).map_err(|_| PayloadError::Truncated)?;
-    if rest.len() < graph_len {
-        return Err(PayloadError::Truncated);
-    }
-    let (graph, rest) = rest.split_at(graph_len);
-
-    let mut rest: &[u8] = rest;
+    let mut src: &[u8] = blob;
+    let graph_len = read_graph_len(&mut src)?;
+    let prefix = blob.len() - src.len();
+    let (graph, mut rest) = (
+        &blob[prefix..prefix + graph_len],
+        &blob[prefix + graph_len..],
+    );
     let tids = read_tid_table(&mut rest)?;
     Ok((graph, tids))
+}
+
+/// Read the graph's declared byte length and check the source can supply it.
+///
+/// Shared for the same reason [`read_tid_table`] is: `load_index` walks pages
+/// while the framing tests hand in a slice, and a second copy of this would let
+/// the tested path and the shipped one drift apart.
+fn read_graph_len<S: GraphBytes + ?Sized>(src: &mut S) -> Result<usize, PayloadError> {
+    let len = src.read_len().map_err(|_| PayloadError::Truncated)?;
+    if len > src.remaining() {
+        return Err(PayloadError::Truncated);
+    }
+    Ok(len)
 }
 
 /// Read the node-id → heap-TID table that follows the graph, and require the
@@ -123,17 +135,6 @@ fn read_tid_table<S: GraphBytes + ?Sized>(src: &mut S) -> Result<Vec<TidPair>, P
         return Err(PayloadError::TrailingBytes);
     }
     Ok(tids)
-}
-
-fn read_u64(buf: &[u8]) -> Result<(u64, &[u8]), PayloadError> {
-    if buf.len() < 8 {
-        return Err(PayloadError::Truncated);
-    }
-    let (head, rest) = buf.split_at(8);
-    let value = u64::from_le_bytes([
-        head[0], head[1], head[2], head[3], head[4], head[5], head[6], head[7],
-    ]);
-    Ok((value, rest))
 }
 
 // --- page IO -------------------------------------------------------------
@@ -352,8 +353,13 @@ struct PageBytes {
     /// Next block to fault in; `nblocks` means the pages are exhausted.
     blkno: pg_sys::BlockNumber,
     nblocks: pg_sys::BlockNumber,
-    /// Contents of the page currently being served.
-    page: Vec<u8>,
+    /// The pinned, share-locked buffer whose contents are being served, or
+    /// `InvalidBuffer` before the first page and after the last is released.
+    buffer: pg_sys::Buffer,
+    /// Content area of that buffer: borrowed from the buffer pool, valid only
+    /// while `buffer` stays pinned.
+    page: *const u8,
+    len: usize,
     pos: usize,
     /// Payload bytes not yet handed out, from the metapage's declared length.
     left: usize,
@@ -368,24 +374,82 @@ impl PageBytes {
             index,
             blkno: 1, // block 0 is the metapage, already consumed by the caller
             nblocks,
-            page: Vec::with_capacity(PAGE_CHUNK_CAPACITY),
+            buffer: pg_sys::InvalidBuffer as pg_sys::Buffer,
+            page: core::ptr::null(),
+            len: 0,
             pos: 0,
             left: blob_len,
         }
     }
 
-    /// Fault in the next page. Returns false once none are left.
+    fn release(&mut self) {
+        if self.buffer != pg_sys::InvalidBuffer as pg_sys::Buffer {
+            // SAFETY: the buffer was pinned and share-locked by `advance`, and
+            // is released exactly once because this clears the handle.
+            unsafe { pg_sys::UnlockReleaseBuffer(self.buffer) };
+            self.buffer = pg_sys::InvalidBuffer as pg_sys::Buffer;
+            self.page = core::ptr::null();
+            self.len = 0;
+            self.pos = 0;
+        }
+    }
+
+    /// Pin and lock the next page, serving its bytes in place. Returns false
+    /// once none are left.
+    ///
+    /// Reads are answered straight out of the buffer pool rather than from a
+    /// copy, which is the point: a copy per page is a second pass over the whole
+    /// index on every scan. Holding the content lock while the decoder consumes
+    /// the page is what index access methods normally do, and the work between
+    /// pages is bounded by the page.
     fn advance(&mut self) -> bool {
+        self.release();
         if self.blkno >= self.nblocks {
             return false;
         }
-        self.page.clear();
-        self.pos = 0;
         // SAFETY: the relation is locked by the caller for the whole decode and
         // `blkno` is below `nblocks`, so the block exists in the main fork.
-        unsafe { read_page_contents(self.index, self.blkno, &mut self.page) };
+        unsafe {
+            let buffer = pg_sys::ReadBufferExtended(
+                self.index,
+                pg_sys::ForkNumber::MAIN_FORKNUM,
+                self.blkno,
+                pg_sys::ReadBufferMode::RBM_NORMAL,
+                core::ptr::null_mut(),
+            );
+            pg_sys::LockBuffer(buffer, pg_sys::BUFFER_LOCK_SHARE as i32);
+            let page = pg_sys::BufferGetPage(buffer);
+            let pd_lower = (*page.cast::<pg_sys::PageHeaderData>()).pd_lower as usize;
+            if pd_lower < PAGE_CONTENTS_OFFSET || pd_lower > pg_sys::BLCKSZ as usize {
+                pg_sys::UnlockReleaseBuffer(buffer);
+                error!(
+                    "brindle: corrupted index page {} (pd_lower {pd_lower})",
+                    self.blkno
+                );
+            }
+            self.buffer = buffer;
+            self.page = page.cast::<u8>().add(PAGE_CONTENTS_OFFSET);
+            self.len = pd_lower - PAGE_CONTENTS_OFFSET;
+        }
+        self.pos = 0;
         self.blkno += 1;
         true
+    }
+
+    /// Restrict how many further bytes this source will hand out. Used to fence
+    /// the graph off from the pointer table that follows it.
+    fn limit(&mut self, bytes: usize) {
+        self.left = bytes;
+    }
+}
+
+/// Releasing on drop covers the ordinary paths. An `ERROR` inside the decode
+/// longjmps past this, which is safe but not tidy: the transaction's own
+/// end-of-xact cleanup releases the pin and the lock, exactly as it does for
+/// every other backend that errors mid-scan.
+impl Drop for PageBytes {
+    fn drop(&mut self) {
+        self.release();
     }
 }
 
@@ -396,16 +460,25 @@ impl GraphBytes for PageBytes {
         }
         let mut filled = 0;
         while filled < out.len() {
-            if self.pos == self.page.len() && !self.advance() {
-                return Err(HnswDecodeError::Truncated);
+            if self.pos == self.len {
+                // Skipping rather than stopping is defensive: the writer
+                // re-initializes leftover pages instead of truncating, so a
+                // shrunken image leaves empty ones behind. Today `left` stops
+                // the read at the length the metapage declares, before any of
+                // them — this branch is what keeps that a bound rather than the
+                // only thing standing between the reader and stale tail bytes.
+                if !self.advance() {
+                    return Err(HnswDecodeError::Truncated);
+                }
+                continue;
             }
             // A value may straddle a page boundary, so take what this page has
             // and come back for the rest.
-            let take = (out.len() - filled).min(self.page.len() - self.pos);
-            if take == 0 {
-                return Err(HnswDecodeError::Truncated);
-            }
-            out[filled..filled + take].copy_from_slice(&self.page[self.pos..self.pos + take]);
+            let take = (out.len() - filled).min(self.len - self.pos);
+            // SAFETY: `page` points at the pinned buffer's content area and
+            // `pos + take <= len`, which was derived from that page's pd_lower.
+            let src = unsafe { core::slice::from_raw_parts(self.page.add(self.pos), take) };
+            out[filled..filled + take].copy_from_slice(src);
             self.pos += take;
             filled += take;
         }
@@ -415,14 +488,6 @@ impl GraphBytes for PageBytes {
 
     fn remaining(&self) -> usize {
         self.left
-    }
-}
-
-impl PageBytes {
-    /// Restrict how many further bytes this source will hand out. Used to fence
-    /// the graph off from the pointer table that follows it.
-    fn limit(&mut self, bytes: usize) {
-        self.left = bytes;
     }
 }
 
@@ -489,14 +554,9 @@ pub unsafe fn load_index(index: pg_sys::Relation) -> (Hnsw, Vec<TidPair>) {
     let (nblocks, blob_len) = read_meta(index);
     let mut src = PageBytes::new(index, nblocks, blob_len);
 
-    // Same framing decode_index_payload performs, driven off the page walk so
-    // the whole blob never lands in memory at once.
-    let graph_len = src
-        .read_len()
-        .unwrap_or_else(|_| error!("brindle: {}", PayloadError::Truncated));
-    if graph_len > src.remaining() {
-        error!("brindle: {}", PayloadError::Truncated);
-    }
+    // Same framing the slice path performs, driven off the page walk so the
+    // whole blob never lands in memory at once.
+    let graph_len = read_graph_len(&mut src).unwrap_or_else(|e| error!("brindle: {e}"));
     // Hand the decoder exactly the graph's bytes: it bounds its own allocations
     // by what the source says is left, and the trailing pointer table is not
     // part of that budget.

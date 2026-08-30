@@ -121,7 +121,8 @@ was then stored as one `Vec` per node's vector plus one per node per layer of
 neighbors — roughly 400 000 allocations rebuilt on every scan, because a scan
 decodes the whole graph before it can walk it. Storing it flat (one buffer
 strided by `dim`, neighbor lists in fixed-width slots) is where the latency win
-comes from. A second change stopped assembling the whole 80 MB blob before
+comes from: decoding a 100k × 128 graph goes from 43.9 ms to 28.3 ms, measured
+through the same bench on both shapes. A second change stopped assembling the whole 80 MB blob before
 decoding it, and decodes straight from the index pages instead.
 
 **Recall did not move by a digit through either change**, which is the point: the
