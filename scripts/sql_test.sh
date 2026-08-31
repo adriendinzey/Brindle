@@ -38,19 +38,37 @@ cd "$repo_root"
 pgenv_load "$repo_root" "$PG"
 
 filter="${1:-}"
-mapfile -t cases < <(find tests/sql -name '*.sql' | sort | { [[ -n "$filter" ]] && grep -- "$filter" || cat; })
+# `while read` rather than mapfile: stock macOS ships bash 3.2, which has neither
+# mapfile nor readarray, and ONBOARDING lists macOS as supported.
+cases=()
+while IFS= read -r case_file; do
+  # Match the case name, not the directory path — otherwise a filter like "sql"
+  # matches every file by way of "tests/sql/".
+  name="$(basename "$case_file" .sql)"
+  if [[ -z "$filter" || "$name" == *"$filter"* ]]; then
+    cases+=("$case_file")
+  fi
+done < <(find tests/sql -name '*.sql' | sort)
 if [[ ${#cases[@]} -eq 0 ]]; then
   echo "error: no cases matched${filter:+ filter '$filter'}" >&2
   exit 1
 fi
 
+# The pgrx *install prefix* is shared across worktrees — every worktree's
+# Postgres loads brindle.so from the same ~/.pgrx/<ver>/pgrx-install — so this
+# clobbers a sibling task's build while it runs. Same caveat as the benchmark
+# driver; do not run them concurrently.
+#
+# Not --release: these cases assert behaviour, not timing, and an optimized build
+# here means CI pays for a second full compile after the debug one that
+# `cargo pgrx test` already did.
 echo "==> installing the extension into pg$PG"
-cargo pgrx install --release --pg-config "$pg_config" >/dev/null
+cargo pgrx install --pg-config "$pg_config" >/dev/null
 
 echo "==> starting pg$PG (port $port)"
 cargo pgrx start "pg$PG" >/dev/null
 
-echo "==> $(basename "$pg_config" >/dev/null; "$bindir/postgres" --version | awk '{print $3}'), ${#cases[@]} case(s)"
+echo "==> $("$bindir/postgres" --version | awk '{print $3}'), ${#cases[@]} case(s)"
 echo
 
 failed=0
@@ -58,7 +76,13 @@ for case_file in "${cases[@]}"; do
   name="$(basename "$case_file" .sql)"
   # A database per case, so cases cannot see each other's committed state and
   # the suite passes in any order and when re-run. Nothing here rolls back.
+  # Postgres truncates identifiers at NAMEDATALEN (63) without complaint, which
+  # would silently run two long case names against one database.
   db="brindle_t_${name}"
+  if [[ ${#db} -gt 63 ]]; then
+    echo "error: case name '$name' makes a database name over 63 characters" >&2
+    exit 1
+  fi
   "$bindir/dropdb" --host "$host" --port "$port" --if-exists "$db" >/dev/null 2>&1 || true
   "$bindir/createdb" --host "$host" --port "$port" "$db"
   "$bindir/psql" --host "$host" --port "$port" --dbname "$db" --quiet --no-psqlrc \
@@ -89,3 +113,4 @@ if [[ $failed -gt 0 ]]; then
   exit 1
 fi
 echo "==> all ${#cases[@]} case(s) passed"
+echo "    Postgres is still running; stop it with: scripts/pgx.sh stop pg$PG"

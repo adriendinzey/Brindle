@@ -101,11 +101,16 @@ Three things worth knowing:
   afternoon. There are no expected-output files on purpose — they break on
   incidental formatting and tell you only that two files differ.
 - **Assert observable behaviour, not log output.** The `VACUUM` case checks that
-  `pg_class` stats were refreshed, because Postgres only refreshes them from what
-  `amvacuumcleanup` returns — so correct stats are proof the callback ran.
-- **A test that cannot fail is worse than none.** Before trusting a new case,
-  break the thing it covers and watch it go red. Both existing cases were checked
-  that way.
+  `pg_class` stats were refreshed, because a vacuum refreshes them only from what
+  `amvacuumcleanup` returns. (`ANALYZE` refreshes them by its own route, which is
+  why that case disables autovacuum on its table.)
+- **A test that cannot fail is worse than none, and it is easy to write one by
+  accident.** The first version of the recycled-line-pointer case asserted that
+  deleted rows stop being returned — which passes with no `VACUUM` at all, because
+  Postgres rechecks heap visibility for every TID an index scan hands back. It
+  looked like a strong test and tested nothing. Before trusting a case, break the
+  thing it covers and watch it go red; if it stays green, the assertion is
+  measuring something else.
 
 ## Editing from Windows
 

@@ -12,6 +12,10 @@
 -- case fails.
 
 CREATE TABLE vac_stats (id int, embedding real[]);
+-- ANALYZE refreshes these same stats on its own, so an autoanalyze landing
+-- mid-case would either trip the precondition below or satisfy the assertion
+-- that follows it without VACUUM having done anything.
+ALTER TABLE vac_stats SET (autovacuum_enabled = off);
 INSERT INTO vac_stats
 SELECT i, ARRAY[i::real, (i + 1)::real] FROM generate_series(1, 500) i;
 

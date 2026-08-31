@@ -386,9 +386,9 @@ unsafe extern "C" fn amvacuumcleanup(
     // how far the index had grown since it was built. The planner was costing
     // scans against the build-time size.
     //
-    // SAFETY: `info` is Postgres' own vacuum state for this call.
-    let analyze_only = !info.is_null() && (*info).analyze_only;
-    if analyze_only {
+    // SAFETY: `info` is Postgres' own vacuum state for this call. Postgres never
+    // passes NULL here, and the code below relies on that too.
+    if (*info).analyze_only {
         // An analyze-only pass must not touch the index; it is only here to let
         // an AM update its own statistics, and brindle keeps none of its own.
         return stats;
@@ -408,11 +408,14 @@ unsafe extern "C" fn amvacuumcleanup(
     result.num_pages =
         pg_sys::RelationGetNumberOfBlocksInFork(index, pg_sys::ForkNumber::MAIN_FORKNUM);
     if fresh {
-        // Only when ambulkdelete did not already count them: it reports the
-        // live total from the graph it had loaded, and loading it again here
-        // would be the same answer at the cost of a second full read.
-        let (hnsw, _) = storage::load_index(index);
-        result.num_index_tuples = hnsw.live_len() as f64;
+        // Only when ambulkdelete did not already count them. Every live heap
+        // tuple has an index entry and tombstones are the rows the heap has
+        // dropped, so the count Postgres just took over the heap is the same
+        // number the graph would report — and reading the graph to ask it would
+        // turn a callback that costs microseconds into one that reads the whole
+        // index on every vacuum that finds nothing to do.
+        result.num_index_tuples = (*info).num_heap_tuples;
+        result.estimated_count = (*info).estimated_count;
     }
     result.into_pg()
 }
