@@ -40,6 +40,7 @@ cd ~/code/brindle
 
 cargo test                  # fast: pure-Rust core logic (no Postgres)
 cargo pgrx test pg17        # integration tests against a managed Postgres
+scripts/sql_test.sh         # SQL tests against a real, committed database
 cargo pgrx run  pg17        # build + install + open psql with brindle loaded
 ```
 
@@ -47,6 +48,64 @@ cargo pgrx run  pg17        # build + install + open psql with brindle loaded
 CREATE EXTENSION brindle;
 SELECT brindle_l2_distance(ARRAY[1,2,3]::real[], ARRAY[4,5,6]::real[]);  -- 5.196...
 ```
+
+## Two kinds of SQL test
+
+`cargo pgrx test` is the default and should stay that way: assertions are in
+Rust, setup is cheap, and each case is wrapped in a transaction that rolls back,
+so cases cannot see each other.
+
+That wrapper is also a ceiling. Anything needing a **real commit** cannot be
+tested through it — most visibly `VACUUM`, which Postgres refuses to run inside a
+transaction block, but equally a second session observing the first, or anything
+that has to survive a restart. Reaching for a workaround (calling the callback
+`VACUUM` would have called, and checking the rest by hand) tests the callback but
+not the path Postgres takes to it.
+
+`scripts/sql_test.sh` exists for exactly those cases and nothing else:
+
+```bash
+scripts/sql_test.sh              # every case
+scripts/sql_test.sh vacuum       # cases whose filename contains "vacuum"
+PG=16 scripts/sql_test.sh        # against pg16
+KEEP=1 scripts/sql_test.sh       # leave each case's database behind to inspect
+```
+
+It installs the extension, starts the worktree's own Postgres, and runs each
+`tests/sql/*.sql` file **in its own fresh database** — so cases cannot see each
+other's committed state, the suite passes in any order, and re-running it is
+safe. It runs in CI on pg16 and pg17 beside `cargo pgrx test`.
+
+### Writing a case
+
+Drop a `.sql` file in `tests/sql/`. It runs under `ON_ERROR_STOP`, against a
+database with the extension already created, so any error fails the case. Assert
+in plpgsql and `RAISE EXCEPTION` when something is wrong:
+
+```sql
+DO $$
+DECLARE stated bigint; actual bigint;
+BEGIN
+    SELECT relpages INTO stated FROM pg_class WHERE relname = 'my_idx';
+    SELECT pg_relation_size('my_idx') / current_setting('block_size')::int INTO actual;
+    IF stated <> actual THEN
+        RAISE EXCEPTION 'pg_class says % pages, relation is %', stated, actual;
+    END IF;
+END $$;
+```
+
+Three things worth knowing:
+
+- **The exception message is the failure report.** Say what was expected and what
+  was found; a case that fails with "assertion failed" wastes the next person's
+  afternoon. There are no expected-output files on purpose — they break on
+  incidental formatting and tell you only that two files differ.
+- **Assert observable behaviour, not log output.** The `VACUUM` case checks that
+  `pg_class` stats were refreshed, because Postgres only refreshes them from what
+  `amvacuumcleanup` returns — so correct stats are proof the callback ran.
+- **A test that cannot fail is worse than none.** Before trusting a new case,
+  break the thing it covers and watch it go red. Both existing cases were checked
+  that way.
 
 ## Editing from Windows
 

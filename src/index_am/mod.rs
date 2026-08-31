@@ -376,10 +376,45 @@ unsafe extern "C" fn ambulkdelete(
 
 #[pg_guard]
 unsafe extern "C" fn amvacuumcleanup(
-    _info: *mut pg_sys::IndexVacuumInfo,
+    info: *mut pg_sys::IndexVacuumInfo,
     stats: *mut pg_sys::IndexBulkDeleteResult,
 ) -> *mut pg_sys::IndexBulkDeleteResult {
-    stats
+    // Postgres refreshes the index's pg_class.relpages/reltuples from whatever
+    // this returns, and skips the refresh entirely on NULL. Returning the input
+    // unchanged therefore left those stale for the common case: a VACUUM that
+    // finds no dead tuples never calls ambulkdelete, so nothing ever reported
+    // how far the index had grown since it was built. The planner was costing
+    // scans against the build-time size.
+    //
+    // SAFETY: `info` is Postgres' own vacuum state for this call.
+    let analyze_only = !info.is_null() && (*info).analyze_only;
+    if analyze_only {
+        // An analyze-only pass must not touch the index; it is only here to let
+        // an AM update its own statistics, and brindle keeps none of its own.
+        return stats;
+    }
+
+    // SAFETY: a non-NULL `stats` is Postgres' own, palloc'd in the vacuum
+    // context that outlives this call; otherwise allocating it is the AM's job.
+    let mut result = PgBox::from_pg(stats);
+    let fresh = result.is_null();
+    if fresh {
+        result = PgBox::<pg_sys::IndexBulkDeleteResult>::alloc0().into_pg_boxed();
+    }
+
+    // SAFETY: `info.index` is the open index relation Postgres locked for this
+    // vacuum.
+    let index = (*info).index;
+    result.num_pages =
+        pg_sys::RelationGetNumberOfBlocksInFork(index, pg_sys::ForkNumber::MAIN_FORKNUM);
+    if fresh {
+        // Only when ambulkdelete did not already count them: it reports the
+        // live total from the graph it had loaded, and loading it again here
+        // would be the same answer at the cost of a second full read.
+        let (hnsw, _) = storage::load_index(index);
+        result.num_index_tuples = hnsw.live_len() as f64;
+    }
+    result.into_pg()
 }
 
 // Signature fixed by the index AM ABI.
@@ -1035,6 +1070,11 @@ mod tests {
     /// tuples it reported removing. VACUUM itself cannot run inside the
     /// transaction wrapped around a test, so this drives the callback VACUUM
     /// would drive.
+    ///
+    /// That makes this a unit test of the callback, not of vacuuming: which rows
+    /// Postgres decides are dead, whether it calls the AM at all, and what it
+    /// does with the result are all outside it. `tests/sql/` covers the path
+    /// end to end against a committed database — see `scripts/sql_test.sh`.
     fn bulk_delete(index: &str, mut doomed: Vec<TidPair>) -> f64 {
         // SAFETY: the index exists; PgRelation keeps it open across the call,
         // and `doomed` outlives the callback that reads it.
