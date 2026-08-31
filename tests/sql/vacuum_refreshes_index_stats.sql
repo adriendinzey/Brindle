@@ -47,7 +47,7 @@ BEGIN
       INTO actual;
     SELECT count(*) INTO live FROM vac_stats;
 
-    IF stated = actual THEN -- DELIBERATELY INVERTED: verifying CI goes red
+    IF stated <> actual THEN
         RAISE EXCEPTION
             'VACUUM did not refresh relpages: pg_class says %, relation is % pages. '
             'amvacuumcleanup either was not reached or returned NULL',
