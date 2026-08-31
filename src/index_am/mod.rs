@@ -553,6 +553,55 @@ mod tests {
     }
 
     #[pg_test]
+    fn reads_a_shrunken_image_without_running_into_the_old_tail() {
+        // The writer re-initializes leftover pages instead of truncating, so a
+        // rewrite that shrinks the payload leaves the relation the same size
+        // with stale pages past the new end. This checks the reader stops where
+        // the metapage says the payload does, rather than reading on into them.
+        //
+        // It does *not* cover the reader's skip-an-empty-page branch: `left`
+        // halts the read before the tail, so that branch stays unreachable
+        // while the metapage length is trusted. Verified by breaking the branch
+        // and watching this test still pass — it is a bound behind a bound, not
+        // a tested path.
+        //
+        // Nothing reaches a shrunken image from SQL yet — tombstones keep their
+        // slot, so bulk delete does not shrink it, and reclaiming them is not
+        // wired to a vacuum entry point. Hence the direct rewrite.
+        create_fixture("t_tail", 400);
+        Spi::run("CREATE INDEX t_tail_idx ON t_tail USING brindle (embedding)")
+            .expect("create index");
+        let before = index_pages("t_tail_idx");
+        assert!(before > 3, "fixture must span several pages, got {before}");
+
+        // SAFETY: the index exists and PgRelation keeps it open across both
+        // calls; the blob is a well-formed encoding of the graph beside it.
+        let (restored, tids) = unsafe {
+            let relation = PgRelation::open_with_name("t_tail_idx").expect("open index");
+            let mut small = Hnsw::new(HnswParams::default());
+            for i in 0..5u32 {
+                small
+                    .insert(vec![i as f32, (i + 1) as f32])
+                    .expect("insert");
+            }
+            let small_tids: Vec<TidPair> = (0..5).map(|i| (0u32, i as u16 + 1)).collect();
+            storage::rewrite_index_blob(
+                relation.as_ptr(),
+                &storage::encode_index(&small, &small_tids),
+            );
+            storage::load_index(relation.as_ptr())
+        };
+
+        assert_eq!(
+            index_pages("t_tail_idx"),
+            before,
+            "the relation keeps its pages; only the payload shrinks"
+        );
+        assert_eq!(restored.len(), 5, "read back across the emptied tail");
+        assert_eq!(tids.len(), 5);
+    }
+
+    #[pg_test]
     fn create_index_on_empty_table() {
         Spi::run("CREATE TABLE t_empty (id int, embedding real[])").expect("create");
         Spi::run("CREATE INDEX t_empty_idx ON t_empty USING brindle (embedding)")

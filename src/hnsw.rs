@@ -37,6 +37,8 @@ pub enum HnswError {
     EmptyVector,
     /// An operation referenced a node id that doesn't exist.
     UnknownNode { id: usize },
+    /// The graph is full: node ids are 32-bit, so it cannot grow further.
+    NodeLimitReached { limit: usize },
 }
 
 impl std::fmt::Display for HnswError {
@@ -50,6 +52,12 @@ impl std::fmt::Display for HnswError {
             }
             HnswError::EmptyVector => write!(f, "vector must not be empty"),
             HnswError::UnknownNode { id } => write!(f, "unknown node id: {id}"),
+            HnswError::NodeLimitReached { limit } => {
+                write!(
+                    f,
+                    "graph is full: {limit} nodes is the ceiling for 32-bit ids"
+                )
+            }
         }
     }
 }
@@ -93,6 +101,25 @@ impl HnswParams {
     /// γ ≈ 1000, so 1024 covers the documented use cases while keeping the
     /// γ-scaled degree caps (and the allocations sized from them) bounded.
     pub const MAX_GAMMA: f32 = 1024.0;
+
+    /// Largest `m` a graph may declare. Matches the ceiling enforced when an
+    /// index is created, so no index that exists can fail to decode.
+    pub const MAX_M: usize = 128;
+
+    /// Ceiling on the layer-0 degree cap `2·m·γ`.
+    ///
+    /// `m` and `γ` are each bounded, but it is their *product* that sizes link
+    /// storage, and on the decode path both arrive inside the payload. Fixed
+    /// stride means a node reserves its full cap whether or not it uses it, so
+    /// this is the number that turns a small blob into a large allocation. The
+    /// same ceiling is enforced when an index is created.
+    pub const MAX_LAYER0_DEGREE: usize = 2048;
+
+    /// Ceiling on a graph's top layer. Levels are drawn geometrically, so even
+    /// at the smallest permitted `m` the chance of reaching this is ~2⁻⁶⁴: a
+    /// payload claiming more is corrupt, and each extra layer a node claims
+    /// reserves another stride of link slots.
+    pub const MAX_LAYER: usize = 64;
 }
 
 impl Default for HnswParams {
@@ -208,13 +235,33 @@ pub struct Hnsw {
     ml: f64,
     dim: usize,
     seed: u64,
-    // Invariant: `vectors`, `links`, and `deleted` are parallel arrays indexed by
-    // node id, and nodes are never removed (delete only tombstones), so every id
-    // stored in `links` or `entry_point` remains a valid index for all three.
-    // This is what makes the raw `[id]` indexing on the search/insert paths
-    // panic-free.
-    vectors: Vec<Vec<f32>>,
-    links: Vec<Vec<Vec<usize>>>,
+    /// Node count. Kept explicitly because `vectors` is now flat, so its length
+    /// no longer identifies the node count when `dim` is 0.
+    n: usize,
+    // Invariant: node ids index `vectors`, `layer_base`, `attrs` and `deleted` in
+    // parallel, and nodes are never removed (delete only tombstones), so every id
+    // stored in `links` or `entry_point` stays valid for all of them. This is what
+    // makes the raw indexing on the search/insert paths panic-free.
+    //
+    // Storage is flat: `vectors` holds every node's components end to end, strided
+    // by `dim`, and neighbor lists live in fixed-width slots rather than in a
+    // `Vec` per node per layer. Rebuilding a nested shape cost one allocation per
+    // node per layer on every load, which dominated the decode.
+    vectors: Vec<f32>,
+    /// Prefix sum of per-node layer counts, `n + 1` entries: node `id` owns
+    /// layers `layer_base[id] .. layer_base[id + 1]`. Both a node's layer count
+    /// and its slot offset derive from this, so neither needs its own array.
+    layer_base: Vec<u32>,
+    /// Live neighbor count per (node, layer), indexed by `layer_base[id] + layer`.
+    link_counts: Vec<u32>,
+    /// Neighbor ids in fixed-width slots. A layer's width is its degree cap plus
+    /// one: `insert` appends before pruning, so a list is transiently one over.
+    ///
+    /// Slots past a layer's live count hold **unspecified** bytes — pruning
+    /// shortens a list without clearing what it left behind, and a decoded graph
+    /// zero-fills instead. Only `neighbors` defines the graph's value; comparing
+    /// this array raw would see differences that carry no meaning.
+    links: Vec<u32>,
     /// Filterable attribute rows parallel to `vectors`, keyed by node id and set
     /// at insert time. Empty for nodes inserted without attributes; consulted by
     /// predicate-aware traversal, never by graph construction.
@@ -288,7 +335,10 @@ impl Hnsw {
             ml,
             dim: 0,
             seed,
+            n: 0,
             vectors: Vec::new(),
+            layer_base: vec![0],
+            link_counts: Vec::new(),
             links: Vec::new(),
             attrs: Vec::new(),
             deleted: Vec::new(),
@@ -299,11 +349,11 @@ impl Hnsw {
     }
 
     pub fn len(&self) -> usize {
-        self.vectors.len()
+        self.n
     }
 
     pub fn is_empty(&self) -> bool {
-        self.vectors.is_empty()
+        self.n == 0
     }
 
     pub fn dim(&self) -> usize {
@@ -349,12 +399,107 @@ impl Hnsw {
         }
     }
 
+    /// Width of one neighbor slot run. One over the degree cap, because `insert`
+    /// appends a neighbor and only then prunes back to the cap.
+    /// Largest node count the `u32` ids and layer offsets can address.
+    pub const MAX_NODES: usize = u32::MAX as usize;
+
     #[inline]
-    fn neighbors(&self, id: usize, layer: usize) -> &[usize] {
-        self.links[id]
-            .get(layer)
-            .map(|v| v.as_slice())
-            .unwrap_or(&[])
+    fn slot_width(&self, layer: usize) -> usize {
+        self.max_degree(layer) + 1
+    }
+
+    /// Layers node `id` participates in.
+    #[inline]
+    fn levels(&self, id: usize) -> usize {
+        (self.layer_base[id + 1] - self.layer_base[id]) as usize
+    }
+
+    /// Start of node `id`'s slot run in `links`. Every earlier node contributed
+    /// one layer-0 run plus one upper-layer run per level above 0, and
+    /// `layer_base[id] - id` is exactly that count of upper layers.
+    #[inline]
+    fn link_base(&self, id: usize) -> usize {
+        let upper = self.layer_base[id] as usize - id;
+        id * self.slot_width(0) + upper * self.slot_width(1)
+    }
+
+    /// Start of node `id`'s slots for `layer`.
+    #[inline]
+    fn layer_slot(&self, id: usize, layer: usize) -> usize {
+        let within = if layer == 0 {
+            0
+        } else {
+            self.slot_width(0) + (layer - 1) * self.slot_width(1)
+        };
+        self.link_base(id) + within
+    }
+
+    #[inline]
+    fn vector(&self, id: usize) -> &[f32] {
+        let start = id * self.dim;
+        &self.vectors[start..start + self.dim]
+    }
+
+    #[inline]
+    fn neighbors(&self, id: usize, layer: usize) -> &[u32] {
+        if id >= self.n || layer >= self.levels(id) {
+            return &[];
+        }
+        let start = self.layer_slot(id, layer);
+        let count = self.link_counts[self.layer_base[id] as usize + layer] as usize;
+        &self.links[start..start + count]
+    }
+
+    /// Replace node `id`'s neighbor list at `layer`. `ids` must fit the slot
+    /// width, which holds because callers pass a list the degree cap bounded.
+    fn set_neighbors(&mut self, id: usize, layer: usize, ids: &[u32]) {
+        let start = self.layer_slot(id, layer);
+        self.links[start..start + ids.len()].copy_from_slice(ids);
+        self.link_counts[self.layer_base[id] as usize + layer] = ids.len() as u32;
+    }
+
+    /// Append one neighbor to node `id`'s list at `layer`, returning the new
+    /// length. The slot run is one wider than the degree cap, so an append onto
+    /// a full list still fits and the caller prunes immediately after.
+    fn push_neighbor(&mut self, id: usize, layer: usize, neighbor: u32) -> usize {
+        let idx = self.layer_base[id] as usize + layer;
+        let count = self.link_counts[idx] as usize;
+        let start = self.layer_slot(id, layer);
+        self.links[start + count] = neighbor;
+        self.link_counts[idx] = (count + 1) as u32;
+        count + 1
+    }
+
+    /// Append a node's storage across the flat arrays and return its id.
+    ///
+    /// Node ids and layer offsets are stored as `u32`, which caps a graph at
+    /// [`Hnsw::MAX_NODES`] nodes. That is far beyond what the interim
+    /// whole-image format can hold — every insert rewrites the entire index —
+    /// but the ceiling is the representation's, not the format's, so it is
+    /// checked here rather than assumed.
+    fn push_node(
+        &mut self,
+        vector: &[f32],
+        attrs: Vec<AttrValue>,
+        levels: usize,
+    ) -> Result<usize, HnswError> {
+        if self.n >= Self::MAX_NODES {
+            return Err(HnswError::NodeLimitReached {
+                limit: Self::MAX_NODES,
+            });
+        }
+        let id = self.n;
+        self.vectors.extend_from_slice(vector);
+        self.attrs.push(attrs);
+        self.deleted.push(false);
+        let end = self.layer_base[id] + levels as u32;
+        self.layer_base.push(end);
+        self.link_counts.resize(self.link_counts.len() + levels, 0);
+        let slots = self.slot_width(0) + (levels - 1) * self.slot_width(1);
+        self.links.resize(self.links.len() + slots, 0);
+        self.n += 1;
+        Ok(id)
     }
 
     fn random_level(&mut self) -> usize {
@@ -402,7 +547,7 @@ impl Hnsw {
         if !beam.visited.insert(id) {
             return Ok(false);
         }
-        let d = self.metric.distance(query, &self.vectors[id])?;
+        let d = self.metric.distance(query, self.vector(id))?;
         if beam.results.len() < beam.ef || d < beam.farthest() {
             beam.push(Cand { dist: d, id }, self.admissible(id, predicate));
             return Ok(true);
@@ -450,7 +595,7 @@ impl Hnsw {
         let neighbors = self.neighbors(id, layer);
         if !Self::is_filtered(predicate) {
             for &n in neighbors {
-                self.visit(query, n, predicate, beam)?;
+                self.visit(query, n as usize, predicate, beam)?;
             }
             return Ok(());
         }
@@ -466,6 +611,7 @@ impl Hnsw {
         bridges.clear();
         let mut matching = 0usize;
         for &n in neighbors {
+            let n = n as usize;
             if self.node_matches(n, predicate) {
                 matching += 1;
                 self.visit(query, n, predicate, beam)?;
@@ -482,6 +628,7 @@ impl Hnsw {
                 if matching >= target {
                     break;
                 }
+                let nn = nn as usize;
                 if self.node_matches(nn, predicate) {
                     matching += 1;
                     self.visit(query, nn, predicate, beam)?;
@@ -503,7 +650,7 @@ impl Hnsw {
                 if beam.detours == 0 {
                     break;
                 }
-                if self.visit(query, n, predicate, beam)? {
+                if self.visit(query, n as usize, predicate, beam)? {
                     beam.detours -= 1;
                 }
             }
@@ -533,7 +680,7 @@ impl Hnsw {
 
         for &ep in entry_points {
             if beam.visited.insert(ep) {
-                let d = self.metric.distance(query, &self.vectors[ep])?;
+                let d = self.metric.distance(query, self.vector(ep))?;
                 // A seed routes even when tombstoned or non-matching: it may be
                 // the only way into the region that does match.
                 beam.push(Cand { dist: d, id: ep }, self.admissible(ep, predicate));
@@ -574,9 +721,7 @@ impl Hnsw {
             }
             let mut keep = true;
             for &r in &selected {
-                let d = self
-                    .metric
-                    .distance(&self.vectors[cand.id], &self.vectors[r])?;
+                let d = self.metric.distance(self.vector(cand.id), self.vector(r))?;
                 if d < cand.dist {
                     keep = false;
                     break;
@@ -629,15 +774,8 @@ impl Hnsw {
             });
         }
 
-        let id = self.vectors.len();
         let level = self.random_level();
-
-        self.vectors.push(vector);
-        self.attrs.push(attrs);
-        self.deleted.push(false);
-        let mut node_links: Vec<Vec<usize>> = Vec::with_capacity(level + 1);
-        node_links.resize_with(level + 1, Vec::new);
-        self.links.push(node_links);
+        let id = self.push_node(&vector, attrs, level + 1)?;
 
         let entry = match self.entry_point {
             None => {
@@ -648,7 +786,7 @@ impl Hnsw {
             Some(e) => e,
         };
 
-        let query = self.vectors[id].clone();
+        let query = self.vector(id).to_vec();
         let max_layer = self.max_layer;
         let mut ep_ids = vec![entry];
 
@@ -669,17 +807,24 @@ impl Hnsw {
             let max_deg = self.max_degree(lc);
             let selected = self.select_neighbors_heuristic(&w, max_deg)?;
 
-            self.links[id][lc] = selected.clone();
+            let chosen: Vec<u32> = selected.iter().map(|&n| n as u32).collect();
+            self.set_neighbors(id, lc, &chosen);
             for &n in &selected {
-                self.links[n][lc].push(id);
-                if self.links[n][lc].len() > max_deg {
-                    let nbase = self.vectors[n].clone();
-                    let mut cands = Vec::with_capacity(self.links[n][lc].len());
-                    for &nn in &self.links[n][lc] {
-                        let d = self.metric.distance(&nbase, &self.vectors[nn])?;
+                // Append then prune, which is why a slot run is one wider than
+                // the cap: the pruned set is chosen from the same candidates the
+                // nested layout considered, so the resulting graph is identical.
+                let len = self.push_neighbor(n, lc, id as u32);
+                if len > max_deg {
+                    let nbase = self.vector(n).to_vec();
+                    let mut cands = Vec::with_capacity(len);
+                    for &nn in self.neighbors(n, lc) {
+                        let nn = nn as usize;
+                        let d = self.metric.distance(&nbase, self.vector(nn))?;
                         cands.push(Cand { dist: d, id: nn });
                     }
-                    self.links[n][lc] = self.select_neighbors_heuristic(&cands, max_deg)?;
+                    let kept = self.select_neighbors_heuristic(&cands, max_deg)?;
+                    let kept: Vec<u32> = kept.into_iter().map(|x| x as u32).collect();
+                    self.set_neighbors(n, lc, &kept);
                 }
             }
 
@@ -779,13 +924,13 @@ impl Hnsw {
                 got: query.len(),
             });
         }
-        let mut all: Vec<Cand> = Vec::with_capacity(self.vectors.len());
-        for (id, v) in self.vectors.iter().enumerate() {
+        let mut all: Vec<Cand> = Vec::with_capacity(self.n);
+        for id in 0..self.n {
             if self.deleted[id] {
                 continue;
             }
             all.push(Cand {
-                dist: self.metric.distance(query, v)?,
+                dist: self.metric.distance(query, self.vector(id))?,
                 id,
             });
         }
@@ -824,7 +969,7 @@ impl Hnsw {
         let mut live: Vec<(Vec<f32>, Vec<AttrValue>)> = Vec::with_capacity(self.live_len());
         for (id, &deleted) in self.deleted.iter().enumerate() {
             if !deleted {
-                live.push((self.vectors[id].clone(), self.attrs[id].clone()));
+                live.push((self.vector(id).to_vec(), self.attrs[id].clone()));
             }
         }
         let mut fresh = Hnsw::new(HnswParams {
@@ -907,40 +1052,87 @@ impl<'a> ByteReader<'a> {
         self.pos = end;
         Ok(slice)
     }
+}
 
-    fn u8(&mut self) -> Result<u8, HnswDecodeError> {
-        Ok(self.take(1)?[0])
-    }
-
-    fn u16(&mut self) -> Result<u16, HnswDecodeError> {
-        let s = self.take(2)?;
-        Ok(u16::from_le_bytes([s[0], s[1]]))
-    }
-
-    fn u32(&mut self) -> Result<u32, HnswDecodeError> {
-        let s = self.take(4)?;
-        Ok(u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
-    }
-
-    fn u64(&mut self) -> Result<u64, HnswDecodeError> {
-        let s = self.take(8)?;
-        Ok(u64::from_le_bytes([
-            s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7],
-        ]))
-    }
-
-    /// A `u64` that must fit in `usize` (counts, ids, sizes).
-    fn len(&mut self) -> Result<usize, HnswDecodeError> {
-        usize::try_from(self.u64()?)
-            .map_err(|_| HnswDecodeError::Invalid("value exceeds address space"))
+impl GraphBytes for ByteReader<'_> {
+    fn read_exact(&mut self, out: &mut [u8]) -> Result<(), HnswDecodeError> {
+        out.copy_from_slice(self.take(out.len())?);
+        Ok(())
     }
 
     fn remaining(&self) -> usize {
         self.buf.len() - self.pos
     }
+}
 
+/// Reads from a slice, so callers already holding the bytes — and the framing
+/// tests — drive exactly the same code as a page walk.
+impl GraphBytes for &[u8] {
+    fn read_exact(&mut self, out: &mut [u8]) -> Result<(), HnswDecodeError> {
+        if out.len() > self.len() {
+            return Err(HnswDecodeError::Truncated);
+        }
+        let (head, tail) = self.split_at(out.len());
+        out.copy_from_slice(head);
+        *self = tail;
+        Ok(())
+    }
+
+    fn remaining(&self) -> usize {
+        self.len()
+    }
+}
+
+/// The serialized bytes of a graph, consumed strictly front to back.
+///
+/// A decoder cannot simply take a slice over the stored form: the storage layer
+/// keeps the blob across index pages, and a graph large enough to matter spans
+/// more pages than a backend may pin at once — so the bytes are delivered a
+/// buffer at a time rather than borrowed whole. Reading through this trait lets
+/// the same decoder serve a plain slice and a page walk, and lets the page walk
+/// avoid materializing the entire blob first.
+pub trait GraphBytes {
+    /// Fill `out` completely, or fail if fewer bytes remain.
+    fn read_exact(&mut self, out: &mut [u8]) -> Result<(), HnswDecodeError>;
+
+    /// Bytes not yet consumed. The decoder bounds its allocations by this, so an
+    /// implementation must never report more than it can actually supply.
+    fn remaining(&self) -> usize;
+
+    /// Read one little-endian value of the named width, advancing the source.
+    fn u8(&mut self) -> Result<u8, HnswDecodeError> {
+        let mut b = [0u8; 1];
+        self.read_exact(&mut b)?;
+        Ok(b[0])
+    }
+
+    fn u16(&mut self) -> Result<u16, HnswDecodeError> {
+        let mut b = [0u8; 2];
+        self.read_exact(&mut b)?;
+        Ok(u16::from_le_bytes(b))
+    }
+
+    fn u32(&mut self) -> Result<u32, HnswDecodeError> {
+        let mut b = [0u8; 4];
+        self.read_exact(&mut b)?;
+        Ok(u32::from_le_bytes(b))
+    }
+
+    fn u64(&mut self) -> Result<u64, HnswDecodeError> {
+        let mut b = [0u8; 8];
+        self.read_exact(&mut b)?;
+        Ok(u64::from_le_bytes(b))
+    }
+
+    /// A `u64` that must fit in `usize` (counts, ids, sizes).
+    fn read_len(&mut self) -> Result<usize, HnswDecodeError> {
+        usize::try_from(self.u64()?)
+            .map_err(|_| HnswDecodeError::Invalid("value exceeds address space"))
+    }
+
+    /// Whether every byte has been consumed.
     fn done(&self) -> bool {
-        self.pos == self.buf.len()
+        self.remaining() == 0
     }
 }
 
@@ -954,12 +1146,12 @@ impl Hnsw {
     pub fn serialized_len_hint(&self) -> usize {
         // Header, then per node: tombstone flag, level count, vector, attribute
         // count, each layer's own count, and the ids and values themselves.
-        let mut total = 76 + self.vectors.len() * (17 + self.dim * 4);
-        for (layers, row) in self.links.iter().zip(&self.attrs) {
-            for layer in layers {
-                total += 8 + layer.len() * 8;
+        let mut total = 76 + self.n * (17 + self.dim * 4);
+        for id in 0..self.n {
+            for layer in 0..self.levels(id) {
+                total += 8 + self.neighbors(id, layer).len() * 8;
             }
-            total += row.len() * 9;
+            total += self.attrs[id].len() * 9;
         }
         total
     }
@@ -991,16 +1183,17 @@ impl Hnsw {
         out.extend_from_slice(&self.rng.to_le_bytes());
         let entry = self.entry_point.map_or(u64::MAX, |e| e as u64);
         out.extend_from_slice(&entry.to_le_bytes());
-        out.extend_from_slice(&(self.vectors.len() as u64).to_le_bytes());
-        for id in 0..self.vectors.len() {
+        out.extend_from_slice(&(self.n as u64).to_le_bytes());
+        for id in 0..self.n {
             out.push(u8::from(self.deleted[id]));
-            out.extend_from_slice(&(self.links[id].len() as u64).to_le_bytes());
-            for x in &self.vectors[id] {
+            out.extend_from_slice(&(self.levels(id) as u64).to_le_bytes());
+            for x in self.vector(id) {
                 out.extend_from_slice(&x.to_le_bytes());
             }
-            for layer in &self.links[id] {
-                out.extend_from_slice(&(layer.len() as u64).to_le_bytes());
-                for &neighbor in layer {
+            for layer in 0..self.levels(id) {
+                let ids = self.neighbors(id, layer);
+                out.extend_from_slice(&(ids.len() as u64).to_le_bytes());
+                for &neighbor in ids {
                     out.extend_from_slice(&(neighbor as u64).to_le_bytes());
                 }
             }
@@ -1028,7 +1221,13 @@ impl Hnsw {
     /// neighbor choice) are trusted as-is, since a well-formed-but-worse graph
     /// only degrades recall, never safety.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, HnswDecodeError> {
-        let mut r = ByteReader::new(bytes);
+        Self::from_graph_bytes(&mut ByteReader::new(bytes))
+    }
+
+    /// Decode from any [`GraphBytes`] source. The storage layer uses this to
+    /// decode straight out of index pages, which avoids assembling the whole
+    /// serialized blob in memory only to read it once and drop it.
+    pub fn from_graph_bytes<S: GraphBytes + ?Sized>(r: &mut S) -> Result<Self, HnswDecodeError> {
         if r.u32()? != CODEC_MAGIC {
             return Err(HnswDecodeError::BadMagic);
         }
@@ -1039,8 +1238,14 @@ impl Hnsw {
         let metric =
             Metric::from_code(r.u8()?).ok_or(HnswDecodeError::Invalid("unknown metric code"))?;
         let _reserved = r.u8()?;
-        let m = r.len()?;
-        if m < 2 {
+        let m = r.read_len()?;
+        // Bounded on both sides. The upper bound is not cosmetic: `m` and
+        // `gamma` below size the link storage, and that is the one allocation
+        // here the payload's own length does not constrain. A Rust allocation
+        // that fails aborts the process instead of raising an error a session
+        // can catch, so an unbounded one turns a corrupt index into a crash of
+        // every backend.
+        if !(2..=HnswParams::MAX_M).contains(&m) {
             return Err(HnswDecodeError::Invalid("m out of range"));
         }
         let gamma = f32::from_bits(r.u32()?);
@@ -1050,12 +1255,18 @@ impl Hnsw {
         // Same derivation `new()` uses, so a decoded graph's degree caps and ef
         // floor match a freshly built one's.
         let (_, m_cap, m0_cap, ml, ef_floor) = Self::derived_params(m, gamma);
-        let ef_construction = r.len()?;
+        if m0_cap > HnswParams::MAX_LAYER0_DEGREE {
+            return Err(HnswDecodeError::Invalid("degree cap out of range"));
+        }
+        let ef_construction = r.read_len()?;
         if ef_construction < ef_floor {
             return Err(HnswDecodeError::Invalid("ef_construction below floor"));
         }
-        let dim = r.len()?;
-        let max_layer = r.len()?;
+        let dim = r.read_len()?;
+        let max_layer = r.read_len()?;
+        if max_layer > HnswParams::MAX_LAYER {
+            return Err(HnswDecodeError::Invalid("top layer out of range"));
+        }
         let seed = r.u64()?;
         let rng = r.u64()?;
         // Encoded graphs come from `new()`, which never produces a zero seed
@@ -1064,7 +1275,7 @@ impl Hnsw {
             return Err(HnswDecodeError::Invalid("PRNG state must be nonzero"));
         }
         let entry_raw = r.u64()?;
-        let n = r.len()?;
+        let n = r.read_len()?;
         let entry_point = if entry_raw == u64::MAX {
             None
         } else {
@@ -1094,9 +1305,18 @@ impl Hnsw {
         // because `vector_bytes` can be near `usize::MAX` on a crafted blob.
         let min_node_bytes = 25usize.saturating_add(vector_bytes);
         let plausible_n = n.min(r.remaining() / min_node_bytes);
-        let mut vectors: Vec<Vec<f32>> = Vec::with_capacity(plausible_n);
-        let mut links: Vec<Vec<Vec<usize>>> = Vec::with_capacity(plausible_n);
+        // Sized from `plausible_n` so the decode does not reallocate, and flat so
+        // it does not allocate per node at all. `links` is sized for the common
+        // case of a single layer; nodes above layer 0 grow it, which is rare.
+        let slot0 = m0_cap + 1;
+        let slot_up = m_cap + 1;
+        let mut vectors: Vec<f32> = Vec::with_capacity(plausible_n * dim);
+        let mut layer_base: Vec<u32> = Vec::with_capacity(plausible_n + 1);
+        layer_base.push(0);
+        let mut link_counts: Vec<u32> = Vec::with_capacity(plausible_n);
+        let mut links: Vec<u32> = Vec::with_capacity(plausible_n * slot0);
         let mut attrs: Vec<Vec<AttrValue>> = Vec::with_capacity(plausible_n);
+        let mut scratch: Vec<u8> = Vec::new();
         let mut deleted: Vec<bool> = Vec::with_capacity(plausible_n);
         for _ in 0..n {
             deleted.push(match r.u8()? {
@@ -1104,41 +1324,62 @@ impl Hnsw {
                 1 => true,
                 _ => return Err(HnswDecodeError::Invalid("bad tombstone flag")),
             });
-            let levels = r.len()?;
+            let levels = r.read_len()?;
             if levels == 0 {
                 return Err(HnswDecodeError::Invalid("node with no layers"));
             }
             if levels - 1 > max_layer {
                 return Err(HnswDecodeError::Invalid("node above the top layer"));
             }
-            let raw = r.take(vector_bytes)?;
-            let mut vector = Vec::with_capacity(dim);
-            for c in raw.as_chunks::<4>().0 {
-                vector.push(f32::from_le_bytes(*c));
-            }
-            vectors.push(vector);
+            // Read through a reusable scratch buffer rather than borrowing: a
+            // page source has no contiguous slice to lend. The buffer is one
+            // vector wide and stays hot in cache, so this costs far less than
+            // assembling the whole blob to borrow from.
+            scratch.resize(vector_bytes, 0);
+            r.read_exact(&mut scratch)?;
+            vectors.extend(
+                scratch
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|c| f32::from_le_bytes(*c)),
+            );
             if levels > r.remaining() / 8 {
                 return Err(HnswDecodeError::Truncated);
             }
-            let mut node_links = Vec::with_capacity(levels);
-            for _ in 0..levels {
-                let count = r.len()?;
+            layer_base.push(
+                u32::try_from(link_counts.len() + levels)
+                    .map_err(|_| HnswDecodeError::Invalid("too many layers"))?,
+            );
+            let node_slots = slot0 + (levels - 1) * slot_up;
+            let node_start = links.len();
+            links.resize(node_start + node_slots, 0);
+            for layer in 0..levels {
+                let count = r.read_len()?;
+                let cap = if layer == 0 { m0_cap } else { m_cap };
+                if count > cap {
+                    return Err(HnswDecodeError::Invalid("neighbor list over degree cap"));
+                }
                 if count > r.remaining() / 8 {
                     return Err(HnswDecodeError::Truncated);
                 }
-                let mut layer = Vec::with_capacity(count);
-                for _ in 0..count {
-                    let id = r.len()?;
+                let within = if layer == 0 {
+                    0
+                } else {
+                    slot0 + (layer - 1) * slot_up
+                };
+                let start = node_start + within;
+                for slot in 0..count {
+                    let id = r.read_len()?;
                     if id >= n {
                         return Err(HnswDecodeError::Invalid("link target out of range"));
                     }
-                    layer.push(id);
+                    links[start + slot] = id as u32;
                 }
-                node_links.push(layer);
+                link_counts.push(count as u32);
             }
-            links.push(node_links);
 
-            let attr_count = r.len()?;
+            let attr_count = r.read_len()?;
             // Every value costs at least a tag byte, so a count exceeding what
             // is left is corrupt — checked before reserving, like the counts above.
             if attr_count > r.remaining() {
@@ -1170,8 +1411,9 @@ impl Hnsw {
         // count, keeping search's top-down descent finite.
         match entry_point {
             Some(e) => {
-                // `len() - 1` cannot underflow: every node has ≥ 1 layer.
-                if links[e].len() - 1 != max_layer {
+                // `- 1` cannot underflow: every node has ≥ 1 layer.
+                let entry_levels = (layer_base[e + 1] - layer_base[e]) as usize;
+                if entry_levels - 1 != max_layer {
                     return Err(HnswDecodeError::Invalid(
                         "entry point does not own the top layer",
                     ));
@@ -1196,7 +1438,10 @@ impl Hnsw {
             ml,
             dim,
             seed,
+            n,
             vectors,
+            layer_base,
+            link_counts,
             links,
             attrs,
             deleted,
@@ -1249,9 +1494,11 @@ mod tests {
                 hash = hash.wrapping_mul(FNV_PRIME);
             }
         };
-        for layers in &h.links {
-            mix(layers.len() as u64);
-            for nbrs in layers {
+        for id in 0..h.len() {
+            let levels = h.levels(id);
+            mix(levels as u64);
+            for lc in 0..levels {
+                let nbrs = h.neighbors(id, lc);
                 mix(nbrs.len() as u64);
                 for &n in nbrs {
                     mix(n as u64);
@@ -1299,9 +1546,126 @@ mod tests {
         assert!(!h.is_empty());
     }
 
+    /// Live neighbor lists, which is what the graph's value *is*. The backing
+    /// slot array cannot be compared directly: its padding is unspecified, so a
+    /// raw comparison both fails on meaningless differences and could pass on a
+    /// wrong count that happened to leave matching bytes behind.
+    fn adjacency(h: &Hnsw) -> Vec<Vec<Vec<u32>>> {
+        (0..h.len())
+            .map(|id| {
+                (0..h.levels(id))
+                    .map(|lc| h.neighbors(id, lc).to_vec())
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// A byte source that hands out at most `chunk` bytes per call, so every
+    /// multi-byte value in the encoding straddles a boundary at some chunk size.
+    /// The storage layer's page walk has exactly this shape; this exercises the
+    /// decoder's half of it without a running server.
+    struct ChokedSource<'a> {
+        buf: &'a [u8],
+        pos: usize,
+        chunk: usize,
+    }
+
+    impl GraphBytes for ChokedSource<'_> {
+        fn read_exact(&mut self, out: &mut [u8]) -> Result<(), HnswDecodeError> {
+            if out.len() > self.buf.len() - self.pos {
+                return Err(HnswDecodeError::Truncated);
+            }
+            let mut filled = 0;
+            while filled < out.len() {
+                let take = (out.len() - filled).min(self.chunk);
+                out[filled..filled + take].copy_from_slice(&self.buf[self.pos..self.pos + take]);
+                self.pos += take;
+                filled += take;
+            }
+            Ok(())
+        }
+
+        fn remaining(&self) -> usize {
+            self.buf.len() - self.pos
+        }
+    }
+
+    #[test]
+    fn decodes_identically_from_a_fragmented_source() {
+        let (h, _) = build(200, 12, 9);
+        let bytes = h.to_bytes();
+        let whole = Hnsw::from_bytes(&bytes).expect("decode");
+
+        // 1 and 3 split every scalar; 7 lands mid-vector; a prime near the
+        // vector width keeps the seams from lining up with node boundaries.
+        for chunk in [1usize, 3, 7, 53] {
+            let mut src = ChokedSource {
+                buf: &bytes,
+                pos: 0,
+                chunk,
+            };
+            let piecewise = Hnsw::from_graph_bytes(&mut src).expect("decode");
+            assert_eq!(
+                adjacency(&piecewise),
+                adjacency(&whole),
+                "chunk size {chunk} changed the graph"
+            );
+            assert_eq!(piecewise.vectors, whole.vectors, "chunk size {chunk}");
+            assert_eq!(piecewise.entry_point, whole.entry_point);
+            assert_eq!(src.remaining(), 0, "chunk size {chunk} left bytes unread");
+        }
+    }
+
+    /// Header for a blob that is well-formed up to the fields under test, so a
+    /// case fails on the bound it targets rather than on framing.
+    fn header(m: u64, gamma: f32, max_layer: u64, n: u64) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(&CODEC_MAGIC.to_le_bytes());
+        b.extend_from_slice(&CODEC_VERSION.to_le_bytes());
+        b.push(Metric::L2.code());
+        b.push(0);
+        b.extend_from_slice(&m.to_le_bytes());
+        b.extend_from_slice(&gamma.to_bits().to_le_bytes());
+        b.extend_from_slice(&64u64.to_le_bytes()); // ef_construction
+        b.extend_from_slice(&2u64.to_le_bytes()); // dim
+        b.extend_from_slice(&max_layer.to_le_bytes());
+        b.extend_from_slice(&1u64.to_le_bytes()); // seed
+        b.extend_from_slice(&1u64.to_le_bytes()); // rng
+        b.extend_from_slice(&0u64.to_le_bytes()); // entry point
+        b.extend_from_slice(&n.to_le_bytes());
+        b
+    }
+
+    #[test]
+    fn rejects_headers_that_would_size_a_huge_allocation() {
+        // Link storage is sized from `m` and `gamma`, which arrive in the blob,
+        // and fixed stride reserves a node's whole cap whether or not it uses
+        // it — so these fields, unlike the rest, are not bounded by how many
+        // bytes the payload actually supplies. A Rust allocation that fails
+        // aborts the process rather than raising a catchable error, which for
+        // an extension means every backend dies and the server enters crash
+        // recovery. A handful of bytes must not be able to ask for terabytes.
+        for (label, blob) in [
+            ("m beyond the ceiling", header(1 << 40, 1024.0, 0, 1)),
+            (
+                "m times gamma beyond the degree cap",
+                header(128, 1024.0, 0, 1),
+            ),
+            ("top layer beyond the ceiling", header(16, 1.0, 1 << 40, 1)),
+        ] {
+            let err = Hnsw::from_bytes(&blob)
+                .expect_err(&format!("{label}: should be rejected, not decoded"));
+            assert!(
+                matches!(err, HnswDecodeError::Invalid(_)),
+                "{label}: expected a validation error, got {err:?}"
+            );
+        }
+    }
+
     fn assert_degree_caps(h: &Hnsw) {
         for id in 0..h.len() {
-            for (lc, nbrs) in h.links[id].iter().enumerate() {
+            for lc in 0..h.levels(id) {
+                let nbrs = h.neighbors(id, lc);
                 assert!(
                     nbrs.len() <= h.max_degree(lc),
                     "node {id} layer {lc}: {} neighbors > cap {}",
@@ -1619,7 +1983,11 @@ mod tests {
         h.delete(17).unwrap();
         h.delete(42).unwrap();
         let restored = Hnsw::from_bytes(&h.to_bytes()).expect("decode");
-        assert_eq!(restored.links, h.links, "neighbor lists must round-trip");
+        assert_eq!(
+            adjacency(&restored),
+            adjacency(&h),
+            "neighbor lists must round-trip"
+        );
         assert_eq!(restored.entry_point, h.entry_point);
         assert_eq!(restored.vectors, h.vectors);
         assert_eq!(restored.deleted, h.deleted);
@@ -1651,7 +2019,7 @@ mod tests {
             (h.m_cap, h.m0_cap),
             "degree caps must survive the round-trip"
         );
-        assert_eq!(restored.links, h.links);
+        assert_eq!(adjacency(&restored), adjacency(&h));
     }
 
     #[test]
