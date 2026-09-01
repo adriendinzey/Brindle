@@ -35,10 +35,10 @@ pg17 = ["pgrx/pg17", "pgrx-tests/pg17"]
 pg_test = []
 
 [dependencies]
-pgrx = "=0.12.9"
+pgrx = "=0.13.1"
 
 [dev-dependencies]
-pgrx-tests = "=0.12.9"
+pgrx-tests = "=0.13.1"
 # `cargo_bench_support` is required for the harness to run under `cargo bench`;
 # it is part of criterion's default features, which we otherwise drop to avoid
 # pulling in `plotters`/`rayon` for these tiny kernels.
