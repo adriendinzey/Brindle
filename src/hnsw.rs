@@ -39,6 +39,8 @@ pub enum HnswError {
     UnknownNode { id: usize },
     /// The graph is full: node ids are 32-bit, so it cannot grow further.
     NodeLimitReached { limit: usize },
+    /// A vector had more components than a graph can carry.
+    DimensionTooLarge { got: usize, max: usize },
 }
 
 impl std::fmt::Display for HnswError {
@@ -57,6 +59,9 @@ impl std::fmt::Display for HnswError {
                     f,
                     "graph is full: {limit} nodes is the ceiling for 32-bit ids"
                 )
+            }
+            HnswError::DimensionTooLarge { got, max } => {
+                write!(f, "vector has {got} dimensions, the maximum is {max}")
             }
         }
     }
@@ -775,6 +780,18 @@ impl Hnsw {
     ) -> Result<usize, HnswError> {
         if vector.is_empty() {
             return Err(HnswError::EmptyVector);
+        }
+        // Refused on the way in, not only on the way back. The decoder caps the
+        // dimension it will accept, because it sizes a buffer from that field
+        // before anything relates it to the payload's length — so a graph that
+        // took a wider vector would serialize to something it could never read
+        // back, and the index built from it would be unreadable rather than
+        // merely wrong. The two limits are the same number for that reason.
+        if vector.len() > HnswParams::MAX_DIM {
+            return Err(HnswError::DimensionTooLarge {
+                got: vector.len(),
+                max: HnswParams::MAX_DIM,
+            });
         }
         if self.dim == 0 {
             self.dim = vector.len();
