@@ -35,6 +35,12 @@ const SQL_NAME: &str = "brindle_vector";
 /// keeps the dimension count in the 16 bits the header reserves for it.
 pub const MAX_DIM: usize = 16_000;
 
+// The graph refuses a wider vector on the way in and the decoder refuses one on
+// the way back, using the core's own limit. If these two drifted apart, one side
+// would accept what the other could not read — an index that builds and is then
+// unusable, which is the failure this pairing exists to prevent.
+const _: () = assert!(MAX_DIM == crate::hnsw::HnswParams::MAX_DIM);
+
 /// Header of a `brindle_vector` value. The components follow it contiguously.
 #[repr(C)]
 struct VectorHeader {

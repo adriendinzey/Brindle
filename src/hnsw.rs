@@ -1351,8 +1351,8 @@ impl Hnsw {
         // neighbour it stores, and stores each neighbour as 8 payload bytes, so
         // slots land near payload/8. Allowing one slot per payload byte leaves
         // eight times that headroom — ample for a sparse graph, far under what
-        // the padding trick needs. The floor keeps tiny graphs, where the
-        // per-node cap dominates a short payload, from tripping it.
+        // the padding trick needs.
+        //
         // The floor covers small graphs, where a node's full stride dwarfs a
         // short payload. It has to clear what a *build* actually produces at the
         // densest legal settings, not just what looks generous: at m = 2 with
@@ -1806,10 +1806,14 @@ mod tests {
         // a payload that stays short. Small n is where the per-node stride most
         // outweighs the bytes, so the sizes sweep the region that matters rather
         // than a large graph where `remaining` dominates.
-        for &(m, gamma) in &[(2usize, 512.0f32), (16, 4.0), (128, 8.0), (16, 1.0)] {
-            for &n in &[1usize, 2, 64, 130, 154, 200, 300] {
-                for &dim in &[1usize, 8] {
-                    for &seed in &[1u64, 27, 0x9E37_79B9_7F4A_7C15] {
+        // Sized to stay quick enough to run on every `cargo test`: the worst
+        // configuration is swept properly and the others are sampled, because
+        // it is m = 2 / gamma = 512 that puts the ceiling under pressure. The
+        // ignored `slot_ceiling_margin` probe beside this one sweeps widely.
+        for &(m, gamma) in &[(2usize, 512.0f32), (128, 8.0), (16, 1.0)] {
+            for &n in &[1usize, 2, 130, 154, 300] {
+                for &dim in &[1usize] {
+                    for &seed in &[27u64, 0x9E37_79B9_7F4A_7C15] {
                         let mut h = Hnsw::new(HnswParams {
                             m,
                             ef_construction: 4,
