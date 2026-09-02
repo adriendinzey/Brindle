@@ -90,3 +90,11 @@ jobs:
 
       - name: Test
         run: cargo pgrx test pg${{ matrix.pg }}
+
+      # The cases `cargo pgrx test` structurally cannot run: it wraps each test
+      # in a transaction it rolls back, and VACUUM refuses to run inside one.
+      # This drives a real, committed database instead. It starts its own
+      # cluster from the pgrx config the init step above wrote, so it needs no
+      # connection details of its own.
+      - name: SQL tests (committed database)
+        run: PG=${{ matrix.pg }} scripts/sql_test.sh

@@ -42,15 +42,8 @@ PG="${PG:-17}"
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
 
-# Load the worktree's isolated PGRX_HOME / CARGO_TARGET_DIR, exactly as
-# scripts/pgx.sh does, so the bench uses this task's Postgres and build dir.
-if [[ -f "$repo_root/.cargo/worktree-env" ]]; then
-  # shellcheck disable=SC1091
-  . "$repo_root/.cargo/worktree-env"
-fi
-# Outside a task worktree PGRX_HOME is unset, and `set -u` would kill the script
-# with "unbound variable" instead of the clearer errors below.
-: "${PGRX_HOME:=$HOME/.pgrx}"
+# shellcheck disable=SC1091
+. "$repo_root/scripts/lib/pgenv.sh"
 
 case "${SHAPE:-uniform}" in
   clustered) clustered_flag="--set=clustered=1" ;;
@@ -58,32 +51,13 @@ case "${SHAPE:-uniform}" in
   *) echo "error: SHAPE must be 'uniform' or 'clustered', got '$SHAPE'" >&2; exit 1 ;;
 esac
 
-pg_config="$(cargo pgrx info pg-config "pg$PG" 2>/dev/null || true)"
-if [[ -z "$pg_config" ]]; then
-  echo "error: pg$PG is not initialized for this PGRX_HOME." >&2
-  echo "       run: cargo pgrx init --pg$PG download" >&2
-  exit 1
-fi
-bindir="$("$pg_config" --bindir)"
-# pgrx derives the running port from base_port in PGRX_HOME/config.toml, and
-# exposes no command to print it — read it the same way pgrx does. A stock
-# config.toml has no base_port key at all (only [configs]); pgrx falls back to
-# 28800 there, and so must this, or the script dies outside a task worktree —
-# exactly the case the PGRX_HOME default above exists to support. `|| true`
-# keeps a missing file from tripping `set -e` before the check below.
-base_port="$(awk '/^base_port/ { print $3 }' "$PGRX_HOME/config.toml" 2>/dev/null || true)"
-port=$(( ${base_port:-28800} + PG ))
+pgenv_load "$repo_root" "$PG"
 
 echo "==> installing the extension into pg$PG"
 cargo pgrx install --release --pg-config "$pg_config" >/dev/null
 
 echo "==> starting pg$PG (port $port)"
 cargo pgrx start "pg$PG" >/dev/null
-
-# pgrx points the postmaster's unix socket at PGRX_HOME rather than /tmp, so
-# every client needs --host; without it psql looks in the default socket dir and
-# reports the server as not running.
-host="$PGRX_HOME"
 
 db="brindle_bench"
 "$bindir/dropdb" --host "$host" --port "$port" --if-exists "$db" >/dev/null 2>&1 || true

@@ -376,10 +376,77 @@ unsafe extern "C" fn ambulkdelete(
 
 #[pg_guard]
 unsafe extern "C" fn amvacuumcleanup(
-    _info: *mut pg_sys::IndexVacuumInfo,
+    info: *mut pg_sys::IndexVacuumInfo,
     stats: *mut pg_sys::IndexBulkDeleteResult,
 ) -> *mut pg_sys::IndexBulkDeleteResult {
-    stats
+    // Postgres refreshes the index's pg_class.relpages/reltuples from whatever
+    // this returns, and skips the refresh on NULL — or on a result whose
+    // `estimated_count` is set, which a vacuum that skipped all-visible pages
+    // produces. Returning the input
+    // unchanged therefore left those stale for the common case: a VACUUM that
+    // finds no dead tuples never calls ambulkdelete, so nothing ever reported
+    // how far the index had grown since it was built. The planner was costing
+    // scans against the build-time size.
+    //
+    // SAFETY: `info` is Postgres' own vacuum state for this call. Postgres never
+    // passes NULL here, and the code below relies on that too.
+    if (*info).analyze_only {
+        // An analyze-only pass must not touch the index; it is only here to let
+        // an AM update its own statistics, and brindle keeps none of its own.
+        return stats;
+    }
+
+    // SAFETY: a non-NULL `stats` is Postgres' own, palloc'd in the vacuum
+    // context that outlives this call; otherwise allocating it is the AM's job.
+    let mut result = PgBox::from_pg(stats);
+    let fresh = result.is_null();
+    if fresh {
+        result = PgBox::<pg_sys::IndexBulkDeleteResult>::alloc0().into_pg_boxed();
+    }
+
+    // SAFETY: `info.index` is the open index relation Postgres locked for this
+    // vacuum.
+    let index = (*info).index;
+    result.num_pages =
+        pg_sys::RelationGetNumberOfBlocksInFork(index, pg_sys::ForkNumber::MAIN_FORKNUM);
+    if fresh {
+        // Only when ambulkdelete did not already count them.
+        //
+        // For a full index the vacuum's own heap count is the answer: every live
+        // heap tuple has an entry, and tombstones are exactly the rows the heap
+        // dropped. Asking the graph instead would turn a callback costing
+        // microseconds into one that reads the whole index on every vacuum that
+        // finds nothing to do.
+        //
+        // For a *partial* index it is not: `indpred` means most of those heap
+        // tuples have no entry here, and reporting the heap's total would
+        // overstate the index by however selective the predicate is — telling
+        // the planner to avoid the very index made partial to be cheap. Rather
+        // than guess, report nothing and leave its statistics where they were,
+        // which is where they would have stayed before this callback reported
+        // anything at all. Counting them properly means reading the index, and
+        // that trade belongs with the storage work, not here.
+        // Read the predicate from the catalog tuple, not `rd_indpred`: that
+        // field is filled in lazily by RelationGetIndexPredicate and is null
+        // here for a partial index nobody has planned against yet, which would
+        // report the heap's count for exactly the indexes this guards.
+        let partial = !pg_sys::heap_attisnull(
+            (*index).rd_indextuple,
+            pg_sys::Anum_pg_index_indpred as i32,
+            core::ptr::null_mut(),
+        );
+        if partial {
+            return stats;
+        }
+        result.num_index_tuples = (*info).num_heap_tuples;
+        // Truthfully: a vacuum that skipped all-visible pages did not count
+        // every tuple. Postgres skips the refresh entirely for an index whose
+        // result says so, which means the numbers above land on a vacuum that
+        // read the whole table and not otherwise — the honest cost of not
+        // reading the index to find out.
+        result.estimated_count = (*info).estimated_count;
+    }
+    result.into_pg()
 }
 
 // Signature fixed by the index AM ABI.
@@ -1035,6 +1102,11 @@ mod tests {
     /// tuples it reported removing. VACUUM itself cannot run inside the
     /// transaction wrapped around a test, so this drives the callback VACUUM
     /// would drive.
+    ///
+    /// That makes this a unit test of the callback, not of vacuuming: which rows
+    /// Postgres decides are dead, whether it calls the AM at all, and what it
+    /// does with the result are all outside it. `tests/sql/` covers the path
+    /// end to end against a committed database — see `scripts/sql_test.sh`.
     fn bulk_delete(index: &str, mut doomed: Vec<TidPair>) -> f64 {
         // SAFETY: the index exists; PgRelation keeps it open across the call,
         // and `doomed` outlives the callback that reads it.
