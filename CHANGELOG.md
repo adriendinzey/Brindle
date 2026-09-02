@@ -42,17 +42,44 @@ versions may break).
 
 ### Changed
 
-- The stored graph format now carries each row's filterable attribute values
-  (format version 2). Version 1 payloads are rejected rather than read as
+- A backend now keeps one decoded copy of an index in memory and reuses it
+  across scans, instead of reading and decoding the whole index for every query.
+  On a 100k × 128 index that takes a query from ~58 ms to ~0.3 ms. The first
+  scan in a backend still pays the full cost, as does the first after any write
+  invalidates the copy, so a connection that issues one query and disconnects
+  sees no benefit.
+- **The on-disk page layout is now version 2, and an index written by an earlier
+  build must be rebuilt with `REINDEX`.** (Distinct from the graph codec version
+  named below — they are separate numbers in separate headers, which is worth
+  knowing when reading an error message.) The metapage carries a generation
+  counter, which is how a backend tells whether the copy it holds is still the
+  index — including when another connection wrote to it, which Postgres does not
+  otherwise announce. Reading such an index reports the format it was written in
+  and names `REINDEX`.
+- The stored graph codec now carries each row's filterable attribute values
+  (codec version 2). Codec version 1 payloads are rejected rather than read as
   attribute-free, because that would let a filtered scan silently return no rows
   instead of failing; an index built by an earlier development build must be
   rebuilt with `REINDEX`. No released version wrote the old format.
+
+### Added
+
+- `brindle.cache_max_mb` (default 256) bounds the decoded index copies a backend
+  keeps. The copy is **per backend**, not shared between connections, so the
+  real cost is this ceiling times the number of connections that touch an index
+  — measured at about 887 bytes per node at 128 dimensions, so a 100k index is
+  roughly 89 MB of graph and rather more resident. Zero disables the cache, and
+  an index that does not fit is decoded per scan as before.
 
 ### Known limitations
 
 - A scan returns at most `brindle.ef_search` rows, so a larger `LIMIT` — or an
   `ORDER BY` with none — comes back short. Raise the setting to see further. The
   ceiling is what makes the ordering guarantee hold.
+- The decoded-index cache is per backend and unshared, so a server with many
+  connections against a large index holds many copies of it. Lowering
+  `brindle.cache_max_mb` bounds each backend; nothing bounds the total. Paged
+  storage would put one copy in the shared buffer cache for the whole server.
 - Every `INSERT` or `UPDATE` of an indexed row rewrites the whole stored graph,
   so write cost grows with index size. Writes are correct and immediately
   searchable, but a bulk load is still far faster as `COPY` followed by

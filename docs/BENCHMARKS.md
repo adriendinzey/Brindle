@@ -85,7 +85,7 @@ connected, or one whose copy a writer invalidated, pays **57.9 ms** (p95
 65.7 ms) — measured in the same run, and unchanged by any of this. Before the
 cache, every query paid it.
 
-Build: **106.0 s**, observed 112.5–116.3 s across runs on this machine — read
+Build: **106.0 s**, observed 106–116 s across runs on this machine — read
 it as "under two minutes", not to the tenth. Index: **77 MB** (heap: 56 MB).
 
 Recall reproduces to three decimals on every run — the build takes a fixed RNG
@@ -253,13 +253,15 @@ side, which makes a comparison partly a comparison of protocols.
 | build, `max_parallel_maintenance_workers = 0` | 106.0 s | 39.2 s |
 | index size | 77 MB | 79 MB |
 
-**Latency: two orders of magnitude, and the ratio is not a constant.** It is
-on the warm path Brindle is now **faster**: 0.34 ms against 0.60 ms at
+**Latency: it depends entirely on which path you are on.** On the warm path
+Brindle is now **faster**: 0.34 ms against 0.60 ms at
 `ef_search = 64`, and ahead at every sweep point. Both sides are answering from
 memory, so this is a fair comparison of like with like — with one asymmetry that
 belongs in the headline rather than a footnote. **pgvector's working set is in
 the shared buffer cache, sized once for the server; Brindle's is a private copy
-per backend**, about 89 MB for this index. Brindle is faster here partly by
+per backend**, about 89 MB of graph for this index — and a backend's resident
+size after warming it is nearer 143 MB, since the allocator holds on to what the
+decode passed through. Brindle is faster here partly by
 spending memory pgvector does not.
 
 Cold, Brindle is 57.9 ms against the same 0.60 ms — **96× slower**. Which figure
@@ -269,12 +271,12 @@ of magnitude, not necessarily faster yet", and this misses it by two.
 
 **Build: ~2.75× slower, not ~6.5×.** pgvector builds in parallel by default and
 Brindle is single-threaded, so comparing defaults compares a three-backend
-build against a one-backend one. At matched single-threadedness it is 114.0 s
-against 41.4 s. (The serial setting was verified to take effect rather than
+build against a one-backend one. At matched single-threadedness it is 106.0 s
+against 39.2 s. (The serial setting was verified to take effect rather than
 assumed — an out-of-band check, not part of either run above: the build shows
 zero parallel workers in `pg_stat_activity` where the default run shows two.)
 
-**Recall is within about a point** — 0.966 against 0.976 at `ef_search = 64` in
+**Recall is within about a point** — 0.966 against 0.978 at `ef_search = 64` in
 this run. Read the next section before quoting that gap as a value.
 
 ### Why the pgvector recall figures are one sample and Brindle's are not
@@ -361,10 +363,10 @@ Recorded because a comparison whose asymmetries are hidden is worse than none.
 
 ## Follow-ups this baseline argues for
 
-- **Paged storage** is now quantified rather than asserted: search is a low
-  the dominant cost of a *cold* scan at ~58 ms, which a per-backend cache moves
-  off the warm path without removing — and which paged storage would remove for
-  the whole server rather than per connection.
+- **Paged storage** is now quantified rather than asserted: reading and decoding
+  the index is the whole of a *cold* scan at ~58 ms, which a per-backend cache
+  moves off the warm path without removing — and which paged storage would
+  remove for the whole server rather than per connection.
 - **Recall plateaus at 0.974 and more budget does not help.** Between
   `ef_search` 128 and 256 recall does not move. That ceiling is build quality,
   not search effort: at `ef_construction = 64` the graph does not contain the

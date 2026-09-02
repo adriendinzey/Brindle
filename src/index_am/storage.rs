@@ -521,16 +521,29 @@ unsafe fn read_meta(index: pg_sys::Relation) -> (pg_sys::BlockNumber, usize, u64
 
     let mut meta_bytes = Vec::new();
     read_page_contents(index, 0, &mut meta_bytes);
-    let meta: &[u8; META_SIZE] = meta_bytes
-        .first_chunk::<META_SIZE>()
+    // Magic and version are read before the length check, because an index
+    // written by an older build has a *shorter* metapage — so checking the size
+    // first would report it as corrupt when it is merely old, and say nothing
+    // about what to do. Both fields sit at the same offsets in every version,
+    // which is what makes reading them out of a short metapage safe.
+    let header: &[u8; 8] = meta_bytes
+        .first_chunk::<8>()
         .unwrap_or_else(|| error!("brindle: metapage too short ({} bytes)", meta_bytes.len()));
-    let (magic, version, blob_len, generation) = decode_meta(meta);
+    let magic = u32::from_le_bytes([header[0], header[1], header[2], header[3]]);
     if magic != META_MAGIC {
         error!("brindle: bad metapage magic {magic:#x}");
     }
+    let version = u32::from_le_bytes([header[4], header[5], header[6], header[7]]);
     if version != STORAGE_VERSION {
-        error!("brindle: unsupported storage version {version}");
+        error!(
+            "brindle: index was written in storage format {version}, this build reads {STORAGE_VERSION}; REINDEX to rebuild it"
+        );
     }
+
+    let meta: &[u8; META_SIZE] = meta_bytes
+        .first_chunk::<META_SIZE>()
+        .unwrap_or_else(|| error!("brindle: metapage too short ({} bytes)", meta_bytes.len()));
+    let (_, _, blob_len, generation) = decode_meta(meta);
     let blob_len = usize::try_from(blob_len)
         .unwrap_or_else(|_| error!("brindle: metapage blob length out of range"));
     // Never trust a length the relation can't physically hold — it would turn

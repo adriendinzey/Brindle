@@ -8,7 +8,7 @@ implementation needs to decide about *bytes on pages* is decided here; what is
 left open is listed in [§ 12](#12-left-to-the-implementation).
 
 Status: **specification** (format version 2). The shipping code still uses the
-interim format version 1 described in [§ 2](#2-what-this-replaces).
+interim blob format described in [§ 2](#2-what-this-replaces).
 
 ---
 
@@ -39,7 +39,7 @@ interim format version 1 described in [§ 2](#2-what-this-replaces).
 
 ## 2. What this replaces
 
-The interim format (version 1, `src/index_am/storage.rs`) serializes the entire
+The interim blob format (`src/index_am/storage.rs`) serializes the entire
 in-memory graph — every vector, every adjacency list — into one opaque blob,
 splits it across pages, and re-reads it whole whenever the copy a backend holds
 is no longer current:
@@ -54,10 +54,10 @@ block N   ┘
 
 Consequences, all of which this design exists to remove:
 
-| | Version 1 (blob) | Version 2 (pages) |
+| | Interim (blob) | Paged |
 |---|---|---|
 | Scan startup | read the metapage; deserialize the whole index if this backend has no current copy | read the metapage |
-| Scan working set | one decoded copy per backend, bounded by `brindle.cache_max_mb` | shared buffer cache |
+| Scan working set | decoded copies per backend, bounded per backend by `brindle.cache_max_mb` — nothing bounds the total across connections | shared buffer cache, one copy for the server |
 | Insert cost | O(index) CPU: load, mutate, write back | O(m · log n) page reads, O(m) page writes |
 | Insert WAL | O(index) — a 4 MB index logs ~4 MB per row | O(m) page images |
 | Vacuum tombstone | rewrite the whole image | flip one byte on one page |
@@ -146,7 +146,7 @@ Two exceptions, both load-bearing:
 
 The metapage is written into the page's content area — directly after the
 standard header, at `PageGetContents`, with `pd_lower` marking its end — and
-**not** as a line-pointer item. That is where version 1 puts its own metapage
+**not** as a line-pointer item. That is where the blob format puts its own metapage
 and where pgvector puts its HNSW metapage, and it is what makes the version
 check in [§ 11](#11-migration-from-the-interim-format) work: `magic` and
 `version` land at the same page offsets (24 and 28) in both formats, so
