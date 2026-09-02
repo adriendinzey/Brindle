@@ -73,40 +73,75 @@ BEGIN
     END IF;
 END $$;
 
--- REINDEX replaces the image wholesale, and the replacement starts its
--- generation over — so a copy cached at the same number would match by
--- coincidence rather than by being current. Postgres invalidates the relcache
--- entry, which drops the cache with it; this checks that it really does, since
--- the generation alone would not catch it.
+-- REINDEX writes a new relfilenode, so a cached copy keyed on the old one can
+-- never be mistaken for the new index. Asserting that deleted rows stop being
+-- returned would prove nothing — Postgres rechecks heap visibility for every TID
+-- an index scan hands back, so they disappear whether or not the index knows.
+-- An earlier version of this block did exactly that and passed against a
+-- knowingly stale cache with no REINDEX at all.
+--
+-- What a stale copy actually does is return *too few* rows: it still holds the
+-- deleted nodes, the recheck drops them, and the scan comes up short. So count.
 DELETE FROM cache_x WHERE id <= 150;
 REINDEX INDEX cache_x_idx;
 
 DO $$
-DECLARE leaked int[];
+DECLARE got int[]; want int[];
 BEGIN
     SET LOCAL enable_seqscan = off;
-    SELECT array_agg(id) INTO leaked
+    SELECT array_agg(id ORDER BY id) INTO got
     FROM (SELECT id FROM cache_x
-          ORDER BY embedding <-> ARRAY[1.0, 2.0]::real[] LIMIT 40) s
-    WHERE id <= 150;
-    IF leaked IS NOT NULL THEN
+          ORDER BY embedding <-> ARRAY[151.0, 152.0]::real[] LIMIT 20) s;
+    SELECT array_agg(i ORDER BY i) INTO want FROM generate_series(151, 170) i;
+    IF got IS DISTINCT FROM want THEN
         RAISE EXCEPTION
-            'index returned rows % after REINDEX; a cached copy survived the '
-            'rebuild that removed them', leaked;
+            'after REINDEX the index returned % for the 20 nearest to [151,152], '
+            'expected %; a copy cached before the rebuild would come up short',
+            got, want;
     END IF;
 END $$;
 
--- TRUNCATE empties the table and rebuilds the index; nothing may survive it.
+-- TRUNCATE also writes a new relfilenode, and empties the table. A stale copy
+-- would still hold every node; the recheck hides them, so again count rather
+-- than look for leaks — then refill and require the new rows to be findable,
+-- which a copy from before the truncate cannot do.
 TRUNCATE cache_x;
+INSERT INTO cache_x
+SELECT i, ARRAY[i::real, (i + 1)::real] FROM generate_series(7000, 7099) i;
 
 DO $$
-DECLARE remaining bigint;
+DECLARE nearest int; total bigint;
 BEGIN
     SET LOCAL enable_seqscan = off;
-    SELECT count(*) INTO remaining
+    SELECT count(*) INTO total
     FROM (SELECT id FROM cache_x
-          ORDER BY embedding <-> ARRAY[1.0, 2.0]::real[] LIMIT 10) s;
-    IF remaining <> 0 THEN
-        RAISE EXCEPTION 'index returned % rows after TRUNCATE', remaining;
+          ORDER BY embedding <-> ARRAY[7050.0, 7051.0]::real[] LIMIT 10) s;
+    IF total <> 10 THEN
+        RAISE EXCEPTION
+            'after TRUNCATE and refill the index returned % of 10 rows; a copy '
+            'cached before the truncate does not contain them', total;
+    END IF;
+    SELECT id INTO nearest FROM cache_x
+    ORDER BY embedding <-> ARRAY[7050.0, 7051.0]::real[] LIMIT 1;
+    IF nearest <> 7050 THEN
+        RAISE EXCEPTION 'nearest after TRUNCATE and refill was %, expected 7050', nearest;
+    END IF;
+END $$;
+
+-- Dropping and recreating the index is the third way its identity changes, and
+-- the acceptance criteria name it separately.
+DROP INDEX cache_x_idx;
+CREATE INDEX cache_x_idx ON cache_x USING brindle (embedding);
+INSERT INTO cache_x SELECT 7500, ARRAY[7500.0::real, 7501.0::real];
+
+DO $$
+DECLARE nearest int;
+BEGIN
+    SET LOCAL enable_seqscan = off;
+    SELECT id INTO nearest FROM cache_x
+    ORDER BY embedding <-> ARRAY[7500.0, 7501.0]::real[] LIMIT 1;
+    IF nearest <> 7500 THEN
+        RAISE EXCEPTION
+            'after DROP and CREATE the index answered %, expected 7500', nearest;
     END IF;
 END $$;

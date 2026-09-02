@@ -602,15 +602,15 @@ pub unsafe fn load_index(index: pg_sys::Relation) -> (Hnsw, Vec<TidPair>) {
 ///
 /// Every scan otherwise re-reads and re-decodes the whole index before it can
 /// walk it, which is where a query's time goes. This holds one decoded copy per
-/// index relation per backend, good while the generation it was decoded at still
-/// matches the metapage.
+/// index per backend, good while the generation it was decoded at still matches
+/// the metapage.
 ///
-/// It is per-backend and bounded only by `brindle.cache_max_mb`, which is the
-/// trade: memory for latency, somewhere the buffer manager cannot share it.
-/// Paged storage replaces this with a shared, bounded cache; it is not a
-/// substitute for that.
+/// It is per-backend and invisible to every other connection, which is the trade
+/// being made: memory the buffer manager cannot share, for latency. Paged
+/// storage replaces it with a shared, bounded cache; this is not a substitute.
 pub struct CachedIndex {
     generation: u64,
+    bytes: usize,
     hnsw: Hnsw,
     tids: Vec<TidPair>,
 }
@@ -619,23 +619,33 @@ pub struct CachedIndex {
 /// anything else in the same backend may replace it — an insert bumps the
 /// generation, and the next scan finds the copy stale. Dropping the cache's
 /// reference then leaves a scan still holding one, and the graph lives until
-/// that scan ends. Freeing it outright instead is a use-after-free, which is
-/// what an earlier version of this did.
+/// that scan ends. Freeing it outright instead is a use-after-free.
 type CacheRef = std::rc::Rc<CachedIndex>;
 
-/// The relcache entry's slot, palloc'd in `rd_indexcxt` so the reset callback
-/// registered against it has somewhere stable to look. `rd_amcache` points here
-/// rather than at the graph, so replacing the cached copy never leaves the
-/// callback holding a pointer that has been freed.
-struct CacheSlot {
-    entry: Option<CacheRef>,
+/// Identifies the *physical* relation, so a REINDEX, TRUNCATE or VACUUM FULL —
+/// each of which writes a new relfilenode — cannot be mistaken for the index the
+/// cached copy came from, whatever its generation happens to say.
+type CacheKey = (pg_sys::Oid, pg_sys::Oid, pg_sys::RelFileNumber);
+
+thread_local! {
+    /// The backend's decoded indexes.
+    ///
+    /// Deliberately *not* hung off `rd_amcache`. That field's contract is a
+    /// single palloc'd chunk which Postgres frees outright on a relcache
+    /// invalidation — without running memory-context callbacks, since those fire
+    /// on reset, not on pfree. Ownership reachable only from there is therefore
+    /// dropped on the floor by routine events (ALTER, REINDEX, an autovacuum
+    /// stats update, a sinval overflow), leaking a whole decoded graph each
+    /// time, and leaves any registered callback pointing into a freed chunk that
+    /// the allocator has already written its freelist link across.
+    ///
+    /// A Postgres backend is single-threaded, so thread-local is backend-local.
+    static CACHE: std::cell::RefCell<std::collections::HashMap<CacheKey, CacheRef>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
 }
 
 /// What a reader gets back: the backend's cached copy, or a decode owned by the
-/// caller when the index is too large to keep.
-///
-/// The second case exists so exceeding the ceiling degrades to the old
-/// behaviour — decode per scan — rather than to an unbounded cache.
+/// caller when caching is off or the index does not fit.
 pub enum IndexHandle {
     Cached(CacheRef),
     /// Boxed so the handle stays small: a graph inline would make every handle,
@@ -659,51 +669,18 @@ impl IndexHandle {
     }
 }
 
-/// Drops the slot's reference when the relcache entry that owns it goes away.
-///
-/// The slot is palloc'd, but the graph behind it is a Rust allocation that
-/// resetting the context would not free — Postgres frees only what it palloc'd.
-/// Running `Option::take` rather than freeing a captured pointer is what keeps
-/// this correct across replacement.
-unsafe extern "C" fn drop_cache_slot(arg: *mut core::ffi::c_void) {
-    if !arg.is_null() {
-        drop((*arg.cast::<CacheSlot>()).entry.take());
-    }
-}
-
 /// Rough resident size of a decoded graph, for comparison against the ceiling.
-fn cached_bytes(hnsw: &Hnsw, tids: &[TidPair]) -> usize {
-    hnsw.resident_bytes() + core::mem::size_of_val(tids)
+fn cached_bytes(hnsw: &Hnsw, tids: &Vec<TidPair>) -> usize {
+    // Capacity rather than length, matching `resident_bytes`: an under-estimate
+    // would let the cache sit over its ceiling.
+    hnsw.resident_bytes() + tids.capacity() * core::mem::size_of::<TidPair>()
 }
 
-/// This backend's slot for `index`, created on first use.
-///
 /// # Safety
 /// `index` must be an open index relation.
-unsafe fn cache_slot(index: pg_sys::Relation) -> *mut CacheSlot {
-    if !(*index).rd_amcache.is_null() {
-        return (*index).rd_amcache.cast::<CacheSlot>();
-    }
-    // SAFETY: rd_indexcxt is the relcache entry's own context. It outlives every
-    // scan against the entry and is reset exactly when the entry is dropped,
-    // which is when the cached graph must go too.
-    let slot =
-        pg_sys::MemoryContextAllocZero((*index).rd_indexcxt, core::mem::size_of::<CacheSlot>())
-            .cast::<CacheSlot>();
-    slot.write(CacheSlot { entry: None });
-
-    let callback = pg_sys::MemoryContextAlloc(
-        (*index).rd_indexcxt,
-        core::mem::size_of::<pg_sys::MemoryContextCallback>(),
-    )
-    .cast::<pg_sys::MemoryContextCallback>();
-    (*callback).func = Some(drop_cache_slot);
-    (*callback).arg = slot.cast();
-    (*callback).next = core::ptr::null_mut();
-    pg_sys::MemoryContextRegisterResetCallback((*index).rd_indexcxt, callback);
-
-    (*index).rd_amcache = slot.cast();
-    slot
+unsafe fn cache_key(index: pg_sys::Relation) -> CacheKey {
+    let locator = (*index).rd_locator;
+    (locator.spcOid, locator.dbOid, locator.relNumber)
 }
 
 /// The decoded index — this backend's copy when it is still current.
@@ -718,37 +695,71 @@ pub unsafe fn cached_index(index: pg_sys::Relation) -> IndexHandle {
     let (_, _, generation) = read_meta(index);
     pg_sys::UnlockPage(index, IMAGE_LOCK_BLOCK, pg_sys::ShareLock as i32);
 
-    // Read the ceiling before consulting the cache, not after deciding to fill
-    // it: lowering it mid-session has to stop this backend *using* what it
-    // already holds, or "zero disables caching" would only mean "stop adding to
-    // it" — which is not what the setting says, and left a scan answering from a
-    // copy the operator had just told it to give up.
+    // Read the ceiling before consulting the cache rather than only before
+    // filling it. Lowering it has to stop a backend *using* what it already
+    // holds, or the setting means "stop adding" rather than what it says.
     let ceiling = crate::guc::cache_max_mb() as usize * 1024 * 1024;
+    let key = cache_key(index);
 
-    let slot = cache_slot(index);
-    if let Some(entry) = (*slot).entry.as_ref() {
-        if ceiling > 0 && entry.generation == generation {
-            return IndexHandle::Cached(entry.clone());
+    let hit = CACHE.with(|c| {
+        let mut cache = c.borrow_mut();
+        if ceiling == 0 {
+            // Caching switched off: give up everything, not just this entry.
+            cache.clear();
+            return None;
         }
-        // Written since this copy was decoded — possibly by another backend,
-        // which sends no relcache invalidation for ordinary DML. This comparison
-        // is the only thing between a reader and answers from an index that no
-        // longer exists.
-        (*slot).entry = None;
+        match cache.get(&key) {
+            // Written since this copy was decoded — possibly by another backend,
+            // which sends no relcache invalidation for ordinary DML. This
+            // comparison is the only thing between a reader and answers from an
+            // index that no longer exists.
+            Some(entry) if entry.generation != generation => {
+                cache.remove(&key);
+                None
+            }
+            // Over a ceiling that has since been lowered.
+            Some(entry) if entry.bytes > ceiling => {
+                cache.remove(&key);
+                None
+            }
+            Some(entry) => Some(entry.clone()),
+            None => None,
+        }
+    });
+    if let Some(entry) = hit {
+        return IndexHandle::Cached(entry);
     }
 
     let (hnsw, tids) = load_index(index);
-
-    if ceiling == 0 || cached_bytes(&hnsw, &tids) > ceiling {
+    let bytes = cached_bytes(&hnsw, &tids);
+    if ceiling == 0 || bytes > ceiling {
         return IndexHandle::Fresh(Box::new((hnsw, tids)));
     }
 
     let entry: CacheRef = std::rc::Rc::new(CachedIndex {
         generation,
+        bytes,
         hnsw,
         tids,
     });
-    (*slot).entry = Some(entry.clone());
+    CACHE.with(|c| {
+        let mut cache = c.borrow_mut();
+        // The ceiling bounds the backend, not one index: several indexes each
+        // under it would otherwise add up past it without ever tripping. Nothing
+        // here is smart about which to drop — a backend over budget is already
+        // in trouble, and a scan holding a reference keeps its own copy alive
+        // regardless.
+        let mut total: usize = cache.values().map(|e| e.bytes).sum();
+        while total + bytes > ceiling {
+            let Some(victim) = cache.keys().next().copied() else {
+                break;
+            };
+            if let Some(dropped) = cache.remove(&victim) {
+                total = total.saturating_sub(dropped.bytes);
+            }
+        }
+        cache.insert(key, entry.clone());
+    });
     IndexHandle::Cached(entry)
 }
 
