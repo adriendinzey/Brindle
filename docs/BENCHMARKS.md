@@ -48,7 +48,7 @@ this file should ever gate a merge.
 
 | | |
 |---|---|
-| Commit | `2173c6d` |
+| Commit | `d1e80fd` |
 | Machine | Intel i7-9700K @ 3.6 GHz, 8 cores, 15 GB RAM, WSL2 (kernel 6.18) |
 | PostgreSQL | 17.10, pgrx-managed, default `postgresql.conf` |
 | Build | `cargo build --release`, no `target-cpu` flag (baseline x86-64) |

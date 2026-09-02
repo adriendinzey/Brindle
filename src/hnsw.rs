@@ -39,6 +39,8 @@ pub enum HnswError {
     UnknownNode { id: usize },
     /// The graph is full: node ids are 32-bit, so it cannot grow further.
     NodeLimitReached { limit: usize },
+    /// A vector had more components than a graph can carry.
+    DimensionTooLarge { got: usize, max: usize },
 }
 
 impl std::fmt::Display for HnswError {
@@ -57,6 +59,9 @@ impl std::fmt::Display for HnswError {
                     f,
                     "graph is full: {limit} nodes is the ceiling for 32-bit ids"
                 )
+            }
+            HnswError::DimensionTooLarge { got, max } => {
+                write!(f, "vector has {got} dimensions, the maximum is {max}")
             }
         }
     }
@@ -114,6 +119,17 @@ impl HnswParams {
     /// this is the number that turns a small blob into a large allocation. The
     /// same ceiling is enforced when an index is created.
     pub const MAX_LAYER0_DEGREE: usize = 2048;
+
+    /// Largest dimensionality a graph may declare.
+    ///
+    /// The decode reads each node's vector through a scratch buffer sized from
+    /// this field, before anything relates it to how many bytes the payload
+    /// actually holds — so without a ceiling an 85-byte blob can ask the
+    /// allocator for gigabytes, and a failed allocation aborts the process
+    /// rather than raising an error a session can catch. Matches the limit the
+    /// SQL vector type enforces on input, so no vector that can be stored can
+    /// fail to decode.
+    pub const MAX_DIM: usize = 16_000;
 
     /// Ceiling on a graph's top layer. Levels are drawn geometrically, so even
     /// at the smallest permitted `m` the chance of reaching this is ~2⁻⁶⁴: a
@@ -765,6 +781,18 @@ impl Hnsw {
         if vector.is_empty() {
             return Err(HnswError::EmptyVector);
         }
+        // Refused on the way in, not only on the way back. The decoder caps the
+        // dimension it will accept, because it sizes a buffer from that field
+        // before anything relates it to the payload's length — so a graph that
+        // took a wider vector would serialize to something it could never read
+        // back, and the index built from it would be unreadable rather than
+        // merely wrong. The two limits are the same number for that reason.
+        if vector.len() > HnswParams::MAX_DIM {
+            return Err(HnswError::DimensionTooLarge {
+                got: vector.len(),
+                max: HnswParams::MAX_DIM,
+            });
+        }
         if self.dim == 0 {
             self.dim = vector.len();
         } else if vector.len() != self.dim {
@@ -1263,6 +1291,9 @@ impl Hnsw {
             return Err(HnswDecodeError::Invalid("ef_construction below floor"));
         }
         let dim = r.read_len()?;
+        if dim > HnswParams::MAX_DIM {
+            return Err(HnswDecodeError::Invalid("dimension out of range"));
+        }
         let max_layer = r.read_len()?;
         if max_layer > HnswParams::MAX_LAYER {
             return Err(HnswDecodeError::Invalid("top layer out of range"));
@@ -1305,6 +1336,34 @@ impl Hnsw {
         // because `vector_bytes` can be near `usize::MAX` on a crafted blob.
         let min_node_bytes = 25usize.saturating_add(vector_bytes);
         let plausible_n = n.min(r.remaining() / min_node_bytes);
+        // Ceiling on the link slots the whole graph may reserve.
+        //
+        // The header bounds alone do not constrain this. Fixed stride reserves a
+        // node's full degree cap on every layer it claims, so one 8-byte layer
+        // count can reserve `cap * 4` bytes of padding the payload never has to
+        // fill — a node declaring the maximum layers with no neighbours at all
+        // costs a few hundred bytes and reserves a few hundred kilobytes. At the
+        // permitted extremes that is a thousandfold, and a Vec reservation that
+        // fails aborts the process rather than raising an error a session can
+        // catch, which for an extension means every backend dies.
+        //
+        // A graph a build actually produces reserves roughly one slot per
+        // neighbour it stores, and stores each neighbour as 8 payload bytes, so
+        // slots land near payload/8. Allowing one slot per payload byte leaves
+        // eight times that headroom — ample for a sparse graph, far under what
+        // the padding trick needs.
+        //
+        // The floor covers small graphs, where a node's full stride dwarfs a
+        // short payload. It has to clear what a *build* actually produces at the
+        // densest legal settings, not just what looks generous: at m = 2 with
+        // gamma = 512 the layer-0 cap lands exactly on its ceiling, half the
+        // nodes draw a second layer, and a few hundred nodes then reserve past
+        // 256K slots — rejecting one of those would make an index that exists
+        // permanently unreadable, which is worse than the allocation it guards
+        // against. Sized to clear the worst observed by a wide margin; at any
+        // size where an attacker gains from the padding, `remaining` dominates
+        // and the floor is irrelevant.
+        let max_slots = r.remaining().saturating_add(1 << 22);
         // Sized from `plausible_n` so the decode does not reallocate, and flat so
         // it does not allocate per node at all. `links` is sized for the common
         // case of a single layer; nodes above layer 0 grow it, which is rare.
@@ -1314,7 +1373,10 @@ impl Hnsw {
         let mut layer_base: Vec<u32> = Vec::with_capacity(plausible_n + 1);
         layer_base.push(0);
         let mut link_counts: Vec<u32> = Vec::with_capacity(plausible_n);
-        let mut links: Vec<u32> = Vec::with_capacity(plausible_n * slot0);
+        // Clamped by the same ceiling as the per-node growth below: the
+        // reservation is itself an allocation, and sizing it from the header
+        // alone is how a small payload asks for gigabytes up front.
+        let mut links: Vec<u32> = Vec::with_capacity((plausible_n * slot0).min(max_slots));
         let mut attrs: Vec<Vec<AttrValue>> = Vec::with_capacity(plausible_n);
         let mut scratch: Vec<u8> = Vec::new();
         let mut deleted: Vec<bool> = Vec::with_capacity(plausible_n);
@@ -1353,6 +1415,11 @@ impl Hnsw {
             );
             let node_slots = slot0 + (levels - 1) * slot_up;
             let node_start = links.len();
+            if node_start.saturating_add(node_slots) > max_slots {
+                return Err(HnswDecodeError::Invalid(
+                    "link storage exceeds what the payload could describe",
+                ));
+            }
             links.resize(node_start + node_slots, 0);
             for layer in 0..levels {
                 let count = r.read_len()?;
@@ -1619,6 +1686,18 @@ mod tests {
     /// Header for a blob that is well-formed up to the fields under test, so a
     /// case fails on the bound it targets rather than on framing.
     fn header(m: u64, gamma: f32, max_layer: u64, n: u64) -> Vec<u8> {
+        header_ef(m, gamma, max_layer, n, 64)
+    }
+
+    /// As [`header`], with an explicit `ef_construction`. A densified graph
+    /// floors it at the layer-0 cap, so a fixture using a large gamma has to
+    /// supply one or it is rejected before reaching what it meant to test.
+    fn header_ef(m: u64, gamma: f32, max_layer: u64, n: u64, ef: u64) -> Vec<u8> {
+        header_dim(m, gamma, max_layer, n, ef, 2)
+    }
+
+    /// As [`header_ef`], with an explicit `dim`.
+    fn header_dim(m: u64, gamma: f32, max_layer: u64, n: u64, ef: u64, dim: u64) -> Vec<u8> {
         let mut b = Vec::new();
         b.extend_from_slice(&CODEC_MAGIC.to_le_bytes());
         b.extend_from_slice(&CODEC_VERSION.to_le_bytes());
@@ -1626,14 +1705,199 @@ mod tests {
         b.push(0);
         b.extend_from_slice(&m.to_le_bytes());
         b.extend_from_slice(&gamma.to_bits().to_le_bytes());
-        b.extend_from_slice(&64u64.to_le_bytes()); // ef_construction
-        b.extend_from_slice(&2u64.to_le_bytes()); // dim
+        b.extend_from_slice(&ef.to_le_bytes()); // ef_construction
+        b.extend_from_slice(&dim.to_le_bytes()); // dim
         b.extend_from_slice(&max_layer.to_le_bytes());
         b.extend_from_slice(&1u64.to_le_bytes()); // seed
         b.extend_from_slice(&1u64.to_le_bytes()); // rng
         b.extend_from_slice(&0u64.to_le_bytes()); // entry point
         b.extend_from_slice(&n.to_le_bytes());
         b
+    }
+
+    /// Reports how close a graph a build actually produces comes to the
+    /// decode's slot ceiling. Ignored by default — it is a margin probe rather
+    /// than an assertion, and it takes a couple of minutes.
+    ///
+    /// Run it after changing the floor, `MAX_LAYER0_DEGREE`, or the stride:
+    ///
+    /// ```text
+    /// cargo test --release --features pg17 --lib slot_ceiling_margin -- --ignored --nocapture
+    /// ```
+    ///
+    /// The floor was raised to 1 << 22 because 1 << 18 refused real graphs. At
+    /// the time of writing the worst legitimate case uses 19.5% of the ceiling
+    /// (m = 2, gamma = 512, n = 300, dim = 1), against 105% before.
+    #[test]
+    #[ignore]
+    fn slot_ceiling_margin() {
+        let mut worst = 0.0f64;
+        let mut worst_desc = String::new();
+        for &(m, gamma) in &[
+            (2usize, 512.0f32),
+            (2, 256.0),
+            (3, 341.0),
+            (4, 256.0),
+            (16, 4.0),
+            (128, 8.0),
+        ] {
+            for seed in 1u64..=40 {
+                for n in [1usize, 2, 64, 130, 154, 200, 300] {
+                    for dim in [1usize, 8] {
+                        let mut h = Hnsw::new(HnswParams {
+                            m,
+                            ef_construction: 4,
+                            gamma,
+                            metric: Metric::L2,
+                            seed,
+                        });
+                        let mut st = seed | 1;
+                        for _ in 0..n {
+                            let v: Vec<f32> = (0..dim)
+                                .map(|_| {
+                                    st ^= st << 13;
+                                    st ^= st >> 7;
+                                    st ^= st << 17;
+                                    (st >> 11) as f32 / (1u64 << 53) as f32
+                                })
+                                .collect();
+                            if h.insert(v).is_err() {
+                                break;
+                            }
+                        }
+                        let bytes = h.to_bytes();
+                        let budget = (bytes.len() - 76) + (1 << 22);
+                        let slots: usize = (0..h.len())
+                            .map(|id| (h.m0_cap + 1) + (h.levels(id) - 1) * (h.m_cap + 1))
+                            .sum();
+                        let ratio = slots as f64 / budget as f64;
+                        if ratio > worst {
+                            worst = ratio;
+                            worst_desc = format!(
+                                "m={m} gamma={gamma} n={n} dim={dim} seed={seed} \
+                                 slots={slots} budget={budget}"
+                            );
+                        }
+                        assert!(
+                            Hnsw::from_bytes(&bytes).is_ok(),
+                            "the ceiling refused a graph this build produced: {worst_desc}"
+                        );
+                    }
+                }
+            }
+        }
+        println!(
+            "worst legitimate use of the slot ceiling: {:.1}% -- {worst_desc}",
+            worst * 100.0
+        );
+    }
+
+    #[test]
+    fn decodes_graphs_built_at_the_densest_legal_settings() {
+        // The slot ceiling guards against a payload reserving far more than it
+        // describes, and the cost of getting it wrong is asymmetric: too loose
+        // risks an allocation abort, too tight makes an index that already
+        // exists permanently unreadable. This walks the side the attack-shaped
+        // test cannot see.
+        //
+        // m = 2 with gamma = 512 is the worst legal case, not an arbitrary one:
+        // it puts the layer-0 cap exactly on its ceiling while ml = 1/ln 2 sends
+        // half the nodes to a second layer, so the wide upper stride is paid on
+        // a payload that stays short. Small n is where the per-node stride most
+        // outweighs the bytes, so the sizes sweep the region that matters rather
+        // than a large graph where `remaining` dominates.
+        // Sized to stay quick enough to run on every `cargo test`: the worst
+        // configuration is swept properly and the others are sampled, because
+        // it is m = 2 / gamma = 512 that puts the ceiling under pressure. The
+        // ignored `slot_ceiling_margin` probe beside this one sweeps widely.
+        for &(m, gamma) in &[(2usize, 512.0f32), (128, 8.0), (16, 1.0)] {
+            for &n in &[1usize, 2, 130, 154, 300] {
+                for &dim in &[1usize] {
+                    for &seed in &[27u64, 0x9E37_79B9_7F4A_7C15] {
+                        let mut h = Hnsw::new(HnswParams {
+                            m,
+                            ef_construction: 4,
+                            gamma,
+                            metric: Metric::L2,
+                            seed,
+                        });
+                        let mut state = seed | 1;
+                        for _ in 0..n {
+                            let v: Vec<f32> = (0..dim)
+                                .map(|_| {
+                                    state ^= state << 13;
+                                    state ^= state >> 7;
+                                    state ^= state << 17;
+                                    (state >> 11) as f32 / (1u64 << 53) as f32
+                                })
+                                .collect();
+                            h.insert(v).expect("insert");
+                        }
+                        let bytes = h.to_bytes();
+                        Hnsw::from_bytes(&bytes).unwrap_or_else(|e| {
+                            panic!(
+                                "a graph this build produced will not decode: \
+                                 m={m} gamma={gamma} n={n} dim={dim} seed={seed:#x} \
+                                 blob={} bytes: {e}",
+                                bytes.len()
+                            )
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_a_payload_that_reserves_far_more_than_it_describes() {
+        // The header ceilings bound m, the degree cap and the top layer, and a
+        // payload sitting exactly *at* all three still gets through them. Fixed
+        // stride is what makes that dangerous: a node claiming the maximum
+        // layers with no neighbours on any of them costs a few hundred bytes and
+        // reserves a few hundred kilobytes, so a megabyte of payload asks for
+        // gigabytes. The reservation failing aborts the process rather than
+        // raising a catchable error, so this must be refused, not merely slow.
+        //
+        // m = 2 with gamma = 512 lands the layer-0 cap on its ceiling exactly.
+        let m0_cap = 2048usize;
+        let m_cap = 1024usize;
+        let max_layer = HnswParams::MAX_LAYER;
+        let levels = max_layer + 1;
+        let nodes = 2000usize;
+
+        // ef_construction is floored at the layer-0 cap for a densified graph,
+        // so it has to clear 2048 or the header is refused before the payload
+        // this case is actually about is ever read.
+        let mut blob = header_ef(2, 512.0, max_layer as u64, nodes as u64, m0_cap as u64);
+        for _ in 0..nodes {
+            blob.push(0); // not tombstoned
+            blob.extend_from_slice(&(levels as u64).to_le_bytes());
+            // The header helper declares dim = 2, so supply both components.
+            blob.extend_from_slice(&1.0f32.to_le_bytes());
+            blob.extend_from_slice(&2.0f32.to_le_bytes());
+            for _ in 0..levels {
+                blob.extend_from_slice(&0u64.to_le_bytes()); // no neighbours
+            }
+            blob.extend_from_slice(&0u64.to_le_bytes()); // no attributes
+        }
+
+        let reserved_slots = nodes * (m0_cap + 1 + max_layer * (m_cap + 1));
+        assert!(
+            reserved_slots * 4 > blob.len() * 100,
+            "fixture is not amplifying: {} bytes would reserve {} slots",
+            blob.len(),
+            reserved_slots
+        );
+
+        let err = Hnsw::from_bytes(&blob)
+            .expect_err("a payload reserving 100x what it describes must be refused");
+        assert!(
+            matches!(
+                err,
+                HnswDecodeError::Invalid("link storage exceeds what the payload could describe")
+            ),
+            "must be refused by the slot ceiling specifically, got {err:?}"
+        );
     }
 
     #[test]
@@ -1652,6 +1916,14 @@ mod tests {
                 header(128, 1024.0, 0, 1),
             ),
             ("top layer beyond the ceiling", header(16, 1.0, 1 << 40, 1)),
+            // The vector read reserves a scratch buffer from `dim` before
+            // anything compares it to the payload's length, so an 85-byte blob
+            // could ask the allocator for gigabytes — and a failed reservation
+            // aborts the process rather than raising a catchable error.
+            (
+                "dimension beyond the ceiling",
+                header_dim(16, 1.0, 0, 1, 64, 1 << 30),
+            ),
         ] {
             let err = Hnsw::from_bytes(&blob)
                 .expect_err(&format!("{label}: should be rejected, not decoded"));

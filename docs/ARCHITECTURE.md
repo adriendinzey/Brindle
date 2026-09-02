@@ -154,7 +154,7 @@ calls this out explicitly so the tradeoff is never hidden.
 The page layout that replaces the interim blob — metapage, element tuples,
 neighbor chunks, and the locking and WAL plan around them — is specified in
 [STORAGE.md](STORAGE.md). What the interim blob costs is measured in
-[BENCHMARKS.md](BENCHMARKS.md): 82–88 ms of every query, against at most a few
+[BENCHMARKS.md](BENCHMARKS.md): 59–61 ms of every query, against at most a few
 milliseconds of actual search.
 
 ## 5. Module map (target)
