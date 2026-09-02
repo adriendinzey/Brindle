@@ -1698,6 +1698,83 @@ mod tests {
         b
     }
 
+    /// Reports how close a graph a build actually produces comes to the
+    /// decode's slot ceiling. Ignored by default — it is a margin probe rather
+    /// than an assertion, and it takes a couple of minutes.
+    ///
+    /// Run it after changing the floor, `MAX_LAYER0_DEGREE`, or the stride:
+    ///
+    /// ```text
+    /// cargo test --release --features pg17 --lib slot_ceiling_margin -- --ignored --nocapture
+    /// ```
+    ///
+    /// The floor was raised to 1 << 22 because 1 << 18 refused real graphs. At
+    /// the time of writing the worst legitimate case uses 19.5% of the ceiling
+    /// (m = 2, gamma = 512, n = 300, dim = 1), against 105% before.
+    #[test]
+    #[ignore]
+    fn slot_ceiling_margin() {
+        let mut worst = 0.0f64;
+        let mut worst_desc = String::new();
+        for &(m, gamma) in &[
+            (2usize, 512.0f32),
+            (2, 256.0),
+            (3, 341.0),
+            (4, 256.0),
+            (16, 4.0),
+            (128, 8.0),
+        ] {
+            for seed in 1u64..=40 {
+                for n in [1usize, 2, 64, 130, 154, 200, 300] {
+                    for dim in [1usize, 8] {
+                        let mut h = Hnsw::new(HnswParams {
+                            m,
+                            ef_construction: 4,
+                            gamma,
+                            metric: Metric::L2,
+                            seed,
+                        });
+                        let mut st = seed | 1;
+                        for _ in 0..n {
+                            let v: Vec<f32> = (0..dim)
+                                .map(|_| {
+                                    st ^= st << 13;
+                                    st ^= st >> 7;
+                                    st ^= st << 17;
+                                    (st >> 11) as f32 / (1u64 << 53) as f32
+                                })
+                                .collect();
+                            if h.insert(v).is_err() {
+                                break;
+                            }
+                        }
+                        let bytes = h.to_bytes();
+                        let budget = (bytes.len() - 76) + (1 << 22);
+                        let slots: usize = (0..h.len())
+                            .map(|id| (h.m0_cap + 1) + (h.levels(id) - 1) * (h.m_cap + 1))
+                            .sum();
+                        let ratio = slots as f64 / budget as f64;
+                        if ratio > worst {
+                            worst = ratio;
+                            worst_desc = format!(
+                                "m={m} gamma={gamma} n={n} dim={dim} seed={seed} \
+                                 slots={slots} budget={budget}"
+                            );
+                        }
+                        assert!(
+                            Hnsw::from_bytes(&bytes).is_ok(),
+                            "the ceiling refused a graph this build produced: {worst_desc}"
+                        );
+                    }
+                }
+            }
+        }
+        println!(
+            "worst legitimate use of the slot ceiling: {:.1}% -- {worst_desc}",
+            worst * 100.0
+        );
+    }
+
     #[test]
     fn decodes_graphs_built_at_the_densest_legal_settings() {
         // The slot ceiling guards against a payload reserving far more than it
