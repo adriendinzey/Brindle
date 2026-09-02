@@ -42,7 +42,7 @@ use pgrx::{pg_guard, pg_sys};
 use super::opclass;
 use super::storage::{self, TidPair};
 use crate::guc;
-use crate::hnsw::{Hnsw, HnswError};
+use crate::hnsw::HnswError;
 
 /// Errors raised while producing scan results.
 #[derive(Debug)]
@@ -75,9 +75,11 @@ impl From<HnswError> for ScanError {
 /// The search behind one scan: the graph it loaded, the node-id → TID table, and
 /// the result of the one search this scan runs, with a cursor into it.
 struct ScanSearch {
-    hnsw: Hnsw,
-    /// `tids[i]` is the heap address of graph node `i`.
-    tids: Vec<TidPair>,
+    /// The decoded index: this backend's cached copy where the ceiling allows
+    /// one, otherwise a decode owned by this scan. Held for the scan's life,
+    /// which is inside the relcache entry's — the relation is open and locked
+    /// for the whole scan, so a cached borrow cannot outlive its owner.
+    index: storage::IndexHandle,
     query: Vec<f32>,
     /// The search's results as heap addresses, nearest first.
     results: Vec<TidPair>,
@@ -85,10 +87,9 @@ struct ScanSearch {
 }
 
 impl ScanSearch {
-    fn new(hnsw: Hnsw, tids: Vec<TidPair>) -> Self {
+    fn new(index: storage::IndexHandle) -> Self {
         Self {
-            hnsw,
-            tids,
+            index,
             query: Vec::new(),
             results: Vec::new(),
             cursor: 0,
@@ -106,10 +107,10 @@ impl ScanSearch {
         // to use it, not the value in force when the scan was opened.
         let budget = guc::ef_search().max(1);
 
-        let found = self.hnsw.search(&self.query, budget, budget)?;
+        let found = self.index.graph().search(&self.query, budget, budget)?;
         self.results.reserve(found.len());
         for (_, id) in found {
-            match self.tids.get(id) {
+            match self.index.tids().get(id) {
                 Some(&tid) => self.results.push(tid),
                 None => return Err(ScanError::UnmappedNode(id)),
             }
@@ -205,11 +206,11 @@ pub(super) unsafe extern "C" fn ambeginscan(
     norderbys: c_int,
 ) -> pg_sys::IndexScanDesc {
     let scan = pg_sys::RelationGetIndexScan(index, nkeys, norderbys);
-    // TODO: read the graph through the buffer manager instead of deserializing
-    // the whole index once per scan.
-    // SAFETY: Postgres opened and locked `index` for this scan.
-    let (hnsw, tids) = storage::load_index(index);
-    (*scan).opaque = new_scan_state(ScanSearch::new(hnsw, tids)).cast();
+    // TODO: read the graph through the buffer manager instead of holding a
+    // decoded copy per backend.
+    // SAFETY: Postgres opened and locked `index` for this scan, so the relcache
+    // entry that owns any cached copy outlives the scan that borrows it.
+    (*scan).opaque = new_scan_state(ScanSearch::new(storage::cached_index(index))).cast();
     scan
 }
 
@@ -1017,15 +1018,14 @@ mod tests {
     #[pg_test]
     fn ef_search_sizes_the_scans_candidate_budget() {
         create_indexed_fixture("t_ef", 200);
-        let (hnsw, tids) = {
-            // SAFETY: the index exists; PgRelation holds AccessShare on it.
-            let relation = unsafe { PgRelation::open_with_name("t_ef_idx") }.expect("open index");
-            unsafe { storage::load_index(relation.as_ptr()) }
-        };
+        // SAFETY: the index exists; PgRelation holds AccessShare on it, and the
+        // handle is used before the relation closes.
+        let relation = unsafe { PgRelation::open_with_name("t_ef_idx") }.expect("open index");
+        let handle = unsafe { storage::cached_index(relation.as_ptr()) };
 
         // The budget is observable as how many rows one search yields, since the
         // scan returns exactly what it found and then ends.
-        let mut search = ScanSearch::new(hnsw, tids);
+        let mut search = ScanSearch::new(handle);
 
         Spi::run("SET brindle.ef_search = 137").expect("set");
         search.start(QUERY.to_vec()).expect("start");

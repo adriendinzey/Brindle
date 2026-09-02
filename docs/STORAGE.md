@@ -41,10 +41,11 @@ interim format version 1 described in [§ 2](#2-what-this-replaces).
 
 The interim format (version 1, `src/index_am/storage.rs`) serializes the entire
 in-memory graph — every vector, every adjacency list — into one opaque blob,
-splits it across pages, and re-reads it whole on every access:
+splits it across pages, and re-reads it whole whenever the copy a backend holds
+is no longer current:
 
 ```
-block 0   metapage: magic, version, blob length
+block 0   metapage: magic, version, blob length, generation
 block 1   ┐
 block 2   │  one byte stream, chunked at the page boundary:
   ...     │  [graph codec][node-id → heap-TID table]
@@ -55,12 +56,13 @@ Consequences, all of which this design exists to remove:
 
 | | Version 1 (blob) | Version 2 (pages) |
 |---|---|---|
-| Scan startup | deserialize the whole index into backend memory | read the metapage |
-| Scan working set | a private copy of the graph per scan | shared buffer cache |
+| Scan startup | read the metapage; deserialize the whole index if this backend has no current copy | read the metapage |
+| Scan working set | one decoded copy per backend, bounded by `brindle.cache_max_mb` | shared buffer cache |
 | Insert cost | O(index) CPU: load, mutate, write back | O(m · log n) page reads, O(m) page writes |
 | Insert WAL | O(index) — a 4 MB index logs ~4 MB per row | O(m) page images |
 | Vacuum tombstone | rewrite the whole image | flip one byte on one page |
 | Crash mid-write | image and metapage disagree → index unreadable until `REINDEX` | each record is atomic; worst case is a lost back-edge |
+| Cross-backend writes | every reader re-checks the metapage generation, which every writer advances | invalidation is the buffer manager's |
 | Reader/writer | one heavyweight lock over the whole image | readers take no heavyweight lock |
 | Filter attributes | not persisted at all | inline in the element tuple |
 | Indexable dimensions | any (up to the type's 16000) | ≤ 2000 ([§ 5](#5-sizing-and-limits)) |

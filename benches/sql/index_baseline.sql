@@ -293,6 +293,40 @@ SELECT ef AS ef_search,
 FROM paired GROUP BY ef ORDER BY ef;
 
 \echo ''
+\echo '=== the cold path: what a scan costs with no cached copy ==='
+-- Everything above is the warm path. A backend keeps one decoded copy of the
+-- index, so only the first scan pays to read and decode it and the sweep's 600
+-- queries are answered from that copy. That is the common shape for a session,
+-- and it is not the whole story: a backend that has just connected, or one whose
+-- copy a writer has invalidated, pays the full cost.
+--
+-- Setting the ceiling to zero refuses the cache, so every scan decodes — which
+-- is exactly what the cold path costs. Fewer queries, because the number barely
+-- moves with ef_search when the decode dominates it.
+DO $$
+DECLARE
+    k       int := current_setting('bench.k')::int;
+    q       record;
+    started timestamptz;
+    found   int[];
+BEGIN
+    PERFORM set_config('brindle.cache_max_mb', '0', false);
+    PERFORM set_config('brindle.ef_search', '64', false);
+    FOR q IN SELECT id, embedding FROM bench_queries ORDER BY id LIMIT 10 LOOP
+        started := clock_timestamp();
+        SELECT array_agg(id) INTO found
+        FROM (SELECT id FROM bench_vectors ORDER BY embedding <-> q.embedding LIMIT k) s;
+        INSERT INTO bench_timings
+        VALUES ('cold', 64, extract(epoch FROM clock_timestamp() - started) * 1000, q.id);
+    END LOOP;
+    PERFORM set_config('brindle.cache_max_mb', '256', false);
+END $$;
+
+SELECT round(percentile_cont(0.5) WITHIN GROUP (ORDER BY elapsed_ms)::numeric, 2) AS cold_p50_ms,
+       round(percentile_cont(0.95) WITHIN GROUP (ORDER BY elapsed_ms)::numeric, 2) AS cold_p95_ms
+FROM bench_timings WHERE phase = 'cold';
+
+\echo ''
 \echo '=== distance concentration (how hard this fixture is) ==='
 WITH q AS (SELECT embedding FROM bench_queries ORDER BY id LIMIT 1),
      d AS (SELECT brindle_vector_l2_distance(v.embedding, q.embedding) AS dist

@@ -967,6 +967,29 @@ impl Hnsw {
         Ok(all.into_iter().map(|c| (c.dist, c.id)).collect())
     }
 
+    /// Roughly how much memory this graph occupies.
+    ///
+    /// The flat arrays are the whole of it apart from attribute rows, which are
+    /// still a `Vec` per node and are counted by their capacity. Used to decide
+    /// whether a decoded copy is small enough to keep, so an under-estimate
+    /// would let the cache exceed its ceiling — hence capacity rather than
+    /// length throughout.
+    pub fn resident_bytes(&self) -> usize {
+        let attrs: usize = self
+            .attrs
+            .iter()
+            .map(|row| row.capacity() * core::mem::size_of::<AttrValue>())
+            .sum();
+        core::mem::size_of::<Self>()
+            + self.vectors.capacity() * core::mem::size_of::<f32>()
+            + self.layer_base.capacity() * core::mem::size_of::<u32>()
+            + self.link_counts.capacity() * core::mem::size_of::<u32>()
+            + self.links.capacity() * core::mem::size_of::<u32>()
+            + self.deleted.capacity()
+            + self.attrs.capacity() * core::mem::size_of::<Vec<AttrValue>>()
+            + attrs
+    }
+
     /// Number of tombstoned (soft-deleted) nodes.
     pub fn deleted_count(&self) -> usize {
         self.deleted.iter().filter(|&&d| d).count()
@@ -1713,6 +1736,39 @@ mod tests {
         b.extend_from_slice(&0u64.to_le_bytes()); // entry point
         b.extend_from_slice(&n.to_le_bytes());
         b
+    }
+
+    /// Reports what a decoded graph costs in memory, which is what the cache
+    /// ceiling is set against. Ignored by default.
+    ///
+    /// ```text
+    /// cargo test --release --features pg17 --lib cached_graph_footprint -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore]
+    fn cached_graph_footprint() {
+        for &(n, dim) in &[(10_000usize, 128usize), (25_000, 128), (50_000, 128)] {
+            let mut h = Hnsw::new(HnswParams::default());
+            let mut st = 0x2545_F491_4F6C_DD1D_u64;
+            for _ in 0..n {
+                let v: Vec<f32> = (0..dim)
+                    .map(|_| {
+                        st ^= st << 13;
+                        st ^= st >> 7;
+                        st ^= st << 17;
+                        (st >> 11) as f32 / (1u64 << 53) as f32
+                    })
+                    .collect();
+                h.insert(v).expect("insert");
+            }
+            let bytes = h.resident_bytes();
+            println!(
+                "{n} x {dim}: {:.1} MB resident, {:.0} bytes/node, serialized {:.1} MB",
+                bytes as f64 / 1e6,
+                bytes as f64 / n as f64,
+                h.to_bytes().len() as f64 / 1e6
+            );
+        }
     }
 
     /// Reports how close a graph a build actually produces comes to the
