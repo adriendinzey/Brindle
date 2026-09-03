@@ -210,7 +210,14 @@ pub(super) unsafe extern "C" fn ambeginscan(
     // decoded copy per backend.
     // SAFETY: Postgres opened and locked `index` for this scan, so the relcache
     // entry that owns any cached copy outlives the scan that borrows it.
-    (*scan).opaque = new_scan_state(ScanSearch::new(storage::cached_index(index))).cast();
+    // A transaction that has written to this index must see its own rows, and
+    // they are not on disk until it commits — so its pending graph wins over any
+    // cached copy, which by construction predates them.
+    let handle = match storage::pending_view(index) {
+        Some(view) => storage::IndexHandle::Pending(view),
+        None => storage::cached_index(index),
+    };
+    (*scan).opaque = new_scan_state(ScanSearch::new(handle)).cast();
     scan
 }
 

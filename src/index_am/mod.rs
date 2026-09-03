@@ -271,32 +271,15 @@ unsafe extern "C" fn aminsert(
     // SAFETY: `index` is the open index relation Postgres locked for this
     // insert. An error below unwinds to abort, which releases the page lock
     // along with every other lock the transaction holds.
-    pg_sys::LockPage(
-        index,
-        storage::IMAGE_LOCK_BLOCK,
-        pg_sys::ExclusiveLock as i32,
-    );
-
-    let (mut hnsw, mut tids) = storage::load_index(index);
-    let id = match hnsw.insert(vector) {
-        Ok(id) => id,
-        Err(e) => error!("brindle: {e}"),
-    };
-    // Ids are dense insertion order and the load checked that the graph and the
-    // table have the same length, so the new id addresses the slot being filled.
-    if id != tids.len() {
-        error!("brindle: index graph and heap-pointer table are out of step");
-    }
+    // Applied to a graph held for the transaction and written back once, at the
+    // end. Writing per row means rewriting the whole stored image per row, which
+    // is what makes a bulk load quadratic. A single-row INSERT is its own
+    // transaction and so still flushes immediately — that cost is the stored
+    // format's, and it goes when the format does.
+    //
     // SAFETY: `heap_tid` points at the ItemPointerData of the tuple being
     // inserted, valid for this call.
-    tids.push(item_pointer_get_both(*heap_tid));
-
-    storage::rewrite_index_blob(index, &storage::encode_index(&hnsw, &tids));
-    pg_sys::UnlockPage(
-        index,
-        storage::IMAGE_LOCK_BLOCK,
-        pg_sys::ExclusiveLock as i32,
-    );
+    storage::pending_insert(index, vector, Vec::new(), item_pointer_get_both(*heap_tid));
     true
 }
 
@@ -586,6 +569,11 @@ mod tests {
     /// The persisted graph and heap-pointer table of an index, read back the
     /// way every future reader will read them.
     fn load_persisted(index: &str) -> (Hnsw, Vec<TidPair>) {
+        // Inserts are applied to a graph held for the transaction and written
+        // back when it ends, so reading the stored image means ending that
+        // deferral first. Doing it here puts the flush under test rather than
+        // leaving it to a commit no `#[pg_test]` ever performs.
+        storage::flush_pending();
         // SAFETY: the index exists; PgRelation holds AccessShare on it for the
         // duration of the read.
         let relation = unsafe { PgRelation::open_with_name(index) }.expect("open index");
@@ -603,6 +591,9 @@ mod tests {
     }
 
     fn index_pages(index: &str) -> i64 {
+        // As in `load_persisted`: the stored image only grows when the
+        // transaction's pending writes are flushed.
+        storage::flush_pending();
         Spi::get_one::<i64>(&format!(
             "SELECT pg_relation_size('{index}') / current_setting('block_size')::bigint"
         ))

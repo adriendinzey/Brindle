@@ -19,6 +19,7 @@ use core::ffi::c_char;
 use pgrx::pg_sys;
 use pgrx::prelude::*;
 
+use crate::filter::AttrValue;
 use crate::hnsw::{GraphBytes, Hnsw, HnswDecodeError};
 
 /// Errors from decoding the blob payload framing.
@@ -661,6 +662,13 @@ thread_local! {
 /// caller when caching is off or the index does not fit.
 pub enum IndexHandle {
     Cached(CacheRef),
+    /// The writing transaction's own view, borrowed from [`PENDING`].
+    ///
+    /// Raw pointers because the graph lives in a thread-local the scan cannot
+    /// borrow across its life. Sound because a scan cannot outlive the
+    /// transaction that opened it, and only that transaction's own end — commit,
+    /// abort, or a subtransaction boundary — takes the pending graph away.
+    Pending((*const Hnsw, *const Vec<TidPair>)),
     /// Boxed so the handle stays small: a graph inline would make every handle,
     /// cached or not, as large as an uncached one.
     Fresh(Box<(Hnsw, Vec<TidPair>)>),
@@ -670,6 +678,9 @@ impl IndexHandle {
     pub fn graph(&self) -> &Hnsw {
         match self {
             IndexHandle::Cached(c) => &c.hnsw,
+            // SAFETY: see the variant's own comment — the pending graph outlives
+            // every scan that can observe it.
+            IndexHandle::Pending((hnsw, _)) => unsafe { &**hnsw },
             IndexHandle::Fresh(owned) => &owned.0,
         }
     }
@@ -677,6 +688,8 @@ impl IndexHandle {
     pub fn tids(&self) -> &[TidPair] {
         match self {
             IndexHandle::Cached(c) => &c.tids,
+            // SAFETY: as above.
+            IndexHandle::Pending((_, tids)) => unsafe { &**tids },
             IndexHandle::Fresh(owned) => &owned.1,
         }
     }
@@ -787,6 +800,227 @@ pub unsafe fn cached_index(index: pg_sys::Relation) -> IndexHandle {
         cache.insert(key, entry.clone());
     });
     IndexHandle::Cached(entry)
+}
+
+// --- deferred writes ------------------------------------------------------
+
+/// Inserts this transaction has made but not yet written back.
+///
+/// Every write rewrites the whole stored image, so doing that per row makes a
+/// bulk load quadratic in the table. The rows are applied to a graph held in
+/// memory instead, and written once when the transaction ends.
+///
+/// This does nothing for a single-row `INSERT`, which is its own transaction and
+/// so flushes immediately. Not rewriting the whole image per write is paged
+/// storage, and stays with that work.
+struct PendingWrite {
+    key: CacheKey,
+    /// Reopened at flush time. A `Relation` pointer must not be held across
+    /// statements — the relcache entry behind it can be rebuilt — so the oid is
+    /// what is kept.
+    index_oid: pg_sys::Oid,
+    /// The generation the graph below was derived from. If the metapage has
+    /// moved past it by flush time, another backend wrote while this
+    /// transaction was open and the mutations have to be replayed onto its
+    /// image rather than written over it.
+    base_generation: u64,
+    hnsw: Hnsw,
+    tids: Vec<TidPair>,
+    /// The rows applied, kept for that replay. Costs a second copy of each
+    /// vector for the length of the transaction, which is the price of not
+    /// holding an exclusive lock across it.
+    applied: Vec<(Vec<f32>, Vec<AttrValue>, TidPair)>,
+}
+
+thread_local! {
+    static PENDING: std::cell::RefCell<Option<PendingWrite>> =
+        const { std::cell::RefCell::new(None) };
+    /// Registered once per backend; the callbacks themselves are cheap and
+    /// return immediately when there is nothing pending.
+    static CALLBACKS_REGISTERED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+/// Apply one row to the transaction's pending graph, loading it on first use.
+///
+/// # Safety
+/// `index` must be an open brindle index relation this backend may write.
+pub unsafe fn pending_insert(
+    index: pg_sys::Relation,
+    vector: Vec<f32>,
+    attrs: Vec<AttrValue>,
+    tid: TidPair,
+) {
+    register_callbacks();
+    let key = cache_key(index);
+    let oid = (*index).rd_id;
+
+    PENDING.with(|p| {
+        let mut pending = p.borrow_mut();
+        // A different index in the same transaction: flush the first, since only
+        // one is tracked. Two indexes written alternately therefore behave as
+        // they did before, which is correct if unhelpful.
+        if pending.as_ref().is_some_and(|w| w.key != key) {
+            flush_locked(pending.take());
+        }
+        if pending.is_none() {
+            pg_sys::LockPage(index, IMAGE_LOCK_BLOCK, pg_sys::ShareLock as i32);
+            let (_, _, generation) = read_meta(index);
+            pg_sys::UnlockPage(index, IMAGE_LOCK_BLOCK, pg_sys::ShareLock as i32);
+            let (hnsw, tids) = load_index(index);
+            *pending = Some(PendingWrite {
+                key,
+                index_oid: oid,
+                base_generation: generation,
+                hnsw,
+                tids,
+                applied: Vec::new(),
+            });
+        }
+        let write = pending.as_mut().expect("just populated");
+        apply_one(&mut write.hnsw, &mut write.tids, &vector, &attrs, tid);
+        write.applied.push((vector, attrs, tid));
+    });
+}
+
+/// Add one row to a graph and its pointer table, keeping the two in step.
+fn apply_one(
+    hnsw: &mut Hnsw,
+    tids: &mut Vec<TidPair>,
+    vector: &[f32],
+    attrs: &[AttrValue],
+    tid: TidPair,
+) {
+    let id = hnsw
+        .insert_with_attrs(vector.to_vec(), attrs.to_vec())
+        .unwrap_or_else(|e| error!("brindle: {e}"));
+    // Ids are dense insertion order and the load checked the graph and the table
+    // agree, so the new id addresses the slot being filled.
+    if id != tids.len() {
+        error!("brindle: index graph and heap-pointer table are out of step");
+    }
+    tids.push(tid);
+}
+
+/// The transaction's own view of an index it has written to, if any.
+///
+/// A scan must see rows its own transaction inserted, and those are not on disk
+/// until it commits.
+///
+/// # Safety
+/// `index` must be an open brindle index relation.
+pub unsafe fn pending_view(index: pg_sys::Relation) -> Option<(*const Hnsw, *const Vec<TidPair>)> {
+    let key = cache_key(index);
+    PENDING.with(|p| {
+        let pending = p.borrow();
+        pending
+            .as_ref()
+            .filter(|w| w.key == key)
+            .map(|w| (&w.hnsw as *const Hnsw, &w.tids as *const Vec<TidPair>))
+    })
+}
+
+/// Write a pending graph back, replaying onto whatever is there now if another
+/// backend has written since this transaction started.
+fn flush_locked(write: Option<PendingWrite>) {
+    let Some(write) = write else { return };
+    // SAFETY: the oid names an index this backend wrote to inside the
+    // transaction still being committed, so it exists and is lockable.
+    unsafe {
+        // The index can be gone by now — dropped, or rebuilt under a new
+        // relfilenode — while this transaction still held writes for it. There
+        // is then nothing to write back, and erroring here would fail a commit
+        // over work that no longer has anywhere to go.
+        let rel = pg_sys::try_relation_open(write.index_oid, pg_sys::RowExclusiveLock as i32);
+        if rel.is_null() {
+            return;
+        }
+        pg_sys::LockPage(rel, IMAGE_LOCK_BLOCK, pg_sys::ExclusiveLock as i32);
+
+        let (_, _, current) = read_meta(rel);
+        let blob = if current == write.base_generation {
+            encode_index(&write.hnsw, &write.tids)
+        } else {
+            // Somebody else wrote while this transaction was open. Their image
+            // is the one to build on: writing ours would drop their rows. The
+            // lock was deliberately not held across the transaction, so this is
+            // the expected outcome of that choice rather than a surprise.
+            let (mut hnsw, mut tids) = load_index(rel);
+            for (vector, attrs, tid) in &write.applied {
+                apply_one(&mut hnsw, &mut tids, vector, attrs, *tid);
+            }
+            encode_index(&hnsw, &tids)
+        };
+        rewrite_index_blob(rel, &blob);
+
+        pg_sys::UnlockPage(rel, IMAGE_LOCK_BLOCK, pg_sys::ExclusiveLock as i32);
+        pg_sys::relation_close(rel, pg_sys::RowExclusiveLock as i32);
+    }
+}
+
+/// Write back whatever this transaction has pending, now.
+///
+/// The transaction end does this on its own; this is for callers that need the
+/// stored image to be current before then — which in practice means tests that
+/// read it directly, and which is why the flush is exercised rather than only
+/// reached at commit.
+pub fn flush_pending() {
+    let write = PENDING.with(|p| p.borrow_mut().take());
+    flush_locked(write);
+}
+
+/// Flush at commit, discard at abort.
+unsafe extern "C" fn xact_callback(event: pg_sys::XactEvent::Type, _arg: *mut core::ffi::c_void) {
+    match event {
+        pg_sys::XactEvent::XACT_EVENT_PRE_COMMIT
+        | pg_sys::XactEvent::XACT_EVENT_PARALLEL_PRE_COMMIT => {
+            let write = PENDING.with(|p| p.borrow_mut().take());
+            flush_locked(write);
+        }
+        pg_sys::XactEvent::XACT_EVENT_ABORT | pg_sys::XactEvent::XACT_EVENT_PARALLEL_ABORT => {
+            // Nothing was written, so dropping the mutations is the rollback.
+            PENDING.with(|p| *p.borrow_mut() = None);
+        }
+        _ => {}
+    }
+}
+
+/// Flush before a subtransaction starts, and discard on its rollback.
+///
+/// Rolling back to a savepoint has to undo what came after it while keeping what
+/// came before. Flushing at the boundary puts everything before the savepoint on
+/// disk, so discarding the pending mutations is exactly the right undo. The cost
+/// is that a plpgsql block with an EXCEPTION handler opens a subtransaction per
+/// iteration and so flushes per row — no worse than not batching at all, which
+/// is what it would otherwise get.
+unsafe extern "C" fn subxact_callback(
+    event: pg_sys::SubXactEvent::Type,
+    _my: pg_sys::SubTransactionId,
+    _parent: pg_sys::SubTransactionId,
+    _arg: *mut core::ffi::c_void,
+) {
+    match event {
+        pg_sys::SubXactEvent::SUBXACT_EVENT_START_SUB => {
+            let write = PENDING.with(|p| p.borrow_mut().take());
+            flush_locked(write);
+        }
+        pg_sys::SubXactEvent::SUBXACT_EVENT_ABORT_SUB => {
+            PENDING.with(|p| *p.borrow_mut() = None);
+        }
+        _ => {}
+    }
+}
+
+fn register_callbacks() {
+    CALLBACKS_REGISTERED.with(|done| {
+        if done.get() {
+            return;
+        }
+        // SAFETY: registered once per backend, and Postgres keeps the pointers.
+        unsafe {
+            pg_sys::RegisterXactCallback(Some(xact_callback), core::ptr::null_mut());
+            pg_sys::RegisterSubXactCallback(Some(subxact_callback), core::ptr::null_mut());
+        }
+        done.set(true);
+    });
 }
 
 #[cfg(test)]
