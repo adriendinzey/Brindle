@@ -48,7 +48,7 @@ this file should ever gate a merge.
 
 | | |
 |---|---|
-| Commit | `d1e80fd` |
+| Commit | `ecbc16c` — later commits moved where the cached copy lives without changing what a warm scan does (a hash lookup either way) or what a cold one costs |
 | Machine | Intel i7-9700K @ 3.6 GHz, 8 cores, 15 GB RAM, WSL2 (kernel 6.18) |
 | PostgreSQL | 17.10, pgrx-managed, default `postgresql.conf` |
 | Build | `cargo build --release`, no `target-cpu` flag (baseline x86-64) |
@@ -71,14 +71,21 @@ locally dense, globally separated.
 
 | `ef_search` | p50 | p95 | recall@10 |
 |---|---|---|---|
-| 1 (control) | 59.8 ms | 63.4 ms | — |
-| 16 | 59.9 ms | 64.2 ms | 0.814 |
-| 32 | 59.8 ms | 65.2 ms | 0.932 |
-| 64 | 60.1 ms | 66.5 ms | 0.966 |
-| 128 | 60.0 ms | 63.0 ms | 0.974 |
-| 256 | 60.4 ms | 71.1 ms | 0.974 |
+| 1 (control) | 0.15 ms | 0.25 ms | — |
+| 16 | 0.23 ms | 0.30 ms | 0.814 |
+| 32 | 0.27 ms | 0.46 ms | 0.932 |
+| 64 | 0.34 ms | 0.48 ms | 0.966 |
+| 128 | 0.44 ms | 0.57 ms | 0.974 |
+| 256 | 0.56 ms | 0.83 ms | 0.974 |
 
-Build: **114.0 s**, observed 112.5–116.3 s across runs on this machine — read
+**These are warm figures, and the distinction now matters.** A backend keeps one
+decoded copy of the index, so the first scan pays to read and decode it and the
+sweep's 600 queries are answered from that copy. A backend that has just
+connected, or one whose copy a writer invalidated, pays **57.9 ms** (p95
+65.7 ms) — measured in the same run, and unchanged by any of this. Before the
+cache, every query paid it.
+
+Build: **106.0 s**, observed 106–116 s across runs on this machine — read
 it as "under two minutes", not to the tenth. Index: **77 MB** (heap: 56 MB).
 
 Recall reproduces to three decimals on every run — the build takes a fixed RNG
@@ -93,14 +100,16 @@ Every component independent and uniform.
 
 | `ef_search` | p50 | p95 | recall@10 |
 |---|---|---|---|
-| 1 (control) | 58.8 ms | 61.7 ms | — |
-| 16 | 59.1 ms | 62.0 ms | 0.146 |
-| 32 | 59.0 ms | 63.6 ms | 0.249 |
-| 64 | 59.6 ms | 62.8 ms | 0.375 |
-| 128 | 60.0 ms | 63.4 ms | 0.507 |
-| 256 | 61.3 ms | 64.7 ms | 0.663 |
+| 1 (control) | 0.17 ms | 0.25 ms | — |
+| 16 | 0.35 ms | 0.48 ms | 0.146 |
+| 32 | 0.46 ms | 0.61 ms | 0.249 |
+| 64 | 0.75 ms | 0.91 ms | 0.375 |
+| 128 | 1.27 ms | 1.56 ms | 0.507 |
+| 256 | 2.22 ms | 2.66 ms | 0.663 |
 
-Build: **236.7 s**. Index: **77 MB**.
+Warm, as above; cold is **59.0 ms** (p95 69.4 ms).
+
+Build: **224.9 s**. Index: **77 MB**.
 
 Recall of 0.15 looks like a broken index. It isn't. In 128 uniform dimensions
 distances concentrate: the benchmark measures it directly, and the 1000th
@@ -142,9 +151,18 @@ Absolute latency on this machine also moves several percent between sessions —
 the same `main` commit measured 82–83 ms here and 92–93 ms in an independent
 reviewer's run — so compare figures within a run set, never across them.
 
-**The remaining ~60 ms is still the whole index being read and decoded per
-scan**, so the conclusion the first baseline drew is unchanged. It is 60 ms of
-evidence for paged storage now instead of 82. How that splits between reading
+**A backend now keeps one decoded copy of the index**, so that ~60 ms is paid
+once per backend rather than once per query, and a warm query costs 0.34 ms.
+Read the rest of this file with that split in mind: the tables are warm, and the
+cold figure beside them is what the first scan in a backend still costs.
+
+The conclusion the first baseline drew is unchanged, only relocated. The whole
+index is still read and decoded to answer a query that has no copy to hand — the
+cache moves when that happens, not whether. It is also **per backend**, bounded
+by `brindle.cache_max_mb` and invisible to every other connection, where paged
+storage would put the same working set in the buffer manager once for the whole
+server. Trading memory nobody can share for latency is a good trade at one
+connection and a worse one at a hundred. How that splits between reading
 10 000 pages through the buffer manager and this file's own decode has not been
 measured, and should be before anyone sizes the work to remove it.
 
@@ -166,11 +184,11 @@ Median extra milliseconds over that same query's `ef_search = 1`:
 
 | `ef_search` | clustered | uniform |
 |---|---|---|
-| 16 | +0.14 ms | +0.37 ms |
-| 32 | +0.28 ms | +0.34 ms |
-| 64 | +0.34 ms | +0.59 ms |
-| 128 | +0.23 ms | +1.42 ms |
-| 256 | +0.69 ms | +2.38 ms |
+| 16 | +0.08 ms | +0.17 ms |
+| 32 | +0.12 ms | +0.30 ms |
+| 64 | +0.19 ms | +0.57 ms |
+| 128 | +0.28 ms | +1.09 ms |
+| 256 | +0.41 ms | +2.04 ms |
 
 **Read these as a scale, not as calibrated per-point values, and do not read
 the per-point shape at all.** Pairing removes the fixed cost, which is what
@@ -192,16 +210,18 @@ budget unused, and the recall column forbids it: recall climbs 0.814 → 0.966
 between `ef_search` 16 and 64, so the search is plainly finding more in that
 range, not coasting. Convergence is a fair description only from 128 to 256,
 where recall stops moving. Below that, the honest statement is narrower — the
-extra work is real but too small to measure reliably against a 60 ms constant.
+extra work is real but small.
 
 The conclusion needs none of that detail: at the widest budget measured, search
-is **around 1% of a query on the clustered fixture and under 4% on the uniform
-one**. Quoting it to two significant figures would repeat the mistake the table
-above warns about, since the numerator moves between runs. The remaining
-59–61 ms is reading and decoding the whole 77 MB graph, which the interim
-storage format does on every single scan. That is the concrete case for paged
-storage (`docs/STORAGE.md`), and the number that should move further when it
-lands.
+is now **most of a warm query** — 0.41 of 0.56 ms clustered, 2.04 of 2.22 ms
+uniform. That is the shape a query should have, and it is what was hidden while
+every scan first rebuilt the index.
+
+What has not gone anywhere is the ~58 ms a scan costs with no copy to hand. It
+is off the warm path, not out of the system: it is paid by every newly connected
+backend and again whenever a writer invalidates a copy. That remains the case
+for paged storage (`docs/STORAGE.md`), which removes it for everyone rather than
+for whoever has queried recently.
 
 One caveat the medians hide: the same table's p95 paired deltas run 3–16 ms,
 many times the median. The "1% of a query" figure is a statement about the
@@ -221,33 +241,42 @@ side, which makes a comparison partly a comparison of protocols.
 
 | `ef_search` | Brindle p50 | pgvector p50 | Brindle recall | pgvector recall |
 |---|---|---|---|---|
-| 16 | 59.9 ms | 0.47 ms | 0.814 | 0.826 |
-| 32 | 59.8 ms | 0.49 ms | 0.932 | 0.947 |
-| 64 | 60.1 ms | 0.61 ms | 0.966 | 0.983 |
-| 128 | 60.0 ms | 0.79 ms | 0.974 | 0.989 |
-| 256 | 60.4 ms | 1.09 ms | 0.974 | 0.989 |
+| 16 | 0.23 ms | 0.50 ms | 0.814 | 0.825 |
+| 32 | 0.27 ms | 0.49 ms | 0.932 | 0.940 |
+| 64 | 0.34 ms | 0.60 ms | 0.966 | 0.978 |
+| 128 | 0.44 ms | 0.79 ms | 0.974 | 0.985 |
+| 256 | 0.56 ms | 1.07 ms | 0.974 | 0.985 |
 
 | | Brindle | pgvector |
 |---|---|---|
-| build, parallel (as shipped) | — | 17.4 s |
-| build, `max_parallel_maintenance_workers = 0` | 114.0 s | 41.4 s |
+| build, parallel (as shipped) | — | 17.0 s |
+| build, `max_parallel_maintenance_workers = 0` | 106.0 s | 39.2 s |
 | index size | 77 MB | 79 MB |
 
-**Latency: two orders of magnitude, and the ratio is not a constant.** It is
-127× at `ef_search = 16` and 55× at 256 — it *narrows* as the budget grows,
-because pgvector's cost scales with the search while Brindle's is dominated by
-a fixed 60 ms that the budget does not touch. At `ef_search = 64` it is 98×.
+**Latency: it depends entirely on which path you are on.** On the warm path
+Brindle is now **faster**: 0.34 ms against 0.60 ms at
+`ef_search = 64`, and ahead at every sweep point. Both sides are answering from
+memory, so this is a fair comparison of like with like — with one asymmetry that
+belongs in the headline rather than a footnote. **pgvector's working set is in
+the shared buffer cache, sized once for the server; Brindle's is a private copy
+per backend**, about 89 MB of graph for this index — and a backend's resident
+size after warming it is nearer 143 MB, since the allocator holds on to what the
+decode passed through. Brindle is faster here partly by
+spending memory pgvector does not.
+
+Cold, Brindle is 57.9 ms against the same 0.60 ms — **96× slower**. Which figure
+is the real one depends entirely on whether your connections are long-lived.
 The bar this project set itself for a first queryable index was "the same order
 of magnitude, not necessarily faster yet", and this misses it by two.
 
 **Build: ~2.75× slower, not ~6.5×.** pgvector builds in parallel by default and
 Brindle is single-threaded, so comparing defaults compares a three-backend
-build against a one-backend one. At matched single-threadedness it is 114.0 s
-against 41.4 s. (The serial setting was verified to take effect rather than
+build against a one-backend one. At matched single-threadedness it is 106.0 s
+against 39.2 s. (The serial setting was verified to take effect rather than
 assumed — an out-of-band check, not part of either run above: the build shows
 zero parallel workers in `pg_stat_activity` where the default run shows two.)
 
-**Recall is within about a point** — 0.966 against 0.976 at `ef_search = 64` in
+**Recall is within about a point** — 0.966 against 0.978 at `ef_search = 64` in
 this run. Read the next section before quoting that gap as a value.
 
 ### Why the pgvector recall figures are one sample and Brindle's are not
@@ -273,7 +302,7 @@ two of five, which is why the low ends above moved again. Expect the next build
 to fall outside this range too.
 
 So the recall gap at `ef_search = 64` is somewhere around **0.003 to 0.024**,
-and any single-run figure for pgvector — including the 0.976 in the table above
+and any single-run figure for pgvector — including the 0.978 in the table above
 — is one sample rather than the value. An earlier version of this document
 quoted the flattering end of that range as though it were the result.
 
@@ -283,11 +312,11 @@ Both implementations, same uniform fixture, same queries, same ground truth:
 
 | `ef_search` | Brindle | pgvector |
 |---|---|---|
-| 16 | 0.146 | 0.143 |
-| 32 | 0.249 | 0.222 |
-| 64 | 0.375 | 0.362 |
-| 128 | 0.507 | 0.483 |
-| 256 | 0.663 | 0.657 |
+| 16 | 0.146 | 0.151 |
+| 32 | 0.249 | 0.235 |
+| 64 | 0.375 | 0.352 |
+| 128 | 0.507 | 0.503 |
+| 256 | 0.663 | 0.675 |
 
 A mature implementation scores the same 0.15 as Brindle does on uniform 128-
 dimensional data. That is the strongest available evidence that the number
@@ -295,7 +324,7 @@ measures the dataset and not the index — and it is why the recall figures in
 this file should never be quoted without the fixture they came from.
 
 Both sides also build ~2× slower on this fixture than on the clustered one
-(Brindle 236.7 s against 114.0 s; pgvector 83.4 s serial against 41.4 s):
+(Brindle 224.9 s against 106.0 s; pgvector 77.1 s serial against 39.2 s):
 structure makes neighbour selection converge faster, for both implementations.
 
 ### Ways this comparison is still not apples to apples
@@ -313,8 +342,8 @@ Recorded because a comparison whose asymmetries are hidden is worse than none.
   setting entirely and allocates in backend memory — a defect on Brindle's side,
   not an advantage.
 - **Harness overhead.** The plpgsql timing loop has a floor of about 0.016 ms,
-  measured separately from the two runs above. That is 0.03% of Brindle's 60 ms
-  but roughly 3% of pgvector's 0.47 ms, so the latency ratios above are if
+  measured separately from the two runs above. That is roughly 5% of Brindle's
+  0.34 ms and 3% of pgvector's 0.60 ms, so the warm comparison above is if
   anything conservative. (It cancels entirely from
   the paired search-cost table, which is one more reason to prefer it.)
 - **Warm cache throughout.** Both sides. A cold-cache comparison would be more
@@ -334,9 +363,10 @@ Recorded because a comparison whose asymmetries are hidden is worse than none.
 
 ## Follow-ups this baseline argues for
 
-- **Paged storage** is now quantified rather than asserted: search is a low
-  single-digit percentage of a query and the remaining 59–61 ms is reading and
-  decoding the graph, which is the entire latency gap against pgvector.
+- **Paged storage** is now quantified rather than asserted: reading and decoding
+  the index is the whole of a *cold* scan at ~58 ms, which a per-backend cache
+  moves off the warm path without removing — and which paged storage would
+  remove for the whole server rather than per connection.
 - **Recall plateaus at 0.974 and more budget does not help.** Between
   `ef_search` 128 and 256 recall does not move. That ceiling is build quality,
   not search effort: at `ef_construction = 64` the graph does not contain the

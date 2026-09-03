@@ -8,7 +8,7 @@ implementation needs to decide about *bytes on pages* is decided here; what is
 left open is listed in [§ 12](#12-left-to-the-implementation).
 
 Status: **specification** (format version 2). The shipping code still uses the
-interim format version 1 described in [§ 2](#2-what-this-replaces).
+interim blob format described in [§ 2](#2-what-this-replaces).
 
 ---
 
@@ -39,12 +39,13 @@ interim format version 1 described in [§ 2](#2-what-this-replaces).
 
 ## 2. What this replaces
 
-The interim format (version 1, `src/index_am/storage.rs`) serializes the entire
+The interim blob format (`src/index_am/storage.rs`) serializes the entire
 in-memory graph — every vector, every adjacency list — into one opaque blob,
-splits it across pages, and re-reads it whole on every access:
+splits it across pages, and re-reads it whole whenever the copy a backend holds
+is no longer current:
 
 ```
-block 0   metapage: magic, version, blob length
+block 0   metapage: magic, version, blob length, generation
 block 1   ┐
 block 2   │  one byte stream, chunked at the page boundary:
   ...     │  [graph codec][node-id → heap-TID table]
@@ -53,14 +54,15 @@ block N   ┘
 
 Consequences, all of which this design exists to remove:
 
-| | Version 1 (blob) | Version 2 (pages) |
+| | Interim (blob) | Paged |
 |---|---|---|
-| Scan startup | deserialize the whole index into backend memory | read the metapage |
-| Scan working set | a private copy of the graph per scan | shared buffer cache |
+| Scan startup | read the metapage; deserialize the whole index if this backend has no current copy | read the metapage |
+| Scan working set | decoded copies per backend, bounded per backend by `brindle.cache_max_mb` — nothing bounds the total across connections | shared buffer cache, one copy for the server |
 | Insert cost | O(index) CPU: load, mutate, write back | O(m · log n) page reads, O(m) page writes |
 | Insert WAL | O(index) — a 4 MB index logs ~4 MB per row | O(m) page images |
 | Vacuum tombstone | rewrite the whole image | flip one byte on one page |
 | Crash mid-write | image and metapage disagree → index unreadable until `REINDEX` | each record is atomic; worst case is a lost back-edge |
+| Cross-backend writes | every reader re-checks the metapage generation, which every writer advances | invalidation is the buffer manager's |
 | Reader/writer | one heavyweight lock over the whole image | readers take no heavyweight lock |
 | Filter attributes | not persisted at all | inline in the element tuple |
 | Indexable dimensions | any (up to the type's 16000) | ≤ 2000 ([§ 5](#5-sizing-and-limits)) |
@@ -144,7 +146,7 @@ Two exceptions, both load-bearing:
 
 The metapage is written into the page's content area — directly after the
 standard header, at `PageGetContents`, with `pd_lower` marking its end — and
-**not** as a line-pointer item. That is where version 1 puts its own metapage
+**not** as a line-pointer item. That is where the blob format puts its own metapage
 and where pgvector puts its HNSW metapage, and it is what makes the version
 check in [§ 11](#11-migration-from-the-interim-format) work: `magic` and
 `version` land at the same page offsets (24 and 28) in both formats, so
@@ -152,13 +154,20 @@ version-2 code reading a version-1 index finds the field it needs at the
 offset it expects, rather than dereferencing a line pointer that format
 never wrote.
 
-Fixed offsets, little-endian, exactly as the version-1 metapage and the graph
-codec already store their scalars:
+Fixed offsets, little-endian, exactly as the blob metapage and the graph codec
+already store their scalars.
+
+**The paged metapage is version 3, not 2.** The blob format took 2 when it grew
+a generation counter, so a paged reader that claimed 2 would find a 24-byte blob
+metapage announcing the version it was looking for and parse 80 bytes out of it —
+which is precisely the misparse the version field exists to prevent. The number
+has to move whenever either format changes shape, and only one of them can hold
+a given value.
 
 ```
 offset size field                notes
-  0     4   magic               0x4252_4E44 "BRND"   ─┐ same offsets as version 1,
-  4     4   version             2                    ─┘ so the version check works
+  0     4   magic               0x4252_4E44 "BRND"   ─┐ same offsets as the blob
+  4     4   version             3                    ─┘ format, so the check works
   8     1   metric              Metric::code()
   9     1   flags               reserved, zero
  10     2   reserved
@@ -835,10 +844,12 @@ storage tests should be written against.
 **There is no in-place upgrade. An index built by the interim format must be
 rebuilt with `REINDEX`.**
 
-- The metapage's `version` field is what detects it: a version-1 index read by
-  version-2 code fails with an error naming the version and telling the user to
-  `REINDEX INDEX <name>` (or `REINDEX TABLE`), rather than misparsing a blob as
-  a metapage.
+- The metapage's `version` field is what detects it: an index in an older format
+  fails with an error naming the format it was written in and telling the user to
+  `REINDEX INDEX <name>` (or `REINDEX TABLE`), rather than misparsing a blob as a
+  metapage. The blob format is at 2 and this design takes 3 — every format that
+  has ever been written needs its own number, or the check silently passes on the
+  wrong layout.
 - That check works only because the two formats agree on where to look, which is
   why [§ 3.2](#32-metapage-block-0-page-contents) keeps the metapage in the page
   content area rather than making it a line-pointer item: `magic` and `version`

@@ -140,27 +140,40 @@ fn read_tid_table<S: GraphBytes + ?Sized>(src: &mut S) -> Result<Vec<TidPair>, P
 // --- page IO -------------------------------------------------------------
 
 const META_MAGIC: u32 = 0x4252_4E44; // "BRND"
-const STORAGE_VERSION: u32 = 1;
+/// Bumped to 2 when the generation counter was added; a version-1 metapage has
+/// no room for it, so an index written by an older build is refused rather than
+/// read with a garbage generation.
+const STORAGE_VERSION: u32 = 2;
 
-/// Metapage payload at block 0: magic, version, blob length — little-endian,
-/// like every other layer of the blob format.
-const META_SIZE: usize = 16;
+/// Metapage payload at block 0: magic, version, blob length, generation —
+/// little-endian, like every other layer of the blob format.
+const META_SIZE: usize = 24;
 
-fn encode_meta(blob_len: u64) -> [u8; META_SIZE] {
+/// Written by [`write_index_blob`]; every later write increments it. A reader
+/// holding a decoded copy compares against it to decide whether that copy is
+/// still the index. Starting above zero keeps a zeroed page from reading as a
+/// valid generation.
+const FIRST_GENERATION: u64 = 1;
+
+fn encode_meta(blob_len: u64, generation: u64) -> [u8; META_SIZE] {
     let mut meta = [0u8; META_SIZE];
     meta[0..4].copy_from_slice(&META_MAGIC.to_le_bytes());
     meta[4..8].copy_from_slice(&STORAGE_VERSION.to_le_bytes());
     meta[8..16].copy_from_slice(&blob_len.to_le_bytes());
+    meta[16..24].copy_from_slice(&generation.to_le_bytes());
     meta
 }
 
-/// `(magic, version, blob_len)` from metapage contents.
-fn decode_meta(bytes: &[u8; META_SIZE]) -> (u32, u32, u64) {
+/// `(magic, version, blob_len, generation)` from metapage contents.
+fn decode_meta(bytes: &[u8; META_SIZE]) -> (u32, u32, u64, u64) {
     (
         u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
         u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]),
         u64::from_le_bytes([
             bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15],
+        ]),
+        u64::from_le_bytes([
+            bytes[16], bytes[17], bytes[18], bytes[19], bytes[20], bytes[21], bytes[22], bytes[23],
         ]),
     )
 }
@@ -242,7 +255,7 @@ pub unsafe fn write_index_blob(
         index,
         forknum,
         pg_sys::InvalidBlockNumber,
-        &encode_meta(blob.len() as u64),
+        &encode_meta(blob.len() as u64, FIRST_GENERATION),
     );
     for chunk in blob.chunks(PAGE_CHUNK_CAPACITY) {
         write_page(index, forknum, pg_sys::InvalidBlockNumber, chunk);
@@ -270,7 +283,12 @@ pub unsafe fn rewrite_index_blob(index: pg_sys::Relation, blob: &[u8]) {
     let forknum = pg_sys::ForkNumber::MAIN_FORKNUM;
     let existing = pg_sys::RelationGetNumberOfBlocksInFork(index, forknum);
 
-    let meta = encode_meta(blob.len() as u64);
+    // Every rewrite advances the generation, which is how a reader holding a
+    // decoded copy of the previous image learns it is looking at history. The
+    // caller holds the image lock exclusively, so this read-modify-write cannot
+    // race another writer.
+    let generation = read_meta(index).2.wrapping_add(1);
+    let meta = encode_meta(blob.len() as u64, generation);
     let mut blkno: pg_sys::BlockNumber = 0;
     for contents in core::iter::once(&meta[..]).chain(blob.chunks(PAGE_CHUNK_CAPACITY)) {
         let target = if blkno < existing {
@@ -491,11 +509,11 @@ impl GraphBytes for PageBytes {
     }
 }
 
-/// Validate the metapage and return `(block count, declared payload length)`.
+/// Validate the metapage and return `(block count, payload length, generation)`.
 ///
 /// # Safety
 /// `index` must be an open brindle index relation locked at least AccessShare.
-unsafe fn read_meta(index: pg_sys::Relation) -> (pg_sys::BlockNumber, usize) {
+unsafe fn read_meta(index: pg_sys::Relation) -> (pg_sys::BlockNumber, usize, u64) {
     let nblocks = pg_sys::RelationGetNumberOfBlocksInFork(index, pg_sys::ForkNumber::MAIN_FORKNUM);
     if nblocks == 0 {
         error!("brindle: index has no pages (never built?)");
@@ -503,16 +521,29 @@ unsafe fn read_meta(index: pg_sys::Relation) -> (pg_sys::BlockNumber, usize) {
 
     let mut meta_bytes = Vec::new();
     read_page_contents(index, 0, &mut meta_bytes);
-    let meta: &[u8; META_SIZE] = meta_bytes
-        .first_chunk::<META_SIZE>()
+    // Magic and version are read before the length check, because an index
+    // written by an older build has a *shorter* metapage — so checking the size
+    // first would report it as corrupt when it is merely old, and say nothing
+    // about what to do. Both fields sit at the same offsets in every version,
+    // which is what makes reading them out of a short metapage safe.
+    let header: &[u8; 8] = meta_bytes
+        .first_chunk::<8>()
         .unwrap_or_else(|| error!("brindle: metapage too short ({} bytes)", meta_bytes.len()));
-    let (magic, version, blob_len) = decode_meta(meta);
+    let magic = u32::from_le_bytes([header[0], header[1], header[2], header[3]]);
     if magic != META_MAGIC {
         error!("brindle: bad metapage magic {magic:#x}");
     }
+    let version = u32::from_le_bytes([header[4], header[5], header[6], header[7]]);
     if version != STORAGE_VERSION {
-        error!("brindle: unsupported storage version {version}");
+        error!(
+            "brindle: index was written in storage format {version}, this build reads {STORAGE_VERSION}; REINDEX to rebuild it"
+        );
     }
+
+    let meta: &[u8; META_SIZE] = meta_bytes
+        .first_chunk::<META_SIZE>()
+        .unwrap_or_else(|| error!("brindle: metapage too short ({} bytes)", meta_bytes.len()));
+    let (_, _, blob_len, generation) = decode_meta(meta);
     let blob_len = usize::try_from(blob_len)
         .unwrap_or_else(|_| error!("brindle: metapage blob length out of range"));
     // Never trust a length the relation can't physically hold — it would turn
@@ -523,7 +554,7 @@ unsafe fn read_meta(index: pg_sys::Relation) -> (pg_sys::BlockNumber, usize) {
         );
     }
 
-    (nblocks, blob_len)
+    (nblocks, blob_len, generation)
 }
 
 /// Block whose heavyweight page lock arbitrates the stored image: share to read
@@ -551,7 +582,7 @@ pub unsafe fn load_index(index: pg_sys::Relation) -> (Hnsw, Vec<TidPair>) {
     // A writer already holding the exclusive lock re-enters here freely: the
     // lock manager never conflicts a request with the requester's own locks.
     pg_sys::LockPage(index, IMAGE_LOCK_BLOCK, pg_sys::ShareLock as i32);
-    let (nblocks, blob_len) = read_meta(index);
+    let (nblocks, blob_len, _generation) = read_meta(index);
     let mut src = PageBytes::new(index, nblocks, blob_len);
 
     // Same framing the slice path performs, driven off the page walk so the
@@ -578,6 +609,184 @@ pub unsafe fn load_index(index: pg_sys::Relation) -> (Hnsw, Vec<TidPair>) {
         );
     }
     (hnsw, tids)
+}
+
+/// A decoded index kept for the backend that decoded it.
+///
+/// Every scan otherwise re-reads and re-decodes the whole index before it can
+/// walk it, which is where a query's time goes. This holds one decoded copy per
+/// index per backend, good while the generation it was decoded at still matches
+/// the metapage.
+///
+/// It is per-backend and invisible to every other connection, which is the trade
+/// being made: memory the buffer manager cannot share, for latency. Paged
+/// storage replaces it with a shared, bounded cache; this is not a substitute.
+pub struct CachedIndex {
+    generation: u64,
+    bytes: usize,
+    hnsw: Hnsw,
+    tids: Vec<TidPair>,
+}
+
+/// Reference-counted because a scan borrows the cache for its whole life while
+/// anything else in the same backend may replace it — an insert bumps the
+/// generation, and the next scan finds the copy stale. Dropping the cache's
+/// reference then leaves a scan still holding one, and the graph lives until
+/// that scan ends. Freeing it outright instead is a use-after-free.
+type CacheRef = std::rc::Rc<CachedIndex>;
+
+/// Identifies the *physical* relation, so a REINDEX, TRUNCATE or VACUUM FULL —
+/// each of which writes a new relfilenode — cannot be mistaken for the index the
+/// cached copy came from, whatever its generation happens to say.
+type CacheKey = (pg_sys::Oid, pg_sys::Oid, pg_sys::RelFileNumber);
+
+thread_local! {
+    /// The backend's decoded indexes.
+    ///
+    /// Deliberately *not* hung off `rd_amcache`. That field's contract is a
+    /// single palloc'd chunk which Postgres frees outright on a relcache
+    /// invalidation — without running memory-context callbacks, since those fire
+    /// on reset, not on pfree. Ownership reachable only from there is therefore
+    /// dropped on the floor by routine events (ALTER, REINDEX, an autovacuum
+    /// stats update, a sinval overflow), leaking a whole decoded graph each
+    /// time, and leaves any registered callback pointing into a freed chunk that
+    /// the allocator has already written its freelist link across.
+    ///
+    /// A Postgres backend is single-threaded, so thread-local is backend-local.
+    static CACHE: std::cell::RefCell<std::collections::HashMap<CacheKey, CacheRef>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// What a reader gets back: the backend's cached copy, or a decode owned by the
+/// caller when caching is off or the index does not fit.
+pub enum IndexHandle {
+    Cached(CacheRef),
+    /// Boxed so the handle stays small: a graph inline would make every handle,
+    /// cached or not, as large as an uncached one.
+    Fresh(Box<(Hnsw, Vec<TidPair>)>),
+}
+
+impl IndexHandle {
+    pub fn graph(&self) -> &Hnsw {
+        match self {
+            IndexHandle::Cached(c) => &c.hnsw,
+            IndexHandle::Fresh(owned) => &owned.0,
+        }
+    }
+
+    pub fn tids(&self) -> &[TidPair] {
+        match self {
+            IndexHandle::Cached(c) => &c.tids,
+            IndexHandle::Fresh(owned) => &owned.1,
+        }
+    }
+}
+
+/// Rough resident size of a decoded graph, for comparison against the ceiling.
+fn cached_bytes(hnsw: &Hnsw, tids: &Vec<TidPair>) -> usize {
+    // Capacity rather than length, matching `resident_bytes`: an under-estimate
+    // would let the cache sit over its ceiling.
+    hnsw.resident_bytes() + tids.capacity() * core::mem::size_of::<TidPair>()
+}
+
+/// # Safety
+/// `index` must be an open index relation.
+unsafe fn cache_key(index: pg_sys::Relation) -> CacheKey {
+    let locator = (*index).rd_locator;
+    (locator.spcOid, locator.dbOid, locator.relNumber)
+}
+
+/// The decoded index — this backend's copy when it is still current.
+///
+/// Reading block 0 to compare generations costs a buffer lookup against the tens
+/// of milliseconds a decode costs, so it is worth doing on every call.
+///
+/// # Safety
+/// `index` must be an open brindle index relation locked at least AccessShare.
+pub unsafe fn cached_index(index: pg_sys::Relation) -> IndexHandle {
+    pg_sys::LockPage(index, IMAGE_LOCK_BLOCK, pg_sys::ShareLock as i32);
+    let (_, _, generation) = read_meta(index);
+    pg_sys::UnlockPage(index, IMAGE_LOCK_BLOCK, pg_sys::ShareLock as i32);
+
+    // Read the ceiling before consulting the cache rather than only before
+    // filling it. Lowering it has to stop a backend *using* what it already
+    // holds, or the setting means "stop adding" rather than what it says.
+    let ceiling = crate::guc::cache_max_mb() as usize * 1024 * 1024;
+    let key = cache_key(index);
+
+    let hit = CACHE.with(|c| {
+        let mut cache = c.borrow_mut();
+        if ceiling == 0 {
+            // Caching switched off: give up everything, not just this entry.
+            cache.clear();
+            return None;
+        }
+        // A lowered ceiling has to bind now, not at the next fill: several
+        // entries each under it can still add up over it, and an operator who
+        // lowers this is asking for the memory back rather than for a promise
+        // about the next scan.
+        let mut total: usize = cache.values().map(|e| e.bytes).sum();
+        while total > ceiling {
+            let Some(victim) = cache.keys().find(|k| **k != key).copied() else {
+                break;
+            };
+            if let Some(dropped) = cache.remove(&victim) {
+                total = total.saturating_sub(dropped.bytes);
+            }
+        }
+        match cache.get(&key) {
+            // Written since this copy was decoded — possibly by another backend,
+            // which sends no relcache invalidation for ordinary DML. This
+            // comparison is the only thing between a reader and answers from an
+            // index that no longer exists.
+            Some(entry) if entry.generation != generation => {
+                cache.remove(&key);
+                None
+            }
+            // Over a ceiling that has since been lowered.
+            Some(entry) if entry.bytes > ceiling => {
+                cache.remove(&key);
+                None
+            }
+            Some(entry) => Some(entry.clone()),
+            None => None,
+        }
+    });
+    if let Some(entry) = hit {
+        return IndexHandle::Cached(entry);
+    }
+
+    let (hnsw, tids) = load_index(index);
+    let bytes = cached_bytes(&hnsw, &tids);
+    if ceiling == 0 || bytes > ceiling {
+        return IndexHandle::Fresh(Box::new((hnsw, tids)));
+    }
+
+    let entry: CacheRef = std::rc::Rc::new(CachedIndex {
+        generation,
+        bytes,
+        hnsw,
+        tids,
+    });
+    CACHE.with(|c| {
+        let mut cache = c.borrow_mut();
+        // The ceiling bounds the backend, not one index: several indexes each
+        // under it would otherwise add up past it without ever tripping. Nothing
+        // here is smart about which to drop — a backend over budget is already
+        // in trouble, and a scan holding a reference keeps its own copy alive
+        // regardless.
+        let mut total: usize = cache.values().map(|e| e.bytes).sum();
+        while total + bytes > ceiling {
+            let Some(victim) = cache.keys().next().copied() else {
+                break;
+            };
+            if let Some(dropped) = cache.remove(&victim) {
+                total = total.saturating_sub(dropped.bytes);
+            }
+        }
+        cache.insert(key, entry.clone());
+    });
+    IndexHandle::Cached(entry)
 }
 
 #[cfg(test)]
