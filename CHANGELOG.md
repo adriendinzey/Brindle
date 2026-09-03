@@ -42,6 +42,24 @@ versions may break).
 
 ### Changed
 
+- **A transaction's inserts are written back to the index once, when it ends,
+  rather than once per row.** Every write rewrites the whole stored image, so
+  doing that per row made a bulk load quadratic in the table; `INSERT ... SELECT`
+  of N rows is now linear. Measured on a 20 000-row index, a row inserted as
+  part of a larger statement went from 26.5 ms to 0.36 ms, and no longer grows
+  with the index.
+
+  A single-row `INSERT` is its own transaction, so it has nothing to batch: its
+  cost improved (29.8 ms to 3.5 ms on that index, mostly from reusing the cached
+  copy) but still grows with the index. Not rewriting the whole image per row
+  needs the paged storage this format is a placeholder for.
+
+  Two consequences worth knowing. A transaction's own rows are visible to it
+  before it commits, as before, but they reach the index relation at commit — so
+  a crash mid-transaction leaves the index as it was, which is what rolling that
+  transaction back means anyway. And a `plpgsql` block with an `EXCEPTION`
+  handler opens a subtransaction per iteration, which forces a write-back each
+  time; such a loop gets no batching, though it is no slower than before.
 - A backend now keeps one decoded copy of an index in memory and reuses it
   across scans, instead of reading and decoding the whole index for every query.
   On a 100k × 128 index that takes a query from ~58 ms to ~0.3 ms. The first

@@ -23,6 +23,7 @@ CREATE TABLE ins_bench (id int, embedding real[]);
 -- Autovacuum must not rewrite the image underneath the measurement.
 ALTER TABLE ins_bench SET (autovacuum_enabled = off);
 
+DROP TABLE IF EXISTS ins_results;
 CREATE TABLE ins_results (
     rows_in_index int,
     shape         text,
@@ -41,7 +42,7 @@ DECLARE
     started timestamptz;
     j       int;
     single  int := 3;
-    batch   int := 30;
+    batch   int := 100;
 BEGIN
     FOREACH n IN ARRAY sizes LOOP
         TRUNCATE ins_bench;

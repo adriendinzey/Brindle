@@ -227,6 +227,52 @@ One caveat the medians hide: the same table's p95 paired deltas run 3–16 ms,
 many times the median. The "1% of a query" figure is a statement about the
 median query, and the tail is worse.
 
+## What an insert costs
+
+Every write rewrites the whole stored image, so an insert's cost tracks the size
+of the index rather than the size of the row. A transaction's inserts are now
+applied to a graph held in memory and written back once when it ends, which
+matters entirely for how they arrive:
+
+```bash
+INSERTS=1 scripts/bench_index.sh    # this table, on its own fixtures
+```
+
+Per row, at 128 dimensions, two samples:
+
+| rows in index | one row per statement | 100 rows in one statement |
+|---|---|---|
+| 2 000 | 3.14 / 3.31 ms | 1.67 / 1.80 ms |
+| 8 000 | 4.97 / 4.34 ms | 1.63 / 1.70 ms |
+| 20 000 | 7.10 / 6.62 ms | 1.61 / 1.61 ms |
+
+**A row inserted as part of a larger statement costs the same whatever the index
+holds.** That is the change: `INSERT ... SELECT` was quadratic in the table,
+because each row paid to rewrite everything already in it, and is now linear.
+
+**A row inserted on its own still gets more expensive as the index grows**, and
+that is not fixable here. A single-row `INSERT` is its own transaction, so there
+is nothing to batch with; it rewrites the image exactly as before. Not rewriting
+the whole image per row is paged storage.
+
+The fixtures are small on purpose, and the reason is the measurement rather than
+patience: it is quadratic in the fixture, so timing the old behaviour at a
+realistic size takes longer than anyone will wait. An attempt to measure the
+previous code at these dimensions was abandoned after twenty minutes without
+finishing — which is the same fact the table reports, arrived at the hard way.
+The before/after pair below was therefore taken at 32 dimensions, where it
+completes:
+
+| rows in index | one per statement, before → after | in one statement, before → after |
+|---|---|---|
+| 2 000 | 2.91 → 1.45 ms | 2.69 → 0.40 ms |
+| 8 000 | 7.89 → 2.15 ms | 9.87 → 0.36 ms |
+| 20 000 | 29.75 → 3.52 ms | 26.45 → 0.36 ms |
+
+Read the two tables as answering different questions: the first is what an insert
+costs today at the width the rest of this file uses, the second is what changed.
+They are not comparable to each other.
+
 ## Comparison with pgvector
 
 pgvector 0.8.0, built against the same PostgreSQL, indexing **the same rows**,
