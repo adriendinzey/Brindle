@@ -721,6 +721,19 @@ pub unsafe fn cached_index(index: pg_sys::Relation) -> IndexHandle {
             cache.clear();
             return None;
         }
+        // A lowered ceiling has to bind now, not at the next fill: several
+        // entries each under it can still add up over it, and an operator who
+        // lowers this is asking for the memory back rather than for a promise
+        // about the next scan.
+        let mut total: usize = cache.values().map(|e| e.bytes).sum();
+        while total > ceiling {
+            let Some(victim) = cache.keys().find(|k| **k != key).copied() else {
+                break;
+            };
+            if let Some(dropped) = cache.remove(&victim) {
+                total = total.saturating_sub(dropped.bytes);
+            }
+        }
         match cache.get(&key) {
             // Written since this copy was decoded — possibly by another backend,
             // which sends no relcache invalidation for ordinary DML. This

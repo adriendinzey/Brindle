@@ -48,7 +48,7 @@ this file should ever gate a merge.
 
 | | |
 |---|---|
-| Commit | `ecbc16c` |
+| Commit | `ecbc16c` — later commits moved where the cached copy lives without changing what a warm scan does (a hash lookup either way) or what a cold one costs |
 | Machine | Intel i7-9700K @ 3.6 GHz, 8 cores, 15 GB RAM, WSL2 (kernel 6.18) |
 | PostgreSQL | 17.10, pgrx-managed, default `postgresql.conf` |
 | Build | `cargo build --release`, no `target-cpu` flag (baseline x86-64) |
@@ -302,7 +302,7 @@ two of five, which is why the low ends above moved again. Expect the next build
 to fall outside this range too.
 
 So the recall gap at `ef_search = 64` is somewhere around **0.003 to 0.024**,
-and any single-run figure for pgvector — including the 0.976 in the table above
+and any single-run figure for pgvector — including the 0.978 in the table above
 — is one sample rather than the value. An earlier version of this document
 quoted the flattering end of that range as though it were the result.
 
@@ -324,7 +324,7 @@ measures the dataset and not the index — and it is why the recall figures in
 this file should never be quoted without the fixture they came from.
 
 Both sides also build ~2× slower on this fixture than on the clustered one
-(Brindle 236.7 s against 114.0 s; pgvector 83.4 s serial against 41.4 s):
+(Brindle 224.9 s against 106.0 s; pgvector 77.1 s serial against 39.2 s):
 structure makes neighbour selection converge faster, for both implementations.
 
 ### Ways this comparison is still not apples to apples

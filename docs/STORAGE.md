@@ -154,13 +154,20 @@ version-2 code reading a version-1 index finds the field it needs at the
 offset it expects, rather than dereferencing a line pointer that format
 never wrote.
 
-Fixed offsets, little-endian, exactly as the version-1 metapage and the graph
-codec already store their scalars:
+Fixed offsets, little-endian, exactly as the blob metapage and the graph codec
+already store their scalars.
+
+**The paged metapage is version 3, not 2.** The blob format took 2 when it grew
+a generation counter, so a paged reader that claimed 2 would find a 24-byte blob
+metapage announcing the version it was looking for and parse 80 bytes out of it —
+which is precisely the misparse the version field exists to prevent. The number
+has to move whenever either format changes shape, and only one of them can hold
+a given value.
 
 ```
 offset size field                notes
-  0     4   magic               0x4252_4E44 "BRND"   ─┐ same offsets as version 1,
-  4     4   version             2                    ─┘ so the version check works
+  0     4   magic               0x4252_4E44 "BRND"   ─┐ same offsets as the blob
+  4     4   version             3                    ─┘ format, so the check works
   8     1   metric              Metric::code()
   9     1   flags               reserved, zero
  10     2   reserved
@@ -837,10 +844,12 @@ storage tests should be written against.
 **There is no in-place upgrade. An index built by the interim format must be
 rebuilt with `REINDEX`.**
 
-- The metapage's `version` field is what detects it: a version-1 index read by
-  version-2 code fails with an error naming the version and telling the user to
-  `REINDEX INDEX <name>` (or `REINDEX TABLE`), rather than misparsing a blob as
-  a metapage.
+- The metapage's `version` field is what detects it: an index in an older format
+  fails with an error naming the format it was written in and telling the user to
+  `REINDEX INDEX <name>` (or `REINDEX TABLE`), rather than misparsing a blob as a
+  metapage. The blob format is at 2 and this design takes 3 — every format that
+  has ever been written needs its own number, or the check silently passes on the
+  wrong layout.
 - That check works only because the two formats agree on where to look, which is
   why [§ 3.2](#32-metapage-block-0-page-contents) keeps the metapage in the page
   content area rather than making it a line-pointer item: `magic` and `version`

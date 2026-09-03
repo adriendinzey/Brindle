@@ -55,7 +55,10 @@ BEGIN
     END IF;
 END $$;
 
--- And a delete from the other session must stop being answered too.
+-- A delete from the other session, for completeness. This one does not
+-- discriminate on its own — the heap recheck hides the row whether or not the
+-- index dropped it — so it is here to exercise the path, not to prove it. The
+-- insert above is the assertion that fails when staleness detection is removed.
 SELECT dblink_exec(
     'dbname=' || current_database() ||
     ' port=' || current_setting('port') ||
@@ -74,14 +77,13 @@ BEGIN
 END $$;
 
 -- REINDEX writes a new relfilenode, so a cached copy keyed on the old one can
--- never be mistaken for the new index. Asserting that deleted rows stop being
--- returned would prove nothing — Postgres rechecks heap visibility for every TID
--- an index scan hands back, so they disappear whether or not the index knows.
--- An earlier version of this block did exactly that and passed against a
--- knowingly stale cache with no REINDEX at all.
+-- never be mistaken for the new index.
 --
--- What a stale copy actually does is return *too few* rows: it still holds the
--- deleted nodes, the recheck drops them, and the scan comes up short. So count.
+-- This block exercises that path but does not isolate it: with the deleted rows
+-- interleaved among the survivors, a stale copy still has enough live candidates
+-- within the search budget to answer correctly. `cache_notices_a_rebuilt_index`
+-- is the case that fails when the key is removed, by deleting a contiguous run
+-- and querying where it used to be.
 DELETE FROM cache_x WHERE id <= 150;
 REINDEX INDEX cache_x_idx;
 
