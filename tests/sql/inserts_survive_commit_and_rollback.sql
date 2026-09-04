@@ -48,9 +48,11 @@ BEGIN
     END IF;
 END $$;
 
--- Rolled back rows must leave nothing behind. Nothing was written, so the
--- rollback is the discard — but if the flush ever moved earlier, this is what
--- would notice.
+-- Rolled back rows must not be returned. This one does not discriminate on its
+-- own: MVCC hides index entries for aborted heap tuples, so it passes whether or
+-- not the staged rows were discarded. It is here because the behaviour is worth
+-- stating, not because it would catch a regression — the in-transaction
+-- visibility check above and the post-commit check are what do that.
 BEGIN;
 INSERT INTO defer_t
 SELECT i, ARRAY[i::real, (i + 1)::real] FROM generate_series(9000, 9099) i;
@@ -92,6 +94,9 @@ BEGIN
     END IF;
     SELECT id INTO dropped FROM defer_t
     ORDER BY embedding <-> ARRAY[6003.0, 6004.0]::real[] LIMIT 1;
+    -- As with the rollback above, MVCC would hide this row anyway; the
+    -- assertion that carries weight is the one before it, that the row from
+    -- *before* the savepoint survived. A stale flush would lose that one.
     IF dropped = 6002 THEN
         RAISE EXCEPTION 'the row after the savepoint survived its rollback';
     END IF;

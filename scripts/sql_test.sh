@@ -68,9 +68,12 @@ cargo pgrx install --pg-config "$pg_config" >/dev/null
 # Two-phase commit is off by default, and one case needs it. Setting it costs
 # nothing when unused and cannot be changed without a restart, so it goes in
 # before the cluster starts rather than being skipped around.
+# `cargo pgrx start` creates the data directory on first use, so the setting has
+# to go in after that and before the case that needs it — writing it only when
+# the file already exists leaves a fresh machine failing on its own assertion.
+cargo pgrx start "pg$PG" >/dev/null
 datadir="$PGRX_HOME/data-$PG"
-if [[ -f "$datadir/postgresql.conf" ]] \
-   && ! grep -q '^max_prepared_transactions' "$datadir/postgresql.conf"; then
+if ! grep -q '^max_prepared_transactions' "$datadir/postgresql.conf"; then
   echo "max_prepared_transactions = 10" >>"$datadir/postgresql.conf"
   cargo pgrx stop "pg$PG" >/dev/null 2>&1 || true
 fi

@@ -55,12 +55,21 @@ versions may break).
   rewriting the image per row needs the paged storage this format is a
   placeholder for.
 
-  Two consequences worth knowing. A transaction's own rows are visible to it
-  before it commits, as before, but they reach the index relation at commit — so
-  a crash mid-transaction leaves the index as it was, which is what rolling that
-  transaction back means anyway. And a `plpgsql` block with an `EXCEPTION`
-  handler opens a subtransaction per iteration, which forces a write-back each
-  time; such a loop gets no batching, though it is no slower than before.
+  Consequences worth knowing. A transaction's own rows are visible to it before
+  it commits, as before, but they reach the index relation at commit — so a crash
+  mid-transaction leaves the index as it was, which is what rolling that
+  transaction back means anyway. A `plpgsql` block with an `EXCEPTION` handler
+  opens a subtransaction per iteration and so forces a write-back each time; such
+  a loop gets no batching, though it is no slower than before. **A table with two
+  brindle indexes gets no batching either** — only one index's rows are staged at
+  a time, so writes to a second flush the first.
+
+  While a transaction is staging rows it holds a decoded copy of the index plus a
+  copy of every vector it has inserted, and **neither is bounded by
+  `brindle.cache_max_mb`** — they exist even when that is zero. A large bulk load
+  into a wide-vector index can therefore hold a substantial amount of memory for
+  the length of the transaction. Splitting such a load into several transactions
+  bounds it, at the cost of one write-back each.
 - A backend now keeps one decoded copy of an index in memory and reuses it
   across scans, instead of reading and decoding the whole index for every query.
   On a 100k × 128 index that takes a query from ~58 ms to ~0.3 ms. The first

@@ -865,6 +865,14 @@ pub unsafe fn pending_insert(
             pg_sys::LockPage(index, IMAGE_LOCK_BLOCK, pg_sys::ShareLock as i32);
             let (_, _, generation) = read_meta(index);
             pg_sys::UnlockPage(index, IMAGE_LOCK_BLOCK, pg_sys::ShareLock as i32);
+            // Decoded rather than taken from the backend's cache, which the
+            // card asked about explicitly. The cache hands out a shared
+            // reference and staging needs to mutate, so reusing it would mean
+            // cloning the graph — for the reference index that is copying about
+            // 89 MB against a 58 ms decode, and the cached copy would still be
+            // invalidated by this transaction's own write. Handing the finished
+            // graph *to* the cache at flush time would be worth having, and is a
+            // different change from this one.
             let (hnsw, tids) = load_index(index);
             *pending = Some(PendingWrite {
                 key,
