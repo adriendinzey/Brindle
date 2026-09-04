@@ -970,8 +970,16 @@ pub fn flush_pending() {
 /// Flush at commit, discard at abort.
 unsafe extern "C" fn xact_callback(event: pg_sys::XactEvent::Type, _arg: *mut core::ffi::c_void) {
     match event {
+        // PRE_PREPARE matters as much as PRE_COMMIT: a two-phase transaction
+        // that only reached PREPARE would otherwise have its rows dropped here
+        // and never written, so COMMIT PREPARED would report success over an
+        // index that never received them. Writing at prepare rather than at
+        // commit publishes them slightly early, which is the behaviour every
+        // brindle write had before this batching — the index is not
+        // transactional, and making it so is the storage work's job.
         pg_sys::XactEvent::XACT_EVENT_PRE_COMMIT
-        | pg_sys::XactEvent::XACT_EVENT_PARALLEL_PRE_COMMIT => {
+        | pg_sys::XactEvent::XACT_EVENT_PARALLEL_PRE_COMMIT
+        | pg_sys::XactEvent::XACT_EVENT_PRE_PREPARE => {
             let write = PENDING.with(|p| p.borrow_mut().take());
             flush_locked(write);
         }

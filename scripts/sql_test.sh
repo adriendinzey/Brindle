@@ -65,6 +65,16 @@ fi
 echo "==> installing the extension into pg$PG"
 cargo pgrx install --pg-config "$pg_config" >/dev/null
 
+# Two-phase commit is off by default, and one case needs it. Setting it costs
+# nothing when unused and cannot be changed without a restart, so it goes in
+# before the cluster starts rather than being skipped around.
+datadir="$PGRX_HOME/data-$PG"
+if [[ -f "$datadir/postgresql.conf" ]] \
+   && ! grep -q '^max_prepared_transactions' "$datadir/postgresql.conf"; then
+  echo "max_prepared_transactions = 10" >>"$datadir/postgresql.conf"
+  cargo pgrx stop "pg$PG" >/dev/null 2>&1 || true
+fi
+
 echo "==> starting pg$PG (port $port)"
 cargo pgrx start "pg$PG" >/dev/null
 
