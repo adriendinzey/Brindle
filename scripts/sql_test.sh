@@ -81,6 +81,13 @@ fi
 echo "==> starting pg$PG (port $port)"
 cargo pgrx start "pg$PG" >/dev/null
 
+# One case moves an index between tablespaces, and a tablespace needs an empty
+# directory Postgres owns — which SQL cannot create for itself, and which may not
+# live inside the data directory. Cases read the path from `:tablespace_dir`.
+tablespace_dir="$PGRX_HOME/sql-test-tablespace-$PG"
+rm -rf "$tablespace_dir"
+mkdir -p "$tablespace_dir"
+
 echo "==> $("$bindir/postgres" --version | awk '{print $3}'), ${#cases[@]} case(s)"
 echo
 
@@ -103,7 +110,8 @@ for case_file in "${cases[@]}"; do
 
   output_file="$(mktemp)"
   if "$bindir/psql" --host "$host" --port "$port" --dbname "$db" --quiet --no-psqlrc \
-       --set=ON_ERROR_STOP=1 --file "$case_file" >"$output_file" 2>&1; then
+       --set=ON_ERROR_STOP=1 --set=tablespace_dir="$tablespace_dir" \
+       --file "$case_file" >"$output_file" 2>&1; then
     printf 'ok    %s\n' "$name"
   else
     printf 'FAIL  %s\n' "$name"

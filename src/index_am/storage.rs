@@ -824,6 +824,10 @@ struct PendingWrite {
     /// transaction was open and the mutations have to be replayed onto its
     /// image rather than written over it.
     base_generation: u64,
+    /// Payload length the graph below was derived from. Together with the
+    /// generation this identifies the *image*, which is what distinguishes a
+    /// relation that merely moved from one that was rebuilt.
+    base_blob_len: usize,
     hnsw: Hnsw,
     tids: Vec<TidPair>,
     /// The rows applied, kept for that replay. Costs a second copy of each
@@ -862,8 +866,12 @@ pub unsafe fn pending_insert(
             flush_locked(pending.take());
         }
         if pending.is_none() {
+            // Read under the same lock the load takes, so the recorded image
+            // identity is the one actually loaded. Reading it separately leaves
+            // a window for another backend to commit in between, which only
+            // costs an unnecessary replay at flush but is avoidable.
             pg_sys::LockPage(index, IMAGE_LOCK_BLOCK, pg_sys::ShareLock as i32);
-            let (_, _, generation) = read_meta(index);
+            let (_, blob_len, generation) = read_meta(index);
             pg_sys::UnlockPage(index, IMAGE_LOCK_BLOCK, pg_sys::ShareLock as i32);
             // Decoded rather than taken from the backend's cache, which the
             // card asked about explicitly. The cache hands out a shared
@@ -878,6 +886,7 @@ pub unsafe fn pending_insert(
                 key,
                 index_oid: oid,
                 base_generation: generation,
+                base_blob_len: blob_len,
                 hnsw,
                 tids,
                 applied: Vec::new(),
@@ -942,28 +951,34 @@ fn flush_locked(write: Option<PendingWrite>) {
             return;
         }
 
-        // The oid outlives a rebuild, so opening it says nothing about whether
-        // this is still the same index. TRUNCATE and REINDEX both give the
-        // relation a new relfilenode while keeping the oid, and the generation
-        // cannot tell them apart either — a rebuild starts counting again, so a
-        // staged graph derived from generation 1 compares equal to the fresh
-        // one and would be written straight over it. The result is an index full
-        // of pointers into a heap that no longer has those rows, which every
-        // later scan hits as a read past the end of the file.
+        pg_sys::LockPage(rel, IMAGE_LOCK_BLOCK, pg_sys::ExclusiveLock as i32);
+
+        let (_, current_len, current) = read_meta(rel);
+
+        // Whether this is still the same *image* is the question, and neither
+        // the oid nor the relfilenode answers it on its own. The oid outlives a
+        // rebuild. The relfilenode changes for a rebuild and equally for a plain
+        // move — ALTER INDEX ... SET TABLESPACE copies the image byte for byte —
+        // so keying on it alone throws away staged rows that had somewhere
+        // perfectly good to go. And the generation cannot stand alone either: a
+        // rebuild starts counting again, so a graph staged at generation 1
+        // compares equal to a freshly built one and gets written over it,
+        // leaving entries pointing into a heap that no longer holds those rows.
         //
-        // Discarding is right for both. TRUNCATE emptied the heap, so there is
-        // nothing left for the staged rows to point at; a non-concurrent REINDEX
-        // in the same transaction rebuilds from a heap that already contains
-        // them.
-        if cache_key(rel) != write.key {
+        // Generation and payload length together do answer it. A move preserves
+        // both, so the staged graph still belongs. A rebuild changes the length:
+        // TRUNCATE empties the image, and a REINDEX in this transaction rebuilds
+        // from a heap that already contains the staged rows, so it comes out
+        // larger. Either way the staged graph is the wrong thing to write, and
+        // the rows are already accounted for or gone.
+        let same_image = current == write.base_generation && current_len == write.base_blob_len;
+        if !same_image && cache_key(rel) != write.key {
+            pg_sys::UnlockPage(rel, IMAGE_LOCK_BLOCK, pg_sys::ExclusiveLock as i32);
             pg_sys::relation_close(rel, pg_sys::RowExclusiveLock as i32);
             return;
         }
 
-        pg_sys::LockPage(rel, IMAGE_LOCK_BLOCK, pg_sys::ExclusiveLock as i32);
-
-        let (_, _, current) = read_meta(rel);
-        let blob = if current == write.base_generation {
+        let blob = if same_image {
             encode_index(&write.hnsw, &write.tids)
         } else {
             // Somebody else wrote while this transaction was open. Their image
@@ -1019,6 +1034,13 @@ unsafe extern "C" fn xact_callback(event: pg_sys::XactEvent::Type, _arg: *mut co
 }
 
 /// Flush before a subtransaction starts, and discard on its rollback.
+///
+/// One consequence worth naming: `BeginInternalSubTransaction` runs outside
+/// plpgsql's `PG_TRY`, so a write-back that fails here aborts the whole
+/// transaction rather than being caught by the `EXCEPTION` handler that opened
+/// the subtransaction. That is the right outcome for an I/O failure — the
+/// alternative is a handler swallowing the loss of the rows staged before it —
+/// but it is not what a reader of the handler would expect.
 ///
 /// Rolling back to a savepoint has to undo what came after it while keeping what
 /// came before. Flushing at the boundary puts everything before the savepoint on

@@ -50,13 +50,18 @@ DECLARE
     batch   int := 100;
 BEGIN
     FOREACH n IN ARRAY sizes LOOP
+        -- Drop the index before loading the fixture, not after. Loading
+        -- through the previous iteration's index costs one whole-image rewrite
+        -- per row, which on a build without batching turns a one-minute run into
+        -- a ten-minute one — outside the timed region, so it corrupts nobody's
+        -- numbers, only their afternoon.
+        DROP INDEX IF EXISTS ins_bench_idx;
         TRUNCATE ins_bench;
         INSERT INTO ins_bench
         SELECT g, (SELECT array_agg((random() - 0.5)::real) FROM generate_series(1, dims))
         FROM generate_series(1, n) AS g;
         COMMIT;
 
-        DROP INDEX IF EXISTS ins_bench_idx;
         CREATE INDEX ins_bench_idx ON ins_bench USING brindle (embedding);
         COMMIT;
 

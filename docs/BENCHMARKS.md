@@ -22,7 +22,9 @@ pgvector recall table across repeated builds, which is multi-run by construction
 because its subject
 is how far a randomised build moves; the run-to-run ranges quoted for build
 time and for the paired search-cost medians, which exist precisely to show how
-far those move; the plpgsql timing floor of ~0.016 ms; and the check that
+far those move; the plpgsql timing floor of ~0.016 ms; the insert-cost table,
+which is its own run set at a narrower vector width, with a before-column from a
+pre-change build, and names its own command; and the check that
 `max_parallel_maintenance_workers = 0` really took effect, an out-of-band look
 at `pg_stat_activity`. No figure is silently carried in from a run this file
 does not name.
@@ -267,7 +269,7 @@ single-row column no longer shows a win. The fixtures are small because the
 pre-change behaviour is quadratic in the fixture and a realistic size takes
 longer to measure than anyone will wait.
 
-## Comparison with pgvector## Comparison with pgvector
+## Comparison with pgvector
 
 pgvector 0.8.0, built against the same PostgreSQL, indexing **the same rows**,
 answering **the same queries**, scored against **the same ground truth**, at

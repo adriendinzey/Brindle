@@ -58,7 +58,8 @@ versions may break).
   Consequences worth knowing. A transaction's own rows are visible to it before
   it commits, as before, but they reach the index relation at commit — so a crash
   mid-transaction leaves the index as it was, which is what rolling that
-  transaction back means anyway. A `plpgsql` block with an `EXCEPTION` handler
+  transaction back means anyway. A transaction that ends with `PREPARE
+  TRANSACTION` writes them at the prepare rather than at `COMMIT PREPARED`. A `plpgsql` block with an `EXCEPTION` handler
   opens a subtransaction per iteration and so forces a write-back each time; such
   a loop gets no batching, though it is no slower than before. **A table with two
   brindle indexes gets no batching either** — only one index's rows are staged at

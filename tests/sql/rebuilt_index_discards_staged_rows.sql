@@ -73,3 +73,43 @@ BEGIN
             'index: nearest to [9003,9004] is %', nearest;
     END IF;
 END $$;
+
+-- A relation that merely *moved* is not a rebuild, and its staged rows must
+-- still be written. ALTER INDEX ... SET TABLESPACE copies the image byte for
+-- byte while allocating a new relfilenumber, so keying the decision on the
+-- relfilenode alone throws away rows that had somewhere perfectly good to go —
+-- silently, with the row left in the heap and nothing pointing at it.
+CREATE TABLE mv (id int, embedding real[]);
+ALTER TABLE mv SET (autovacuum_enabled = off);
+INSERT INTO mv SELECT i, ARRAY[i::real, (i + 1)::real] FROM generate_series(1, 300) i;
+CREATE INDEX mv_idx ON mv USING brindle (embedding);
+
+-- The harness makes the directory: a tablespace needs one that exists, is
+-- empty, is owned by the server, and is not inside the data directory. The drop
+-- first because a tablespace is cluster-wide, so a case that failed before
+-- reaching its own cleanup leaves the catalog entry behind for the next run.
+DROP TABLESPACE IF EXISTS brindle_move_ts;
+CREATE TABLESPACE brindle_move_ts LOCATION :'tablespace_dir';
+
+BEGIN;
+INSERT INTO mv SELECT 9101, ARRAY[9101.0::real, 9102.0::real];
+ALTER INDEX mv_idx SET TABLESPACE brindle_move_ts;
+COMMIT;
+
+DO $$
+DECLARE nearest int;
+BEGIN
+    SET LOCAL enable_seqscan = off;
+    SELECT id INTO nearest FROM mv
+    ORDER BY embedding <-> ARRAY[9101.0, 9102.0]::real[] LIMIT 1;
+    IF nearest IS DISTINCT FROM 9101 THEN
+        RAISE EXCEPTION
+            'a row staged alongside a tablespace move was dropped: nearest to '
+            '[9101,9102] is %, and the row is in the heap with nothing pointing '
+            'at it', nearest;
+    END IF;
+END $$;
+
+ALTER INDEX mv_idx SET TABLESPACE pg_default;
+DROP TABLE mv;
+DROP TABLESPACE IF EXISTS brindle_move_ts;
