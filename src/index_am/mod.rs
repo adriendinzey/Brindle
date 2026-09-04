@@ -183,6 +183,14 @@ unsafe extern "C" fn ambuild(
     index: pg_sys::Relation,
     index_info: *mut pg_sys::IndexInfo,
 ) -> *mut pg_sys::IndexBuildResult {
+    // A rebuild supersedes anything this transaction had staged for the index.
+    // TRUNCATE has emptied the heap those rows point at, and a REINDEX here
+    // builds from a heap that already contains them — writing them afterwards
+    // would corrupt the index or duplicate its entries. This is also the only
+    // place that can tell a rebuild from a plain relfilenode change: a
+    // tablespace move never reaches here.
+    storage::forget_pending(index);
+
     let mut state = BuildState {
         hnsw: Hnsw::new(build_params(index)),
         heap_tids: Vec::new(),
@@ -218,6 +226,9 @@ unsafe extern "C" fn ambuild(
 
 #[pg_guard]
 unsafe extern "C" fn ambuildempty(index: pg_sys::Relation) {
+    // As in `ambuild`: whatever was staged is superseded by the empty image.
+    storage::forget_pending(index);
+
     // The init fork of an unlogged index: an empty graph, so the index is
     // valid (and empty) after a crash resets the main fork from it.
     let hnsw = Hnsw::new(build_params(index));

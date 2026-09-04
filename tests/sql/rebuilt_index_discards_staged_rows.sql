@@ -113,3 +113,51 @@ END $$;
 ALTER INDEX mv_idx SET TABLESPACE pg_default;
 DROP TABLE mv;
 DROP TABLESPACE IF EXISTS brindle_move_ts;
+
+-- An index built on an *empty* table is the shape that defeats every attempt to
+-- infer a rebuild from the image: TRUNCATE regenerates it byte for byte, same
+-- generation and same length, so content cannot tell the two apart. Only the
+-- rebuild event can, which is why the discard happens there rather than here.
+CREATE TABLE mt (id int, embedding real[]);
+ALTER TABLE mt SET (autovacuum_enabled = off);
+CREATE INDEX mt_idx ON mt USING brindle (embedding);
+
+BEGIN;
+INSERT INTO mt SELECT i, ARRAY[i::real, (i + 1)::real] FROM generate_series(1, 5) i;
+TRUNCATE mt;
+COMMIT;
+
+DO $$
+DECLARE found bigint;
+BEGIN
+    SET LOCAL enable_seqscan = off;
+    SELECT count(*) INTO found
+    FROM (SELECT id FROM mt ORDER BY embedding <-> ARRAY[3.0, 4.0]::real[] LIMIT 5) s;
+    IF found <> 0 THEN
+        RAISE EXCEPTION
+            'index returned % rows from a truncated table built empty; the '
+            'staged graph was written over the rebuild', found;
+    END IF;
+END $$;
+
+-- And the same again with a row inserted after the truncate, where writing the
+-- stale graph is worse than an error: the new row reuses the freed tid, so the
+-- scan returns the same id twice rather than failing.
+BEGIN;
+INSERT INTO mt SELECT 100, ARRAY[100.0::real, 101.0::real];
+TRUNCATE mt;
+INSERT INTO mt SELECT 200, ARRAY[200.0::real, 201.0::real];
+COMMIT;
+
+DO $$
+DECLARE ids int[];
+BEGIN
+    SET LOCAL enable_seqscan = off;
+    SELECT array_agg(id) INTO ids
+    FROM (SELECT id FROM mt ORDER BY embedding <-> ARRAY[200.0, 201.0]::real[] LIMIT 5) s;
+    IF ids IS DISTINCT FROM ARRAY[200] THEN
+        RAISE EXCEPTION 'expected exactly one row after truncate-and-reinsert, got %', ids;
+    END IF;
+END $$;
+
+DROP TABLE mt;

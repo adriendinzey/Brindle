@@ -51,3 +51,41 @@ BEGIN
             'so this commit wrote over an image it had not read', theirs;
     END IF;
 END $$;
+
+-- The same race, but with the index moved between tablespaces before the commit.
+-- A move changes the relfilenode without rebuilding anything, so a flush that
+-- treated any relfilenode change as a rebuild would discard our staged row here
+-- while the other session's was already on disk — losing ours silently.
+DROP TABLESPACE IF EXISTS brindle_conc_ts;
+CREATE TABLESPACE brindle_conc_ts LOCATION :'tablespace_dir';
+
+BEGIN;
+INSERT INTO conc_t SELECT 4101, ARRAY[4101.0::real, 4102.0::real];
+SELECT dblink_exec(
+    'dbname=' || current_database() ||
+    ' port=' || current_setting('port') ||
+    ' host=' || (string_to_array(current_setting('unix_socket_directories'), ',')) [1],
+    $inner$INSERT INTO conc_t SELECT 4102, ARRAY[4103.0::real, 4104.0::real]$inner$);
+ALTER INDEX conc_idx SET TABLESPACE brindle_conc_ts;
+COMMIT;
+
+DO $$
+DECLARE ours int; theirs int;
+BEGIN
+    SET LOCAL enable_seqscan = off;
+    SELECT id INTO ours FROM conc_t
+    ORDER BY embedding <-> ARRAY[4101.0, 4102.0]::real[] LIMIT 1;
+    SELECT id INTO theirs FROM conc_t
+    ORDER BY embedding <-> ARRAY[4103.0, 4104.0]::real[] LIMIT 1;
+    IF ours <> 4101 THEN
+        RAISE EXCEPTION
+            'our staged row was dropped when the index moved tablespace: '
+            'nearest to [4101,4102] is %', ours;
+    END IF;
+    IF theirs <> 4102 THEN
+        RAISE EXCEPTION 'the other session''s row was lost across the move: %', theirs;
+    END IF;
+END $$;
+
+ALTER INDEX conc_idx SET TABLESPACE pg_default;
+DROP TABLESPACE IF EXISTS brindle_conc_ts;

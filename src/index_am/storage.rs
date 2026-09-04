@@ -580,10 +580,20 @@ pub const IMAGE_LOCK_BLOCK: pg_sys::BlockNumber = 0;
 /// # Safety
 /// `index` must be an open brindle index relation locked at least AccessShare.
 pub unsafe fn load_index(index: pg_sys::Relation) -> (Hnsw, Vec<TidPair>) {
+    let (hnsw, tids, _) = load_index_with_generation(index);
+    (hnsw, tids)
+}
+
+/// As [`load_index`], also returning the generation the image carried when it
+/// was read — under the same lock, so the two cannot disagree.
+///
+/// # Safety
+/// `index` must be an open brindle index relation locked at least AccessShare.
+pub unsafe fn load_index_with_generation(index: pg_sys::Relation) -> (Hnsw, Vec<TidPair>, u64) {
     // A writer already holding the exclusive lock re-enters here freely: the
     // lock manager never conflicts a request with the requester's own locks.
     pg_sys::LockPage(index, IMAGE_LOCK_BLOCK, pg_sys::ShareLock as i32);
-    let (nblocks, blob_len, _generation) = read_meta(index);
+    let (nblocks, blob_len, generation) = read_meta(index);
     let mut src = PageBytes::new(index, nblocks, blob_len);
 
     // Same framing the slice path performs, driven off the page walk so the
@@ -609,7 +619,7 @@ pub unsafe fn load_index(index: pg_sys::Relation) -> (Hnsw, Vec<TidPair>) {
             tids.len()
         );
     }
-    (hnsw, tids)
+    (hnsw, tids, generation)
 }
 
 /// A decoded index kept for the backend that decoded it.
@@ -824,10 +834,6 @@ struct PendingWrite {
     /// transaction was open and the mutations have to be replayed onto its
     /// image rather than written over it.
     base_generation: u64,
-    /// Payload length the graph below was derived from. Together with the
-    /// generation this identifies the *image*, which is what distinguishes a
-    /// relation that merely moved from one that was rebuilt.
-    base_blob_len: usize,
     hnsw: Hnsw,
     tids: Vec<TidPair>,
     /// The rows applied, kept for that replay. Costs a second copy of each
@@ -866,13 +872,12 @@ pub unsafe fn pending_insert(
             flush_locked(pending.take());
         }
         if pending.is_none() {
-            // Read under the same lock the load takes, so the recorded image
-            // identity is the one actually loaded. Reading it separately leaves
-            // a window for another backend to commit in between, which only
-            // costs an unnecessary replay at flush but is avoidable.
-            pg_sys::LockPage(index, IMAGE_LOCK_BLOCK, pg_sys::ShareLock as i32);
-            let (_, blob_len, generation) = read_meta(index);
-            pg_sys::UnlockPage(index, IMAGE_LOCK_BLOCK, pg_sys::ShareLock as i32);
+            // The generation comes back from the load rather than a separate
+            // read: taken apart, another backend can commit in between and the
+            // recorded generation is then older than the image actually loaded.
+            // That costs only a needless replay at flush, but the load already
+            // has the number.
+            //
             // Decoded rather than taken from the backend's cache, which the
             // card asked about explicitly. The cache hands out a shared
             // reference and staging needs to mutate, so reusing it would mean
@@ -881,12 +886,11 @@ pub unsafe fn pending_insert(
             // invalidated by this transaction's own write. Handing the finished
             // graph *to* the cache at flush time would be worth having, and is a
             // different change from this one.
-            let (hnsw, tids) = load_index(index);
+            let (hnsw, tids, generation) = load_index_with_generation(index);
             *pending = Some(PendingWrite {
                 key,
                 index_oid: oid,
                 base_generation: generation,
-                base_blob_len: blob_len,
                 hnsw,
                 tids,
                 applied: Vec::new(),
@@ -953,32 +957,17 @@ fn flush_locked(write: Option<PendingWrite>) {
 
         pg_sys::LockPage(rel, IMAGE_LOCK_BLOCK, pg_sys::ExclusiveLock as i32);
 
-        let (_, current_len, current) = read_meta(rel);
+        let (_, _, current) = read_meta(rel);
 
-        // Whether this is still the same *image* is the question, and neither
-        // the oid nor the relfilenode answers it on its own. The oid outlives a
-        // rebuild. The relfilenode changes for a rebuild and equally for a plain
-        // move — ALTER INDEX ... SET TABLESPACE copies the image byte for byte —
-        // so keying on it alone throws away staged rows that had somewhere
-        // perfectly good to go. And the generation cannot stand alone either: a
-        // rebuild starts counting again, so a graph staged at generation 1
-        // compares equal to a freshly built one and gets written over it,
-        // leaving entries pointing into a heap that no longer holds those rows.
-        //
-        // Generation and payload length together do answer it. A move preserves
-        // both, so the staged graph still belongs. A rebuild changes the length:
-        // TRUNCATE empties the image, and a REINDEX in this transaction rebuilds
-        // from a heap that already contains the staged rows, so it comes out
-        // larger. Either way the staged graph is the wrong thing to write, and
-        // the rows are already accounted for or gone.
-        let same_image = current == write.base_generation && current_len == write.base_blob_len;
-        if !same_image && cache_key(rel) != write.key {
-            pg_sys::UnlockPage(rel, IMAGE_LOCK_BLOCK, pg_sys::ExclusiveLock as i32);
-            pg_sys::relation_close(rel, pg_sys::RowExclusiveLock as i32);
-            return;
-        }
-
-        let blob = if same_image {
+        // Nothing here tries to work out whether the index was rebuilt. It
+        // cannot be done from the image: a TRUNCATE of an index that was built
+        // on an empty table produces a byte-identical one, so no length,
+        // generation or checksum separates the two. `ambuild` is the event that
+        // distinguishes them, it runs in this backend for both TRUNCATE and
+        // REINDEX and never for a tablespace move, and it discards the staged
+        // rows itself. Anything still staged by the time this runs therefore
+        // belongs on whatever image is here now.
+        let blob = if current == write.base_generation {
             encode_index(&write.hnsw, &write.tids)
         } else {
             // Somebody else wrote while this transaction was open. Their image
@@ -996,6 +985,30 @@ fn flush_locked(write: Option<PendingWrite>) {
         pg_sys::UnlockPage(rel, IMAGE_LOCK_BLOCK, pg_sys::ExclusiveLock as i32);
         pg_sys::relation_close(rel, pg_sys::RowExclusiveLock as i32);
     }
+}
+
+/// Discard rows staged for `index`, because it is being rebuilt.
+///
+/// `ambuild` is the only thing that can answer whether a new relfilenode is a
+/// rebuild or a move, and it is the reason the flush does not try. A rebuild
+/// supersedes the staged rows outright: TRUNCATE has emptied the heap they point
+/// at, and a REINDEX in this transaction builds from a heap that already
+/// contains them, so writing them afterwards would either corrupt the index or
+/// duplicate its entries.
+///
+/// Matched on oid rather than on the cache key, because by the time a rebuild
+/// calls this the relfilenode has already moved on from the one that was staged.
+///
+/// # Safety
+/// `index` must be an open index relation.
+pub unsafe fn forget_pending(index: pg_sys::Relation) {
+    let oid = (*index).rd_id;
+    PENDING.with(|p| {
+        let mut pending = p.borrow_mut();
+        if pending.as_ref().is_some_and(|w| w.index_oid == oid) {
+            *pending = None;
+        }
+    });
 }
 
 /// Write back whatever this transaction has pending, now.
