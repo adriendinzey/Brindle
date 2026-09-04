@@ -75,11 +75,6 @@ impl From<HnswError> for ScanError {
 /// The search behind one scan: the graph it loaded, the node-id → TID table, and
 /// the result of the one search this scan runs, with a cursor into it.
 struct ScanSearch {
-    /// The decoded index: this backend's cached copy where the ceiling allows
-    /// one, otherwise a decode owned by this scan. Held for the scan's life,
-    /// which is inside the relcache entry's — the relation is open and locked
-    /// for the whole scan, so a cached borrow cannot outlive its owner.
-    index: storage::IndexHandle,
     query: Vec<f32>,
     /// The search's results as heap addresses, nearest first.
     results: Vec<TidPair>,
@@ -87,9 +82,8 @@ struct ScanSearch {
 }
 
 impl ScanSearch {
-    fn new(index: storage::IndexHandle) -> Self {
+    fn new() -> Self {
         Self {
-            index,
             query: Vec::new(),
             results: Vec::new(),
             cursor: 0,
@@ -97,7 +91,19 @@ impl ScanSearch {
     }
 
     /// Begin (or restart) the scan for `query`, running its one search.
-    fn start(&mut self, query: Vec<f32>) -> Result<(), ScanError> {
+    /// Resolve the index and search it.
+    ///
+    /// The graph is looked up here rather than held from `ambeginscan`, and
+    /// dropped before returning. A transaction's own view lives in a
+    /// thread-local that a subtransaction boundary takes away, so a handle kept
+    /// across the scan would be a pointer whose owner can vanish under it —
+    /// safe today only because the search happens once, up front, which is an
+    /// implementation detail rather than a guarantee. Nothing runs between the
+    /// two statements below that could start a subtransaction.
+    ///
+    /// # Safety
+    /// `index` must be the open index relation this scan was opened against.
+    unsafe fn start(&mut self, index: pg_sys::Relation, query: Vec<f32>) -> Result<(), ScanError> {
         self.query = query;
         self.cursor = 0;
         // Cleared before the search rather than after: a search that fails must
@@ -107,10 +113,17 @@ impl ScanSearch {
         // to use it, not the value in force when the scan was opened.
         let budget = guc::ef_search().max(1);
 
-        let found = self.index.graph().search(&self.query, budget, budget)?;
+        // A transaction that has written to this index must see its own rows,
+        // and they are not on disk until it commits — so its pending graph wins
+        // over any cached copy, which by construction predates them.
+        let handle = match storage::pending_view(index) {
+            Some(view) => storage::IndexHandle::Pending(view),
+            None => storage::cached_index(index),
+        };
+        let found = handle.graph().search(&self.query, budget, budget)?;
         self.results.reserve(found.len());
         for (_, id) in found {
-            match self.index.tids().get(id) {
+            match handle.tids().get(id) {
                 Some(&tid) => self.results.push(tid),
                 None => return Err(ScanError::UnmappedNode(id)),
             }
@@ -210,14 +223,7 @@ pub(super) unsafe extern "C" fn ambeginscan(
     // decoded copy per backend.
     // SAFETY: Postgres opened and locked `index` for this scan, so the relcache
     // entry that owns any cached copy outlives the scan that borrows it.
-    // A transaction that has written to this index must see its own rows, and
-    // they are not on disk until it commits — so its pending graph wins over any
-    // cached copy, which by construction predates them.
-    let handle = match storage::pending_view(index) {
-        Some(view) => storage::IndexHandle::Pending(view),
-        None => storage::cached_index(index),
-    };
-    (*scan).opaque = new_scan_state(ScanSearch::new(handle)).cast();
+    (*scan).opaque = new_scan_state(ScanSearch::new()).cast();
     scan
 }
 
@@ -261,7 +267,7 @@ pub(super) unsafe extern "C" fn amrescan(
     // call against a scan that re-searches the graph anyway.
     let query =
         super::f32_vec_from_datum(opclass::index_kind((*scan).indexRelation), key.sk_argument);
-    if let Err(e) = search.start(query) {
+    if let Err(e) = search.start((*scan).indexRelation, query) {
         error!("brindle: {e}");
     }
 }
@@ -311,7 +317,7 @@ mod tests {
     use pgrx::prelude::*;
     use pgrx::PgRelation;
 
-    use super::{storage, ScanSearch};
+    use super::ScanSearch;
 
     const DIM: usize = 8;
     /// Big enough that a graph search (rather than the exact tail) answers a
@@ -1025,17 +1031,16 @@ mod tests {
     #[pg_test]
     fn ef_search_sizes_the_scans_candidate_budget() {
         create_indexed_fixture("t_ef", 200);
-        // SAFETY: the index exists; PgRelation holds AccessShare on it, and the
-        // handle is used before the relation closes.
+        // SAFETY: the index exists and PgRelation holds AccessShare on it for
+        // as long as the searches below run.
         let relation = unsafe { PgRelation::open_with_name("t_ef_idx") }.expect("open index");
-        let handle = unsafe { storage::cached_index(relation.as_ptr()) };
 
         // The budget is observable as how many rows one search yields, since the
         // scan returns exactly what it found and then ends.
-        let mut search = ScanSearch::new(handle);
+        let mut search = ScanSearch::new();
 
         Spi::run("SET brindle.ef_search = 137").expect("set");
-        search.start(QUERY.to_vec()).expect("start");
+        unsafe { search.start(relation.as_ptr(), QUERY.to_vec()) }.expect("start");
         assert_eq!(
             search.results.len(),
             137,
@@ -1043,7 +1048,7 @@ mod tests {
         );
 
         Spi::run("SET brindle.ef_search = 41").expect("set");
-        search.start(QUERY.to_vec()).expect("start");
+        unsafe { search.start(relation.as_ptr(), QUERY.to_vec()) }.expect("start");
         assert_eq!(
             search.results.len(),
             41,
@@ -1051,7 +1056,7 @@ mod tests {
         );
 
         Spi::run("RESET brindle.ef_search").expect("reset");
-        search.start(QUERY.to_vec()).expect("start");
+        unsafe { search.start(relation.as_ptr(), QUERY.to_vec()) }.expect("start");
         assert_eq!(
             search.results.len(),
             64,
