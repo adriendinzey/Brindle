@@ -30,12 +30,17 @@ CREATE TABLE ins_results (
     ms_per_row    double precision
 );
 
-DO $$
+-- A procedure rather than a DO block, because a procedure can COMMIT. Rows are
+-- written back when a transaction ends, so timing them inside one transaction
+-- measures everything except the write-back — which is the only cost this task
+-- changed. An earlier version of this file did exactly that, and published
+-- single-row numbers about a third of the truth.
+--
+-- Small fixtures on purpose: the pre-change behaviour is quadratic in the
+-- fixture, so a realistic size takes longer to measure than anyone will wait.
+CREATE OR REPLACE PROCEDURE measure_inserts()
+LANGUAGE plpgsql AS $proc$
 DECLARE
-    -- Small on purpose. Each row rewrites the whole stored image, so the
-    -- measurement is quadratic in the fixture and a realistic size would take
-    -- longer to measure than anyone will wait — which is the finding, not an
-    -- inconvenience. The shape is visible well before it becomes unbearable.
     sizes   int[] := ARRAY[2000, 8000, 20000];
     n       int;
     dims    int := current_setting('bench.dims')::int;
@@ -49,32 +54,43 @@ BEGIN
         INSERT INTO ins_bench
         SELECT g, (SELECT array_agg((random() - 0.5)::real) FROM generate_series(1, dims))
         FROM generate_series(1, n) AS g;
+        COMMIT;
 
         DROP INDEX IF EXISTS ins_bench_idx;
         CREATE INDEX ins_bench_idx ON ins_bench USING brindle (embedding);
+        COMMIT;
 
-        -- Single rows, each its own statement.
+        -- One row per transaction, which is what an autocommitted INSERT is.
+        -- The COMMIT inside the loop is the whole point: it forces the
+        -- write-back that makes this the real cost.
         started := clock_timestamp();
         FOR j IN 1..single LOOP
             INSERT INTO ins_bench
             SELECT n + j, (SELECT array_agg((random() - 0.5)::real)
                            FROM generate_series(1, dims));
+            COMMIT;
         END LOOP;
         INSERT INTO ins_results
         VALUES (n, 'single',
                 extract(epoch FROM clock_timestamp() - started) * 1000 / single);
+        COMMIT;
 
-        -- The same number of rows again, in one statement.
+        -- The same rows again in one statement, committed once, so the
+        -- write-back is inside the timed region here too and amortized.
         started := clock_timestamp();
         INSERT INTO ins_bench
         SELECT n + single + g, (SELECT array_agg((random() - 0.5)::real)
                                 FROM generate_series(1, dims))
         FROM generate_series(1, batch) AS g;
+        COMMIT;
         INSERT INTO ins_results
         VALUES (n, 'bulk',
                 extract(epoch FROM clock_timestamp() - started) * 1000 / batch);
+        COMMIT;
     END LOOP;
-END $$;
+END $proc$;
+
+CALL measure_inserts();
 
 \echo ''
 \echo '=== insert cost per row, by index size ==='

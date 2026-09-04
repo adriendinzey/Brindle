@@ -45,14 +45,15 @@ versions may break).
 - **A transaction's inserts are written back to the index once, when it ends,
   rather than once per row.** Every write rewrites the whole stored image, so
   doing that per row made a bulk load quadratic in the table; `INSERT ... SELECT`
-  of N rows is now linear. Measured on a 20 000-row index, a row inserted as
-  part of a larger statement went from 26.5 ms to 0.36 ms, and no longer grows
-  with the index.
+  of N rows is now linear. Measured on a 20 000-row index, a row inserted as part
+  of a 100-row statement went from 25.5 ms to 0.61 ms — amortization rather than
+  elimination, so a larger statement is cheaper per row and a batch of one is no
+  batch at all.
 
-  A single-row `INSERT` is its own transaction, so it has nothing to batch: its
-  cost improved (29.8 ms to 3.5 ms on that index, mostly from reusing the cached
-  copy) but still grows with the index. Not rewriting the whole image per row
-  needs the paged storage this format is a placeholder for.
+  **A single-row `INSERT` is no faster.** It is its own transaction, so it has
+  nothing to batch with and rewrites the whole image exactly as before. Not
+  rewriting the image per row needs the paged storage this format is a
+  placeholder for.
 
   Two consequences worth knowing. A transaction's own rows are visible to it
   before it commits, as before, but they reach the index relation at commit — so

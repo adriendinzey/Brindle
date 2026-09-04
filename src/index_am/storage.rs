@@ -933,6 +933,25 @@ fn flush_locked(write: Option<PendingWrite>) {
         if rel.is_null() {
             return;
         }
+
+        // The oid outlives a rebuild, so opening it says nothing about whether
+        // this is still the same index. TRUNCATE and REINDEX both give the
+        // relation a new relfilenode while keeping the oid, and the generation
+        // cannot tell them apart either — a rebuild starts counting again, so a
+        // staged graph derived from generation 1 compares equal to the fresh
+        // one and would be written straight over it. The result is an index full
+        // of pointers into a heap that no longer has those rows, which every
+        // later scan hits as a read past the end of the file.
+        //
+        // Discarding is right for both. TRUNCATE emptied the heap, so there is
+        // nothing left for the staged rows to point at; a non-concurrent REINDEX
+        // in the same transaction rebuilds from a heap that already contains
+        // them.
+        if cache_key(rel) != write.key {
+            pg_sys::relation_close(rel, pg_sys::RowExclusiveLock as i32);
+            return;
+        }
+
         pg_sys::LockPage(rel, IMAGE_LOCK_BLOCK, pg_sys::ExclusiveLock as i32);
 
         let (_, _, current) = read_meta(rel);

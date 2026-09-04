@@ -232,48 +232,42 @@ median query, and the tail is worse.
 Every write rewrites the whole stored image, so an insert's cost tracks the size
 of the index rather than the size of the row. A transaction's inserts are now
 applied to a graph held in memory and written back once when it ends, which
-matters entirely for how they arrive:
+helps entirely according to how they arrive.
 
 ```bash
-INSERTS=1 scripts/bench_index.sh    # this table, on its own fixtures
+INSERTS=1 scripts/bench_index.sh
 ```
 
-Per row, at 128 dimensions, two samples:
+Per row, at 32 dimensions, before and after that change:
 
 | rows in index | one row per statement | 100 rows in one statement |
 |---|---|---|
-| 2 000 | 3.14 / 3.31 ms | 1.67 / 1.80 ms |
-| 8 000 | 4.97 / 4.34 ms | 1.63 / 1.70 ms |
-| 20 000 | 7.10 / 6.62 ms | 1.61 / 1.61 ms |
+| 2 000 | 4.43 → 3.82 ms | 2.81 → **0.38 ms** |
+| 8 000 | 13.27 → 10.56 ms | 11.79 → **0.45 ms** |
+| 20 000 | 24.55 → **25.88 ms** | 25.53 → **0.61 ms** |
 
-**A row inserted as part of a larger statement costs the same whatever the index
-holds.** That is the change: `INSERT ... SELECT` was quadratic in the table,
-because each row paid to rewrite everything already in it, and is now linear.
+**A row inserted with others got 7× to 42× cheaper, and the gap widens with the
+index** — that is the quadratic becoming linear. It is amortization rather than
+elimination: the write-back still costs what it costs, but once per statement
+instead of once per row, so the per-row figure grows with the index divided by
+the batch. A larger batch is cheaper per row; a batch of one is no batch at all.
 
-**A row inserted on its own still gets more expensive as the index grows**, and
-that is not fixable here. A single-row `INSERT` is its own transaction, so there
-is nothing to batch with; it rewrites the image exactly as before. Not rewriting
-the whole image per row is paged storage.
+**A row inserted on its own did not get cheaper.** 24.55 → 25.88 ms at 20 000
+rows is a wash, and the smaller sizes differ by less than the noise between runs.
+A single-row `INSERT` is its own transaction, so there is nothing to batch with
+and it rewrites the image exactly as before. Not rewriting the whole image per
+row is paged storage, and stays with that work.
 
-The fixtures are small on purpose, and the reason is the measurement rather than
-patience: it is quadratic in the fixture, so timing the old behaviour at a
-realistic size takes longer than anyone will wait. An attempt to measure the
-previous code at these dimensions was abandoned after twenty minutes without
-finishing — which is the same fact the table reports, arrived at the hard way.
-The before/after pair below was therefore taken at 32 dimensions, where it
-completes:
+An earlier version of this section claimed single-row insert had improved eight-
+fold. It had not: the measurement timed the staging and not the write-back,
+because the whole thing ran inside one transaction that never committed, and a
+transaction's rows are written when it ends. The harness commits each shape now,
+which is why these numbers are larger than the ones they replace and why the
+single-row column no longer shows a win. The fixtures are small because the
+pre-change behaviour is quadratic in the fixture and a realistic size takes
+longer to measure than anyone will wait.
 
-| rows in index | one per statement, before → after | in one statement, before → after |
-|---|---|---|
-| 2 000 | 2.91 → 1.45 ms | 2.69 → 0.40 ms |
-| 8 000 | 7.89 → 2.15 ms | 9.87 → 0.36 ms |
-| 20 000 | 29.75 → 3.52 ms | 26.45 → 0.36 ms |
-
-Read the two tables as answering different questions: the first is what an insert
-costs today at the width the rest of this file uses, the second is what changed.
-They are not comparable to each other.
-
-## Comparison with pgvector
+## Comparison with pgvector## Comparison with pgvector
 
 pgvector 0.8.0, built against the same PostgreSQL, indexing **the same rows**,
 answering **the same queries**, scored against **the same ground truth**, at
