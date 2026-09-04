@@ -241,19 +241,26 @@ unsafe extern "C" fn ambuildempty(index: pg_sys::Relation) {
 
 /// Add one heap tuple to the persisted graph, returning whether it was indexed.
 ///
-/// The strategy is load-modify-store: read the whole index back, insert into
-/// the in-memory graph, write the whole image out again. Graph quality is
-/// therefore exactly a rebuild's — the point of doing it this way — but the
-/// cost is O(index) per row, which suits a trickle of inserts and not a bulk
-/// load. Loading a large table is still far faster as `COPY` followed by
-/// `CREATE INDEX`. That cost is O(index) *WAL* too — the whole image is logged
-/// as full page images per row, so one insert into a 4 MB index writes ~4 MB of
-/// WAL, which replicas and archiving pay for as well.
+/// The row is inserted into a graph held for the transaction and written back
+/// once, at the end, rather than per row. Graph quality is exactly a rebuild's
+/// either way — the point of doing it this way — but the stored format has no
+/// way to add a node without rewriting the whole image, so a per-row write back
+/// makes a bulk load quadratic in both bytes written and WAL. Staging pays that
+/// image rewrite once per transaction instead of once per row.
 ///
-/// The whole sequence runs under an exclusive [`storage::IMAGE_LOCK_BLOCK`]
-/// lock, so that two inserts cannot each load the image the other is replacing
-/// and lose a row, and so that a concurrent scan reads one image rather than
-/// halves of two.
+/// What that does *not* buy is a cheaper single-row `INSERT`: it is its own
+/// transaction, so it still writes the whole image, and the cost is the same
+/// O(index) it always was. Only a multi-row transaction gains, and the O(index)
+/// per *transaction* remains — it goes when the stored format does, not before.
+///
+/// Nothing is locked while a row is staged. Two transactions can therefore each
+/// stage against the same starting image, and the second to commit would
+/// otherwise write an image with no trace of the first; [`storage::flush_locked`]
+/// is what closes that, by taking the lock at write-back and replaying the
+/// staged rows onto the current image whenever the generation has moved under
+/// it. A scan does not read staged state at all — [`storage::flush_pending_for`]
+/// writes it back first, because a parallel worker is a separate process and
+/// could not see it.
 ///
 /// TODO: append the new node and its edges to the stored graph in place rather
 /// than rewriting the whole image.
@@ -280,17 +287,11 @@ unsafe extern "C" fn aminsert(
     let vector = f32_vec_from_datum(opclass::index_kind(index), *values);
 
     // SAFETY: `index` is the open index relation Postgres locked for this
-    // insert. An error below unwinds to abort, which releases the page lock
-    // along with every other lock the transaction holds.
-    // Applied to a graph held for the transaction and written back once, at the
-    // end. Writing per row means rewriting the whole stored image per row, which
-    // is what makes a bulk load quadratic. A single-row INSERT is its own
-    // transaction and so still flushes immediately — that cost is the stored
-    // format's, and it goes when the format does.
-    //
-    // SAFETY: `heap_tid` points at the ItemPointerData of the tuple being
-    // inserted, valid for this call.
-    storage::pending_insert(index, vector, Vec::new(), item_pointer_get_both(*heap_tid));
+    // insert, and `heap_tid` points at the ItemPointerData of the tuple being
+    // inserted, valid for this call. Staging takes no lock and writes no page;
+    // an error below unwinds to abort, which discards the staged rows along
+    // with everything else the transaction was holding.
+    storage::pending_insert(index, vector, item_pointer_get_both(*heap_tid));
     true
 }
 

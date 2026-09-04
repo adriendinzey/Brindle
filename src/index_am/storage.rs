@@ -672,13 +672,6 @@ thread_local! {
 /// caller when caching is off or the index does not fit.
 pub enum IndexHandle {
     Cached(CacheRef),
-    /// The writing transaction's own view, borrowed from [`PENDING`].
-    ///
-    /// Raw pointers because the graph lives in a thread-local the scan cannot
-    /// borrow across its life. Sound because a scan cannot outlive the
-    /// transaction that opened it, and only that transaction's own end — commit,
-    /// abort, or a subtransaction boundary — takes the pending graph away.
-    Pending((*const Hnsw, *const Vec<TidPair>)),
     /// Boxed so the handle stays small: a graph inline would make every handle,
     /// cached or not, as large as an uncached one.
     Fresh(Box<(Hnsw, Vec<TidPair>)>),
@@ -688,9 +681,6 @@ impl IndexHandle {
     pub fn graph(&self) -> &Hnsw {
         match self {
             IndexHandle::Cached(c) => &c.hnsw,
-            // SAFETY: see the variant's own comment — the pending graph outlives
-            // every scan that can observe it.
-            IndexHandle::Pending((hnsw, _)) => unsafe { &**hnsw },
             IndexHandle::Fresh(owned) => &owned.0,
         }
     }
@@ -698,8 +688,6 @@ impl IndexHandle {
     pub fn tids(&self) -> &[TidPair] {
         match self {
             IndexHandle::Cached(c) => &c.tids,
-            // SAFETY: as above.
-            IndexHandle::Pending((_, tids)) => unsafe { &**tids },
             IndexHandle::Fresh(owned) => &owned.1,
         }
     }
@@ -824,7 +812,6 @@ pub unsafe fn cached_index(index: pg_sys::Relation) -> IndexHandle {
 /// so flushes immediately. Not rewriting the whole image per write is paged
 /// storage, and stays with that work.
 struct PendingWrite {
-    key: CacheKey,
     /// Reopened at flush time. A `Relation` pointer must not be held across
     /// statements — the relcache entry behind it can be rebuilt — so the oid is
     /// what is kept.
@@ -836,10 +823,10 @@ struct PendingWrite {
     base_generation: u64,
     hnsw: Hnsw,
     tids: Vec<TidPair>,
-    /// The rows applied, kept for that replay. Costs a second copy of each
-    /// vector for the length of the transaction, which is the price of not
-    /// holding an exclusive lock across it.
-    applied: Vec<(Vec<f32>, Vec<AttrValue>, TidPair)>,
+    /// How many nodes the loaded image had. Ids are dense insertion order, so
+    /// everything from here up is what this transaction staged — which is what
+    /// a replay needs, read back out of the graph rather than kept beside it.
+    base_n: usize,
 }
 
 thread_local! {
@@ -853,14 +840,8 @@ thread_local! {
 ///
 /// # Safety
 /// `index` must be an open brindle index relation this backend may write.
-pub unsafe fn pending_insert(
-    index: pg_sys::Relation,
-    vector: Vec<f32>,
-    attrs: Vec<AttrValue>,
-    tid: TidPair,
-) {
+pub unsafe fn pending_insert(index: pg_sys::Relation, vector: Vec<f32>, tid: TidPair) {
     register_callbacks();
-    let key = cache_key(index);
     let oid = (*index).rd_id;
 
     PENDING.with(|p| {
@@ -868,7 +849,11 @@ pub unsafe fn pending_insert(
         // A different index in the same transaction: flush the first, since only
         // one is tracked. Two indexes written alternately therefore behave as
         // they did before, which is correct if unhelpful.
-        if pending.as_ref().is_some_and(|w| w.key != key) {
+        // Matched on the oid, not the relfilenode: `ALTER INDEX … SET TABLESPACE`
+        // changes the latter mid-transaction, and treating that as a different
+        // index would flush the rows staged before the move as if they belonged
+        // somewhere else.
+        if pending.as_ref().is_some_and(|w| w.index_oid != oid) {
             flush_locked(pending.take());
         }
         if pending.is_none() {
@@ -888,55 +873,66 @@ pub unsafe fn pending_insert(
             // different change from this one.
             let (hnsw, tids, generation) = load_index_with_generation(index);
             *pending = Some(PendingWrite {
-                key,
                 index_oid: oid,
                 base_generation: generation,
+                base_n: hnsw.len(),
                 hnsw,
                 tids,
-                applied: Vec::new(),
             });
         }
         let write = pending.as_mut().expect("just populated");
-        apply_one(&mut write.hnsw, &mut write.tids, &vector, &attrs, tid);
-        write.applied.push((vector, attrs, tid));
+        // The vector moves straight into the graph. Nothing else keeps a copy:
+        // a replay reads the staged rows back out of it.
+        apply_one(&mut write.hnsw, write.tids.len(), vector, Vec::new());
+        write.tids.push(tid);
     });
 }
 
 /// Add one row to a graph and its pointer table, keeping the two in step.
-fn apply_one(
-    hnsw: &mut Hnsw,
-    tids: &mut Vec<TidPair>,
-    vector: &[f32],
-    attrs: &[AttrValue],
-    tid: TidPair,
-) {
+/// Insert one row into `hnsw`, checking it lands on `expected_id`.
+///
+/// The caller appends the heap pointer itself; this only guarantees the id it
+/// will be appended at, so the graph and the pointer table cannot drift apart
+/// silently.
+fn apply_one(hnsw: &mut Hnsw, expected_id: usize, vector: Vec<f32>, attrs: Vec<AttrValue>) {
     let id = hnsw
-        .insert_with_attrs(vector.to_vec(), attrs.to_vec())
+        .insert_with_attrs(vector, attrs)
         .unwrap_or_else(|e| error!("brindle: {e}"));
     // Ids are dense insertion order and the load checked the graph and the table
     // agree, so the new id addresses the slot being filled.
-    if id != tids.len() {
+    if id != expected_id {
         error!("brindle: index graph and heap-pointer table are out of step");
     }
-    tids.push(tid);
 }
 
-/// The transaction's own view of an index it has written to, if any.
+/// Write back anything staged for `index` before it is read.
 ///
-/// A scan must see rows its own transaction inserted, and those are not on disk
-/// until it commits.
+/// A scan must see rows its own transaction inserted, and lending it the staged
+/// graph does not achieve that: the staging is backend-local, and a parallel
+/// worker executing the scan is a different process, so it would read the image
+/// on disk and silently miss them. `amcanparallel = false` does not prevent
+/// that — it stops one scan being split across workers, not a whole index scan
+/// running inside one under a Gather.
+///
+/// Writing first is the version that is true for every reader. It costs a
+/// transaction that interleaves writes and reads of the same index one image
+/// write per switch, which is what such a transaction paid before any of this
+/// batching existed; a transaction that only writes, which is the shape the
+/// batching is for, never reaches here.
 ///
 /// # Safety
 /// `index` must be an open brindle index relation.
-pub unsafe fn pending_view(index: pg_sys::Relation) -> Option<(*const Hnsw, *const Vec<TidPair>)> {
-    let key = cache_key(index);
-    PENDING.with(|p| {
-        let pending = p.borrow();
-        pending
-            .as_ref()
-            .filter(|w| w.key == key)
-            .map(|w| (&w.hnsw as *const Hnsw, &w.tids as *const Vec<TidPair>))
-    })
+pub unsafe fn flush_pending_for(index: pg_sys::Relation) {
+    let oid = (*index).rd_id;
+    let write = PENDING.with(|p| {
+        let mut pending = p.borrow_mut();
+        if pending.as_ref().is_some_and(|w| w.index_oid == oid) {
+            pending.take()
+        } else {
+            None
+        }
+    });
+    flush_locked(write);
 }
 
 /// Write a pending graph back, replaying onto whatever is there now if another
@@ -975,8 +971,11 @@ fn flush_locked(write: Option<PendingWrite>) {
             // lock was deliberately not held across the transaction, so this is
             // the expected outcome of that choice rather than a surprise.
             let (mut hnsw, mut tids) = load_index(rel);
-            for (vector, attrs, tid) in &write.applied {
-                apply_one(&mut hnsw, &mut tids, vector, attrs, *tid);
+            for id in write.base_n..write.hnsw.len() {
+                let vector = write.hnsw.vector(id).to_vec();
+                let attrs = write.hnsw.attrs(id).to_vec();
+                apply_one(&mut hnsw, tids.len(), vector, attrs);
+                tids.push(write.tids[id]);
             }
             encode_index(&hnsw, &tids)
         };
@@ -1011,12 +1010,16 @@ pub unsafe fn forget_pending(index: pg_sys::Relation) {
     });
 }
 
-/// Write back whatever this transaction has pending, now.
+/// Write back whatever this transaction has pending, for any index.
+///
+/// Test-only: the production paths reach a flush through the transaction end or
+/// through [`flush_pending_for`], and neither wants "whichever index it happens
+/// to be".
 ///
 /// The transaction end does this on its own; this is for callers that need the
-/// stored image to be current before then — which in practice means tests that
-/// read it directly, and which is why the flush is exercised rather than only
-/// reached at commit.
+/// stored image current before then — tests that read it directly, which is why
+/// the flush is exercised rather than only reached at commit.
+#[cfg(any(test, feature = "pg_test"))]
 pub fn flush_pending() {
     let write = PENDING.with(|p| p.borrow_mut().take());
     flush_locked(write);

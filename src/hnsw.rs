@@ -451,8 +451,13 @@ impl Hnsw {
         self.link_base(id) + within
     }
 
+    /// The stored vector for `id`, borrowed from the flat backing store.
+    ///
+    /// Panics on an out-of-range id, unlike [`Hnsw::attrs`]: every caller here
+    /// has one from the graph itself, and silently returning an empty slice
+    /// would turn a bookkeeping bug into a wrong distance.
     #[inline]
-    fn vector(&self, id: usize) -> &[f32] {
+    pub fn vector(&self, id: usize) -> &[f32] {
         let start = id * self.dim;
         &self.vectors[start..start + self.dim]
     }

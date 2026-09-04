@@ -58,12 +58,12 @@ Consequences, all of which this design exists to remove:
 |---|---|---|
 | Scan startup | read the metapage; deserialize the whole index if this backend has no current copy | read the metapage |
 | Scan working set | decoded copies per backend, bounded per backend by `brindle.cache_max_mb` — nothing bounds the total across connections | shared buffer cache, one copy for the server |
-| Insert cost | O(index) CPU: load, mutate, write back | O(m · log n) page reads, O(m) page writes |
-| Insert WAL | O(index) — a 4 MB index logs ~4 MB per row | O(m) page images |
+| Insert cost | O(index) CPU per *transaction*: load, mutate, write back | O(m · log n) page reads, O(m) page writes |
+| Insert WAL | O(index) per transaction — a 4 MB index logs ~4 MB, and a single-row `INSERT` is a transaction | O(m) page images |
 | Vacuum tombstone | rewrite the whole image | flip one byte on one page |
 | Crash mid-write | image and metapage disagree → index unreadable until `REINDEX` | each record is atomic; worst case is a lost back-edge |
 | Cross-backend writes | every reader re-checks the metapage generation, which every writer advances | invalidation is the buffer manager's |
-| Reader/writer | one heavyweight lock over the whole image | readers take no heavyweight lock |
+| Reader/writer | one heavyweight lock over the whole image, held across the write-back rather than the transaction | readers take no heavyweight lock |
 | Filter attributes | not persisted at all | inline in the element tuple |
 | Indexable dimensions | any (up to the type's 16000) | ≤ 2000 ([§ 5](#5-sizing-and-limits)) |
 | Max layer-0 degree | 2048 | 1024 ([§ 5](#5-sizing-and-limits)) |

@@ -93,13 +93,8 @@ impl ScanSearch {
     /// Begin (or restart) the scan for `query`, running its one search.
     /// Resolve the index and search it.
     ///
-    /// The graph is looked up here rather than held from `ambeginscan`, and
-    /// dropped before returning. A transaction's own view lives in a
-    /// thread-local that a subtransaction boundary takes away, so a handle kept
-    /// across the scan would be a pointer whose owner can vanish under it —
-    /// safe today only because the search happens once, up front, which is an
-    /// implementation detail rather than a guarantee. Nothing runs between the
-    /// two statements below that could start a subtransaction.
+    /// The graph is looked up here rather than held from `ambeginscan`, so no
+    /// handle outlives the search that uses it.
     ///
     /// # Safety
     /// `index` must be the open index relation this scan was opened against.
@@ -113,13 +108,12 @@ impl ScanSearch {
         // to use it, not the value in force when the scan was opened.
         let budget = guc::ef_search().max(1);
 
-        // A transaction that has written to this index must see its own rows,
-        // and they are not on disk until it commits — so its pending graph wins
-        // over any cached copy, which by construction predates them.
-        let handle = match storage::pending_view(index) {
-            Some(view) => storage::IndexHandle::Pending(view),
-            None => storage::cached_index(index),
-        };
+        // A transaction that has written to this index must see its own rows.
+        // Writing them back first is what makes that true for every reader,
+        // including a parallel worker, which is a separate process and cannot
+        // see anything this backend is holding.
+        storage::flush_pending_for(index);
+        let handle = storage::cached_index(index);
         let found = handle.graph().search(&self.query, budget, budget)?;
         self.results.reserve(found.len());
         for (_, id) in found {

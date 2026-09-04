@@ -81,12 +81,16 @@ fi
 echo "==> starting pg$PG (port $port)"
 cargo pgrx start "pg$PG" >/dev/null
 
-# One case moves an index between tablespaces, and a tablespace needs an empty
+# Some cases move an index between tablespaces, and a tablespace needs an empty
 # directory Postgres owns — which SQL cannot create for itself, and which may not
 # live inside the data directory. Cases read the path from `:tablespace_dir`.
-tablespace_dir="$PGRX_HOME/sql-test-tablespace-$PG"
-rm -rf "$tablespace_dir"
-mkdir -p "$tablespace_dir"
+#
+# One directory per case, not one for the suite: two tablespaces cannot share a
+# location, so a shared directory works only until a second case wants one and
+# then fails on whichever runs later.
+tablespace_root="$PGRX_HOME/sql-test-tablespace-$PG"
+rm -rf "$tablespace_root"
+mkdir -p "$tablespace_root"
 
 echo "==> $("$bindir/postgres" --version | awk '{print $3}'), ${#cases[@]} case(s)"
 echo
@@ -105,6 +109,8 @@ for case_file in "${cases[@]}"; do
   fi
   "$bindir/dropdb" --host "$host" --port "$port" --if-exists "$db" >/dev/null 2>&1 || true
   "$bindir/createdb" --host "$host" --port "$port" "$db"
+  tablespace_dir="$tablespace_root/$name"
+  mkdir -p "$tablespace_dir"
   "$bindir/psql" --host "$host" --port "$port" --dbname "$db" --quiet --no-psqlrc \
     --set=ON_ERROR_STOP=1 -c 'CREATE EXTENSION brindle' >/dev/null
 

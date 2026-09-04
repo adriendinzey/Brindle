@@ -65,12 +65,20 @@ versions may break).
   brindle indexes gets no batching either** — only one index's rows are staged at
   a time, so writes to a second flush the first.
 
-  While a transaction is staging rows it holds a decoded copy of the index plus a
-  copy of every vector it has inserted, and **neither is bounded by
-  `brindle.cache_max_mb`** — they exist even when that is zero. A large bulk load
-  into a wide-vector index can therefore hold a substantial amount of memory for
-  the length of the transaction. Splitting such a load into several transactions
-  bounds it, at the cost of one write-back each.
+  **Querying a brindle index inside a transaction that has written to it forces
+  the write-back early**, and the batching restarts from there. Staged rows are
+  backend-local, and a parallel worker running the scan is a separate process
+  that could not see them, so the rows are written before any scan rather than
+  lent to it. A transaction that alternates `INSERT` and `SELECT` on the same
+  index therefore gets no batching — it pays what it paid before — while one that
+  writes and then reads pays one extra write-back. Bulk loads, which do not query
+  what they are filling, are unaffected.
+
+  While a transaction is staging rows it holds a decoded copy of the index, and
+  that copy is **not bounded by `brindle.cache_max_mb`** — it exists even when
+  that is zero. A large bulk load into a wide-vector index can therefore hold a
+  substantial amount of memory for the length of the transaction. Splitting such
+  a load into several transactions bounds it, at the cost of one write-back each.
 - A backend now keeps one decoded copy of an index in memory and reuses it
   across scans, instead of reading and decoding the whole index for every query.
   On a 100k × 128 index that takes a query from ~58 ms to ~0.3 ms. The first
