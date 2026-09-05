@@ -646,9 +646,18 @@ pub struct CachedIndex {
 /// that scan ends. Freeing it outright instead is a use-after-free.
 type CacheRef = std::rc::Rc<CachedIndex>;
 
-/// Identifies the *physical* relation, so a REINDEX, TRUNCATE or VACUUM FULL —
-/// each of which writes a new relfilenode — cannot be mistaken for the index the
-/// cached copy came from, whatever its generation happens to say.
+/// Identifies the *physical* relation, so a rebuild that writes a new
+/// relfilenode cannot be mistaken for the index the cached copy came from,
+/// whatever its generation happens to say.
+///
+/// Not every rebuild does write one. `TRUNCATE` of a relation whose relfilenode
+/// was created in the same transaction truncates it *in place*
+/// (`heap_truncate_one_rel`), keeping the relfilenode, and the rebuild resets
+/// the generation to `FIRST_GENERATION` — which is exactly what a copy cached
+/// just after a build carries. Key and generation then both match and a stale
+/// graph is served, whose TIDs address a heap with no blocks left. See the
+/// backlog entry; the fix belongs with the storage rework rather than here,
+/// and `brindle.cache_max_mb = 0` avoids it in the meantime.
 type CacheKey = (pg_sys::Oid, pg_sys::Oid, pg_sys::RelFileNumber);
 
 thread_local! {
@@ -1151,6 +1160,19 @@ pub unsafe fn forget_pending(index: pg_sys::Relation) {
             return;
         }
         stash.push((subid, write));
+        // The three rules that maintain this — dropping a duplicate here,
+        // dropping rather than moving on a re-parent collision, and draining
+        // every entry for an aborting subid — are deliberately redundant: with
+        // any one of them in place the suite still passes, so none can be
+        // mutation-tested while the others stand. Assert the invariant instead,
+        // which the SQL suite runs against because it installs a debug build.
+        debug_assert!(
+            !stash
+                .iter()
+                .enumerate()
+                .any(|(i, (a, _))| stash[..i].iter().any(|(b, _)| a == b)),
+            "brindle: more than one set-aside write for one subtransaction"
+        );
     });
 }
 
@@ -1195,12 +1217,14 @@ unsafe extern "C" fn xact_callback(event: pg_sys::XactEvent::Type, _arg: *mut co
             // Any rebuild still set aside has committed with the transaction, so
             // the rows it displaced really are gone.
             //
-            // This is about memory, not correctness: at commit Postgres commits
-            // every open subtransaction in turn, so an entry is re-parented up
-            // the chain to the top-level id — and no `ABORT_SUB` ever fires with
-            // that id, since a top-level abort is `XACT_EVENT_ABORT`. A leaked
-            // entry could not be handed to a later transaction; it would simply
-            // hold a decoded graph for the life of the backend.
+            // This is correctness, not just memory. Subtransaction ids restart
+            // with every transaction, so an entry left behind at a live subid
+            // could be handed to a *later* transaction's rollback — clobbering
+            // that transaction's own staging and rewriting a different index
+            // from a graph staged against a relation that no longer exists.
+            // What keeps that unreachable is the drain rule in the abort arm,
+            // not anything about re-parenting reaching the top-level id: an
+            // earlier version of this comment argued the latter and was wrong.
             DISCARDED.with(|d| d.borrow_mut().clear());
         }
         pg_sys::XactEvent::XACT_EVENT_ABORT | pg_sys::XactEvent::XACT_EVENT_PARALLEL_ABORT => {
