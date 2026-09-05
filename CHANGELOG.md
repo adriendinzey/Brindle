@@ -62,11 +62,16 @@ versions may break).
   was, which is what rolling that transaction back means anyway. A transaction
   that ends with `PREPARE TRANSACTION` writes them at the prepare rather than at
   `COMMIT PREPARED`; a `ROLLBACK PREPARED` after that does **not** take them back
-  out, though heap visibility keeps them from being returned. A `plpgsql` block with an `EXCEPTION` handler
-  opens a subtransaction per iteration and so forces a write-back each time; such
-  a loop gets no batching, though it is no slower than before. **A table with two
-  brindle indexes gets no batching either** — only one index's rows are staged at
-  a time, so writes to a second flush the first.
+  out, though heap visibility keeps them from being returned. Savepoints do not
+  force a write-back — `ROLLBACK TO` undoes the rows staged after the savepoint
+  and keeps the rest — so a `plpgsql` loop with an `EXCEPTION` handler keeps its
+  batching. **A table with two brindle indexes gets no batching** — only one
+  index's rows are staged at a time, so writes to a second flush the first.
+
+  One consequence of writing at the end rather than per row: a conflict between
+  two transactions is reported by the one that commits second, at its `COMMIT`,
+  rather than by the statement that caused it. Two sessions inserting different
+  vector dimensions into the same empty index is the reachable case.
 
   **Querying a brindle index inside a transaction that has written to it forces
   the write-back early**, and the batching restarts from there. Staged rows are
@@ -89,7 +94,9 @@ versions may break).
 
   While a transaction is staging rows it holds a decoded copy of the index, and
   that copy is **not bounded by `brindle.cache_max_mb`** — it exists even when
-  that is zero. A large bulk load into a wide-vector index can therefore hold a
+  that is zero. A write-back that has to replay onto another backend's newer
+  image holds two decoded copies plus the encoded blob at its peak, and so does
+  a `ROLLBACK TO` that leaves rows staged. A large bulk load into a wide-vector index can therefore hold a
   substantial amount of memory for the length of the transaction. Splitting such
   a load into several transactions bounds it, at the cost of one write-back each.
 - A backend now keeps one decoded copy of an index in memory and reuses it
