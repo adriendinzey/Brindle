@@ -75,6 +75,10 @@ versions may break).
   batching at all** — only one index's rows are staged at a time, so writes to a
   second flush the first.
 
+  A `TRUNCATE` or `REINDEX` in the same transaction discards whatever that
+  transaction had staged for the index, rather than writing it over the rebuild —
+  the rows are gone from the table or already in the rebuilt index either way.
+
   One consequence of writing at the end rather than per row: a conflict between
   two transactions is reported by the one that commits second, at its `COMMIT`,
   rather than by the statement that caused it. Two sessions inserting different

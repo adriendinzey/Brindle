@@ -58,7 +58,7 @@ Consequences, all of which this design exists to remove:
 |---|---|---|
 | Scan startup | read the metapage; deserialize the whole index if this backend has no current copy | read the metapage |
 | Scan working set | decoded copies per backend, bounded per backend by `brindle.cache_max_mb` — nothing bounds the total across connections | shared buffer cache, one copy for the server |
-| Insert cost | O(index) CPU per *transaction*, plus once more for each query of the same index inside it: load, mutate, write back | O(m · log n) page reads, O(m) page writes |
+| Insert cost | O(index) CPU per write-back: load, mutate, write back. Once per transaction, and once more for each of these inside it — a query against this index, a statement planning a parallel scan, a write to a second brindle index | O(m · log n) page reads, O(m) page writes |
 | Insert WAL | O(index) per write-back — a 4 MB index logs ~4 MB, and a single-row `INSERT` is a transaction | O(m) page images |
 | Vacuum tombstone | rewrite the whole image | flip one byte on one page |
 | Crash mid-write | image and metapage disagree → index unreadable until `REINDEX` | each record is atomic; worst case is a lost back-edge |
