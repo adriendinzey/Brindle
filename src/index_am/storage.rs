@@ -1308,13 +1308,16 @@ unsafe extern "C" fn subxact_callback(
                 // is the older one, so this one is dropped rather than moved.
                 if stash.iter().any(|(subid, _)| *subid == parent) {
                     stash.retain(|(subid, _)| *subid != my);
-                    return;
-                }
-                for (subid, _) in stash.iter_mut() {
-                    if *subid == my {
-                        *subid = parent;
+                } else {
+                    for (subid, _) in stash.iter_mut() {
+                        if *subid == my {
+                            *subid = parent;
+                        }
                     }
                 }
+                // Both branches, not just the one that can break it: an early
+                // return past the check is how the push path came to be pinned
+                // and the re-parent path not.
                 debug_assert_one_per_subxact(&stash);
             });
         }
