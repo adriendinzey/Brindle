@@ -258,9 +258,11 @@ unsafe extern "C" fn ambuildempty(index: pg_sys::Relation) {
 /// otherwise write an image with no trace of the first; [`storage::flush_locked`]
 /// is what closes that, by taking the lock at write-back and replaying the
 /// staged rows onto the current image whenever the generation has moved under
-/// it. A scan does not read staged state at all — [`storage::flush_pending_for`]
-/// writes it back first, because a parallel worker is a separate process and
-/// could not see it.
+/// it. A scan does not read staged state at all: it is written back first, by
+/// [`storage::flush_pending_for`] for a scan in this backend and by
+/// [`storage::flush_before_parallel_plan`] for one that will run in a parallel
+/// worker — a separate process, which could not see staged rows however they
+/// were handed around here.
 ///
 /// TODO: append the new node and its edges to the stored graph in place rather
 /// than rewriting the whole image.

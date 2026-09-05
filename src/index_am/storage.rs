@@ -905,6 +905,74 @@ fn apply_one(hnsw: &mut Hnsw, expected_id: usize, vector: Vec<f32>, attrs: Vec<A
     }
 }
 
+/// The `ExecutorStart_hook` that was installed before this extension loaded.
+///
+/// Hooks are a single global chain, so an extension that replaces one without
+/// calling the previous link silently disables every extension loaded before
+/// it.
+static mut PRIOR_EXECUTOR_START: pg_sys::ExecutorStart_hook_type = None;
+
+/// Install the executor hook that flushes staged rows before a parallel plan.
+///
+/// Valid only from `_PG_init`: the hook variable is process-global and is read
+/// without synchronisation, so it must be set while the backend is still
+/// single-threaded and before any statement can run.
+pub fn init_executor_hook() {
+    // SAFETY: `_PG_init` runs once per backend during library load, before any
+    // executor invocation, so nothing can be reading the hook chain here.
+    unsafe {
+        PRIOR_EXECUTOR_START = pg_sys::ExecutorStart_hook;
+        pg_sys::ExecutorStart_hook = Some(executor_start);
+    }
+}
+
+/// Flush staged rows, then hand on to the rest of the hook chain.
+#[pg_guard]
+unsafe extern "C" fn executor_start(query_desc: *mut pg_sys::QueryDesc, eflags: i32) {
+    // Before delegating, not after: `standard_ExecutorStart` is what builds the
+    // plan state, and the flush wants to happen while this is still plainly the
+    // leader's own transaction doing an ordinary write.
+    flush_before_parallel_plan(query_desc);
+
+    match PRIOR_EXECUTOR_START {
+        Some(prior) => prior(query_desc, eflags),
+        None => pg_sys::standard_ExecutorStart(query_desc, eflags),
+    }
+}
+
+/// Write back every staged row, wherever it is staged, before a parallel plan
+/// starts.
+///
+/// [`flush_pending_for`] is not enough on its own. It runs from `amrescan`,
+/// which for a non-parallel-aware index scan Postgres calls at execution time,
+/// inside whichever process runs the scan node — so under a Gather it runs in
+/// the *worker*, where `PENDING` is empty and there is nothing to write. The
+/// worker then reads the image on disk and misses the transaction's own rows.
+///
+/// The flush therefore has to happen in the process that staged them, before
+/// any worker launches, and no index AM callback fires there. `ExecutorStart`
+/// does: it runs in the leader, and `ExecutePlan` does not enter parallel mode
+/// until `ExecutorRun`, so writing here is an ordinary write.
+///
+/// Gated on `parallelModeNeeded` rather than run for every statement, so that a
+/// transaction whose statements are all serial keeps its batching and pays
+/// nothing for this.
+///
+/// # Safety
+/// `query_desc` must be the live `QueryDesc` Postgres is starting.
+pub unsafe fn flush_before_parallel_plan(query_desc: *mut pg_sys::QueryDesc) {
+    if query_desc.is_null() {
+        return;
+    }
+    let plan = (*query_desc).plannedstmt;
+    if plan.is_null() || !(*plan).parallelModeNeeded {
+        return;
+    }
+    // In a worker this is a no-op: `PENDING` is per-process and the worker
+    // never staged anything.
+    flush_pending();
+}
+
 /// Write back anything staged for `index` before it is read.
 ///
 /// A scan must see rows its own transaction inserted, and lending it the staged
@@ -914,11 +982,13 @@ fn apply_one(hnsw: &mut Hnsw, expected_id: usize, vector: Vec<f32>, attrs: Vec<A
 /// that — it stops one scan being split across workers, not a whole index scan
 /// running inside one under a Gather.
 ///
-/// Writing first is the version that is true for every reader. It costs a
-/// transaction that interleaves writes and reads of the same index one image
-/// write per switch, which is what such a transaction paid before any of this
-/// batching existed; a transaction that only writes, which is the shape the
-/// batching is for, never reaches here.
+/// Writing first is what makes the rows visible to a scan in *this* backend.
+/// It is not sufficient on its own — see [`flush_before_parallel_plan`] for the
+/// half that covers a scan running in a parallel worker, which this one cannot
+/// reach. It costs a transaction that interleaves writes and reads of the same
+/// index one image write per switch, which is what such a transaction paid
+/// before any of this batching existed; a transaction that only writes, which is
+/// the shape the batching is for, never reaches here.
 ///
 /// # Safety
 /// `index` must be an open brindle index relation.
@@ -1012,14 +1082,9 @@ pub unsafe fn forget_pending(index: pg_sys::Relation) {
 
 /// Write back whatever this transaction has pending, for any index.
 ///
-/// Test-only: the production paths reach a flush through the transaction end or
-/// through [`flush_pending_for`], and neither wants "whichever index it happens
-/// to be".
-///
 /// The transaction end does this on its own; this is for callers that need the
 /// stored image current before then — tests that read it directly, which is why
 /// the flush is exercised rather than only reached at commit.
-#[cfg(any(test, feature = "pg_test"))]
 pub fn flush_pending() {
     let write = PENDING.with(|p| p.borrow_mut().take());
     flush_locked(write);

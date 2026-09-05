@@ -56,10 +56,13 @@ versions may break).
   placeholder for.
 
   Consequences worth knowing. A transaction's own rows are visible to it before
-  it commits, as before, but they reach the index relation at commit — so a crash
-  mid-transaction leaves the index as it was, which is what rolling that
-  transaction back means anyway. A transaction that ends with `PREPARE
-  TRANSACTION` writes them at the prepare rather than at `COMMIT PREPARED`. A `plpgsql` block with an `EXCEPTION` handler
+  it commits, as before, but they reach the index relation no earlier than the
+  first of: a query against that index, a parallel plan, or the end of the
+  transaction (see below) — so a crash before any of those leaves the index as it
+  was, which is what rolling that transaction back means anyway. A transaction
+  that ends with `PREPARE TRANSACTION` writes them at the prepare rather than at
+  `COMMIT PREPARED`; a `ROLLBACK PREPARED` after that does **not** take them back
+  out, though heap visibility keeps them from being returned. A `plpgsql` block with an `EXCEPTION` handler
   opens a subtransaction per iteration and so forces a write-back each time; such
   a loop gets no batching, though it is no slower than before. **A table with two
   brindle indexes gets no batching either** — only one index's rows are staged at
@@ -67,12 +70,18 @@ versions may break).
 
   **Querying a brindle index inside a transaction that has written to it forces
   the write-back early**, and the batching restarts from there. Staged rows are
-  backend-local, and a parallel worker running the scan is a separate process
-  that could not see them, so the rows are written before any scan rather than
-  lent to it. A transaction that alternates `INSERT` and `SELECT` on the same
-  index therefore gets no batching — it pays what it paid before — while one that
-  writes and then reads pays one extra write-back. Bulk loads, which do not query
-  what they are filling, are unaffected.
+  backend-local, so rather than lending them to a scan they are written first —
+  and because a parallel worker is a separate process that could not see them
+  either way, **any statement that runs a parallel plan also forces the
+  write-back**, whether or not it touches a brindle index. A transaction that
+  alternates `INSERT` and `SELECT` on the same index therefore gets no batching —
+  it pays what it paid before — while one that writes and then reads pays one
+  extra write-back. Bulk loads, which do not query what they are filling and plan
+  no parallel statements, are unaffected.
+
+  This installs an `ExecutorStart_hook`. It chains to any hook already present,
+  so other extensions are unaffected, and it does nothing unless the statement
+  needs parallel mode and this transaction has rows staged.
 
   While a transaction is staging rows it holds a decoded copy of the index, and
   that copy is **not bounded by `brindle.cache_max_mb`** — it exists even when

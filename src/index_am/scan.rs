@@ -91,7 +91,6 @@ impl ScanSearch {
     }
 
     /// Begin (or restart) the scan for `query`, running its one search.
-    /// Resolve the index and search it.
     ///
     /// The graph is looked up here rather than held from `ambeginscan`, so no
     /// handle outlives the search that uses it.
@@ -108,10 +107,13 @@ impl ScanSearch {
         // to use it, not the value in force when the scan was opened.
         let budget = guc::ef_search().max(1);
 
-        // A transaction that has written to this index must see its own rows.
-        // Writing them back first is what makes that true for every reader,
-        // including a parallel worker, which is a separate process and cannot
-        // see anything this backend is holding.
+        // A transaction that has written to this index must see its own rows,
+        // so write them back before reading rather than lending out the staged
+        // graph. This covers a scan running in the backend that staged them.
+        // It cannot cover a parallel worker: Postgres calls `amrescan` at
+        // execution time, inside whichever process runs the scan node, so under
+        // a Gather this line runs in the worker with nothing staged. The leader
+        // flushes for that case in `storage::flush_before_parallel_plan`.
         storage::flush_pending_for(index);
         let handle = storage::cached_index(index);
         let found = handle.graph().search(&self.query, budget, budget)?;
@@ -215,8 +217,10 @@ pub(super) unsafe extern "C" fn ambeginscan(
     let scan = pg_sys::RelationGetIndexScan(index, nkeys, norderbys);
     // TODO: read the graph through the buffer manager instead of holding a
     // decoded copy per backend.
-    // SAFETY: Postgres opened and locked `index` for this scan, so the relcache
-    // entry that owns any cached copy outlives the scan that borrows it.
+    // SAFETY: `RelationGetIndexScan` returns a live descriptor, and the state
+    // stored here owns everything it holds — the graph is resolved per search in
+    // `ScanSearch::start` and dropped there, so nothing is borrowed across the
+    // scan's life.
     (*scan).opaque = new_scan_state(ScanSearch::new()).cast();
     scan
 }

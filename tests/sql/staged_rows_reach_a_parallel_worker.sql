@@ -34,16 +34,17 @@ BEGIN;
 SET LOCAL enable_seqscan = off;
 INSERT INTO pw VALUES (1201, ARRAY[1201.0::real, 1202.0::real]);
 
-SELECT id AS serial_nearest FROM pw
-ORDER BY embedding <-> ARRAY[1201.0, 1202.0]::real[] LIMIT 1 \gset
-
+-- The parallel query runs FIRST, before any serial scan. That ordering is the
+-- whole test. A serial scan writes the staged rows back, so one placed ahead of
+-- this would satisfy the parallel assertion as a side effect and the case could
+-- never fail on its own claim -- which is exactly how an earlier version of this
+-- file passed against code where the parallel path was broken.
 SELECT set_config(:'force_parallel_guc', 'on', true) \gset force_
 
--- The query has to be written so the scan actually reaches a worker, and that
--- is easy to lose by accident: wrapping it in a scalar subquery makes it an
--- InitPlan, which the *leader* evaluates before dispatching, so the whole test
--- passes without a worker ever opening the index. Guard the plan rather than
--- trusting the shape to stay that way.
+-- The query also has to be written so the scan actually reaches a worker, and
+-- that is easy to lose by accident: wrapping it in a scalar subquery makes it an
+-- InitPlan, which the *leader* evaluates before dispatching, so no worker ever
+-- opens the index. Guard the plan rather than trusting the shape to stay put.
 DO $$
 DECLARE line text; plan text := '';
 BEGIN
@@ -70,7 +71,10 @@ SELECT id AS parallel_nearest FROM pw
 ORDER BY embedding <-> ARRAY[1201.0, 1202.0]::real[] LIMIT 1 \gset
 SELECT set_config(:'force_parallel_guc', 'off', true) \gset force_
 
--- Carried into the assertion through GUCs, for the substitution reason above.
+-- Only now the serial one, which must agree.
+SELECT id AS serial_nearest FROM pw
+ORDER BY embedding <-> ARRAY[1201.0, 1202.0]::real[] LIMIT 1 \gset
+
 SELECT set_config('brindle_test.serial_nearest', :'serial_nearest', true) \gset carry_
 SELECT set_config('brindle_test.parallel_nearest', :'parallel_nearest', true) \gset carry_
 
@@ -79,16 +83,15 @@ DECLARE
     serial_nearest   int := current_setting('brindle_test.serial_nearest')::int;
     parallel_nearest int := current_setting('brindle_test.parallel_nearest')::int;
 BEGIN
+    IF parallel_nearest IS DISTINCT FROM 1201 THEN
+        RAISE EXCEPTION
+            'a parallel worker did not see a row this transaction staged: '
+            'nearest to [1201,1202] is % in a worker', parallel_nearest;
+    END IF;
     IF serial_nearest IS DISTINCT FROM 1201 THEN
         RAISE EXCEPTION
             'a row inserted in this transaction is not findable in it at all: '
             'nearest to [1201,1202] is %', serial_nearest;
-    END IF;
-    IF parallel_nearest IS DISTINCT FROM 1201 THEN
-        RAISE EXCEPTION
-            'a parallel worker did not see a row this transaction staged: '
-            'nearest to [1201,1202] is % in a worker but % in this backend',
-            parallel_nearest, serial_nearest;
     END IF;
 END $$;
 
