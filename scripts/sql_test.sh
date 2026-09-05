@@ -25,6 +25,27 @@
 # the failure report shows, so make it say what was expected and what was found.
 # Expected-output files are deliberately not used: they fail on incidental
 # formatting and say "files differ" when they do.
+#
+# BEFORE TRUSTING A NEW CASE, BREAK THE MECHANISM AND WATCH IT GO RED. Every
+# case here has been confirmed to fail when the thing it names is disabled. That
+# is not a formality: cases in this directory have three times passed for a
+# reason other than the one they claimed —
+#
+#   * Postgres rechecks heap visibility for every TID an index scan returns, so
+#     "the deleted / rolled-back row is absent" holds whatever the index says.
+#     Count rows, or reclaim the freed line pointers and look for wrong answers.
+#   * An earlier step in the same case can satisfy the assertion as a side
+#     effect. Any query against a brindle index writes back the transaction's
+#     staged rows, so a scan — or an EXPLAIN, before that was excluded — placed
+#     between the INSERT and the assertion does the work the assertion is
+#     supposed to be testing.
+#   * A query wrapped in a scalar subquery becomes an InitPlan, which the leader
+#     evaluates before dispatching, so a case meant to exercise a parallel
+#     worker never reaches one.
+#
+# A mutation is cheap: edit the mechanism, run `scripts/sql_test.sh <case>`,
+# confirm FAIL, `git checkout --` the file. If the case still passes, it is not
+# testing what its name says.
 
 set -euo pipefail
 
@@ -65,8 +86,32 @@ fi
 echo "==> installing the extension into pg$PG"
 cargo pgrx install --pg-config "$pg_config" >/dev/null
 
+# Two-phase commit is off by default, and one case needs it. Setting it costs
+# nothing when unused and cannot be changed without a restart, so it goes in
+# before the cluster starts rather than being skipped around.
+# `cargo pgrx start` creates the data directory on first use, so the setting has
+# to go in after that and before the case that needs it — writing it only when
+# the file already exists leaves a fresh machine failing on its own assertion.
+cargo pgrx start "pg$PG" >/dev/null
+datadir="$PGRX_HOME/data-$PG"
+if ! grep -q '^max_prepared_transactions' "$datadir/postgresql.conf"; then
+  echo "max_prepared_transactions = 10" >>"$datadir/postgresql.conf"
+  cargo pgrx stop "pg$PG" >/dev/null 2>&1 || true
+fi
+
 echo "==> starting pg$PG (port $port)"
 cargo pgrx start "pg$PG" >/dev/null
+
+# Some cases move an index between tablespaces, and a tablespace needs an empty
+# directory Postgres owns — which SQL cannot create for itself, and which may not
+# live inside the data directory. Cases read the path from `:tablespace_dir`.
+#
+# One directory per case, not one for the suite: two tablespaces cannot share a
+# location, so a shared directory works only until a second case wants one and
+# then fails on whichever runs later.
+tablespace_root="$PGRX_HOME/sql-test-tablespace-$PG"
+rm -rf "$tablespace_root"
+mkdir -p "$tablespace_root"
 
 echo "==> $("$bindir/postgres" --version | awk '{print $3}'), ${#cases[@]} case(s)"
 echo
@@ -85,12 +130,15 @@ for case_file in "${cases[@]}"; do
   fi
   "$bindir/dropdb" --host "$host" --port "$port" --if-exists "$db" >/dev/null 2>&1 || true
   "$bindir/createdb" --host "$host" --port "$port" "$db"
+  tablespace_dir="$tablespace_root/$name"
+  mkdir -p "$tablespace_dir"
   "$bindir/psql" --host "$host" --port "$port" --dbname "$db" --quiet --no-psqlrc \
     --set=ON_ERROR_STOP=1 -c 'CREATE EXTENSION brindle' >/dev/null
 
   output_file="$(mktemp)"
   if "$bindir/psql" --host "$host" --port "$port" --dbname "$db" --quiet --no-psqlrc \
-       --set=ON_ERROR_STOP=1 --file "$case_file" >"$output_file" 2>&1; then
+       --set=ON_ERROR_STOP=1 --set=tablespace_dir="$tablespace_dir" \
+       --file "$case_file" >"$output_file" 2>&1; then
     printf 'ok    %s\n' "$name"
   else
     printf 'FAIL  %s\n' "$name"

@@ -19,6 +19,7 @@ use core::ffi::c_char;
 use pgrx::pg_sys;
 use pgrx::prelude::*;
 
+use crate::filter::AttrValue;
 use crate::hnsw::{GraphBytes, Hnsw, HnswDecodeError};
 
 /// Errors from decoding the blob payload framing.
@@ -579,10 +580,20 @@ pub const IMAGE_LOCK_BLOCK: pg_sys::BlockNumber = 0;
 /// # Safety
 /// `index` must be an open brindle index relation locked at least AccessShare.
 pub unsafe fn load_index(index: pg_sys::Relation) -> (Hnsw, Vec<TidPair>) {
+    let (hnsw, tids, _) = load_index_with_generation(index);
+    (hnsw, tids)
+}
+
+/// As [`load_index`], also returning the generation the image carried when it
+/// was read — under the same lock, so the two cannot disagree.
+///
+/// # Safety
+/// `index` must be an open brindle index relation locked at least AccessShare.
+pub unsafe fn load_index_with_generation(index: pg_sys::Relation) -> (Hnsw, Vec<TidPair>, u64) {
     // A writer already holding the exclusive lock re-enters here freely: the
     // lock manager never conflicts a request with the requester's own locks.
     pg_sys::LockPage(index, IMAGE_LOCK_BLOCK, pg_sys::ShareLock as i32);
-    let (nblocks, blob_len, _generation) = read_meta(index);
+    let (nblocks, blob_len, generation) = read_meta(index);
     let mut src = PageBytes::new(index, nblocks, blob_len);
 
     // Same framing the slice path performs, driven off the page walk so the
@@ -608,7 +619,7 @@ pub unsafe fn load_index(index: pg_sys::Relation) -> (Hnsw, Vec<TidPair>) {
             tids.len()
         );
     }
-    (hnsw, tids)
+    (hnsw, tids, generation)
 }
 
 /// A decoded index kept for the backend that decoded it.
@@ -635,9 +646,43 @@ pub struct CachedIndex {
 /// that scan ends. Freeing it outright instead is a use-after-free.
 type CacheRef = std::rc::Rc<CachedIndex>;
 
-/// Identifies the *physical* relation, so a REINDEX, TRUNCATE or VACUUM FULL —
-/// each of which writes a new relfilenode — cannot be mistaken for the index the
-/// cached copy came from, whatever its generation happens to say.
+/// At most one set-aside write per subtransaction — the invariant the stash
+/// rests on, checked wherever it could be broken.
+///
+/// Two rules maintain it: dropping a duplicate at push time, and dropping
+/// rather than moving on a re-parent collision. Neither can be caught by
+/// asserting on behaviour — with the invariant held, restoring the first
+/// matching entry and draining the rest can never differ from restoring the
+/// last, so the suite stays green when any single rule is reverted and only
+/// goes red when two are. Removing them one at a time would therefore pass CI
+/// at each step and silently reopen a data loss.
+///
+/// So this is checked at both points where it can break rather than inferred
+/// from what a query returns, and the SQL suite exercises it because it
+/// installs a debug build. The drain in the abort arm stays as the net: it is
+/// unreachable while the invariant holds, which is the point.
+fn debug_assert_one_per_subxact(stash: &[(pg_sys::SubTransactionId, PendingWrite)]) {
+    debug_assert!(
+        !stash
+            .iter()
+            .enumerate()
+            .any(|(i, (a, _))| stash[..i].iter().any(|(b, _)| a == b)),
+        "brindle: more than one set-aside write for one subtransaction"
+    );
+}
+
+/// Identifies the *physical* relation, so a rebuild that writes a new
+/// relfilenode cannot be mistaken for the index the cached copy came from,
+/// whatever its generation happens to say.
+///
+/// Not every rebuild does write one. `TRUNCATE` of a relation whose relfilenode
+/// was created in the same transaction truncates it *in place*
+/// (`heap_truncate_one_rel`), keeping the relfilenode, and the rebuild resets
+/// the generation to `FIRST_GENERATION` — which is exactly what a copy cached
+/// just after a build carries. Key and generation then both match and a stale
+/// graph is served, whose TIDs address a heap with no blocks left. See the
+/// backlog entry; the fix belongs with the storage rework rather than here,
+/// and `brindle.cache_max_mb = 0` avoids it in the meantime.
 type CacheKey = (pg_sys::Oid, pg_sys::Oid, pg_sys::RelFileNumber);
 
 thread_local! {
@@ -787,6 +832,628 @@ pub unsafe fn cached_index(index: pg_sys::Relation) -> IndexHandle {
         cache.insert(key, entry.clone());
     });
     IndexHandle::Cached(entry)
+}
+
+// --- deferred writes ------------------------------------------------------
+
+/// Inserts this transaction has made but not yet written back.
+///
+/// Every write rewrites the whole stored image, so doing that per row makes a
+/// bulk load quadratic in the table. The rows are applied to a graph held in
+/// memory instead, and written once when the transaction ends.
+///
+/// This does nothing for a single-row `INSERT`, which is its own transaction and
+/// so flushes immediately. Not rewriting the whole image per write is paged
+/// storage, and stays with that work.
+struct PendingWrite {
+    /// Reopened at flush time. A `Relation` pointer must not be held across
+    /// statements — the relcache entry behind it can be rebuilt — so the oid is
+    /// what is kept.
+    index_oid: pg_sys::Oid,
+    /// The generation the graph below was derived from. If the metapage has
+    /// moved past it by flush time, another backend wrote while this
+    /// transaction was open and the mutations have to be replayed onto its
+    /// image rather than written over it.
+    base_generation: u64,
+    hnsw: Hnsw,
+    tids: Vec<TidPair>,
+    /// How many nodes the loaded image had. Ids are dense insertion order, so
+    /// everything from here up is what this transaction staged — which is what
+    /// a replay needs, read back out of the graph rather than kept beside it.
+    base_n: usize,
+    /// How many rows this transaction had staged when each open subtransaction
+    /// began. A `ROLLBACK TO` has to leave the rows staged before its savepoint
+    /// and drop the rest, and this is what says where the line is.
+    ///
+    /// Counts of *staged* rows, not indices into `tids`. [`settle_pending`]
+    /// reloads the stored image, and another backend may have committed since
+    /// staging began, so `base_n` is not stable across a transaction — an
+    /// absolute index recorded against one base silently means something else
+    /// against the next. A count does not move.
+    ///
+    /// Shorter than the subtransaction depth whenever one opened with nothing
+    /// staged: no `PendingWrite` existed to record it. The `unwrap_or` in the
+    /// abort arm is what covers that.
+    marks: Vec<usize>,
+    /// Set by a subtransaction abort: staged rows past this many are rolled back
+    /// and must not reach the index. Also a count, for the reason above.
+    ///
+    /// Recorded rather than acted on, because the abort callback is not a place
+    /// where anything may fail. [`settle_pending`] carries it out later, at a
+    /// point where an error is an ordinary error.
+    rewind_to: Option<usize>,
+}
+
+thread_local! {
+    static PENDING: std::cell::RefCell<Option<PendingWrite>> =
+        const { std::cell::RefCell::new(None) };
+    /// Staging set aside by a rebuild, against the subtransaction that did it.
+    ///
+    /// A rebuild is not necessarily permanent: `TRUNCATE` and `REINDEX` inside a
+    /// subtransaction that later aborts are undone, relfilenode and all. The
+    /// staged rows belong to the state that comes back, so they are kept here
+    /// until the subtransaction's fate is known rather than dropped outright.
+    static DISCARDED: std::cell::RefCell<Vec<(pg_sys::SubTransactionId, PendingWrite)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    /// Registered once per backend; the callbacks themselves are cheap and
+    /// return immediately when there is nothing pending.
+    static CALLBACKS_REGISTERED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+/// Apply one row to the transaction's pending graph, loading it on first use.
+///
+/// # Safety
+/// `index` must be an open brindle index relation this backend may write.
+pub unsafe fn pending_insert(index: pg_sys::Relation, vector: Vec<f32>, tid: TidPair) {
+    register_callbacks();
+    // A subtransaction rollback may be outstanding; carry it out before adding
+    // to a graph that still holds the rows it rolled back.
+    settle_pending();
+    let oid = (*index).rd_id;
+
+    PENDING.with(|p| {
+        let mut pending = p.borrow_mut();
+        // A different index in the same transaction: flush the first, since only
+        // one is tracked. Two indexes written alternately therefore behave as
+        // they did before, which is correct if unhelpful.
+        // Matched on the oid, not the relfilenode: `ALTER INDEX … SET TABLESPACE`
+        // changes the latter mid-transaction, and treating that as a different
+        // index would flush the rows staged before the move as if they belonged
+        // somewhere else.
+        if pending.as_ref().is_some_and(|w| w.index_oid != oid) {
+            flush_locked(pending.take());
+        }
+        if pending.is_none() {
+            // The generation comes back from the load rather than a separate
+            // read: taken apart, another backend can commit in between and the
+            // recorded generation is then older than the image actually loaded.
+            // That costs only a needless replay at flush, but the load already
+            // has the number.
+            //
+            // Decoded rather than taken from the backend's cache, which the
+            // card asked about explicitly. The cache hands out a shared
+            // reference and staging needs to mutate, so reusing it would mean
+            // cloning the graph — for the reference index that is copying about
+            // 89 MB against a 58 ms decode, and the cached copy would still be
+            // invalidated by this transaction's own write. Handing the finished
+            // graph *to* the cache at flush time would be worth having, and is a
+            // different change from this one.
+            let (hnsw, tids, generation) = load_index_with_generation(index);
+            *pending = Some(PendingWrite {
+                index_oid: oid,
+                base_generation: generation,
+                base_n: hnsw.len(),
+                hnsw,
+                tids,
+                marks: Vec::new(),
+                rewind_to: None,
+            });
+        }
+        let write = pending.as_mut().expect("just populated");
+        // The vector moves straight into the graph. Nothing else keeps a copy:
+        // a replay reads the staged rows back out of it.
+        apply_one(&mut write.hnsw, write.tids.len(), vector, Vec::new());
+        write.tids.push(tid);
+    });
+}
+
+/// Add one row to a graph and its pointer table, keeping the two in step.
+/// Insert one row into `hnsw`, checking it lands on `expected_id`.
+///
+/// The caller appends the heap pointer itself; this only guarantees the id it
+/// will be appended at, so the graph and the pointer table cannot drift apart
+/// silently.
+fn apply_one(hnsw: &mut Hnsw, expected_id: usize, vector: Vec<f32>, attrs: Vec<AttrValue>) {
+    let id = hnsw
+        .insert_with_attrs(vector, attrs)
+        .unwrap_or_else(|e| error!("brindle: {e}"));
+    // Ids are dense insertion order and the load checked the graph and the table
+    // agree, so the new id addresses the slot being filled.
+    if id != expected_id {
+        error!("brindle: index graph and heap-pointer table are out of step");
+    }
+}
+
+/// The `ExecutorStart_hook` that was installed before this extension loaded.
+///
+/// Hooks are a single global chain, so an extension that replaces one without
+/// calling the previous link silently disables every extension loaded before
+/// it.
+static mut PRIOR_EXECUTOR_START: pg_sys::ExecutorStart_hook_type = None;
+
+/// Whether [`init_executor_hook`] has already run in this backend.
+static mut EXECUTOR_HOOK_INSTALLED: bool = false;
+
+/// Install the executor hook that flushes staged rows before a parallel plan.
+///
+/// Valid only from `_PG_init`: the hook variable is process-global and is read
+/// without synchronisation, so it must be set while the backend is still
+/// single-threaded and before any statement can run.
+pub fn init_executor_hook() {
+    // SAFETY: `_PG_init` runs once per backend during library load, before any
+    // executor invocation, so nothing can be reading the hook chain here.
+    unsafe {
+        // Calling this twice would record our own hook as the previous link and
+        // recurse without bound on the next statement. Postgres loads a library
+        // once, so this is misuse rather than a reachable state — but it is a
+        // hang rather than an error, so refuse it outright. A latch rather than
+        // comparing against the installed pointer: function-pointer equality is
+        // not dependable across codegen units.
+        if EXECUTOR_HOOK_INSTALLED {
+            error!("brindle: init_executor_hook called twice; it is valid only from _PG_init");
+        }
+        EXECUTOR_HOOK_INSTALLED = true;
+        PRIOR_EXECUTOR_START = pg_sys::ExecutorStart_hook;
+        pg_sys::ExecutorStart_hook = Some(executor_start);
+    }
+}
+
+/// Flush staged rows, then hand on to the rest of the hook chain.
+#[pg_guard]
+unsafe extern "C" fn executor_start(query_desc: *mut pg_sys::QueryDesc, eflags: i32) {
+    // Before delegating, not after: `standard_ExecutorStart` is what builds the
+    // plan state, and the flush wants to happen while this is still plainly the
+    // leader's own transaction doing an ordinary write.
+    flush_before_parallel_plan(query_desc, eflags);
+
+    match PRIOR_EXECUTOR_START {
+        Some(prior) => prior(query_desc, eflags),
+        None => pg_sys::standard_ExecutorStart(query_desc, eflags),
+    }
+}
+
+/// Write back every staged row, wherever it is staged, before a parallel plan
+/// starts.
+///
+/// [`flush_pending_for`] is not enough on its own. It runs from `amrescan`,
+/// which for a non-parallel-aware index scan Postgres calls at execution time,
+/// inside whichever process runs the scan node — so under a Gather it runs in
+/// the *worker*, where `PENDING` is empty and there is nothing to write. The
+/// worker then reads the image on disk and misses the transaction's own rows.
+///
+/// The flush therefore has to happen in the process that staged them, before
+/// any worker launches, and no index AM callback fires there. `ExecutorStart`
+/// does: it runs in the leader, and `ExecutePlan` does not enter parallel mode
+/// until `ExecutorRun`, so writing here is an ordinary write.
+///
+/// Gated on `parallelModeNeeded` rather than run for every statement, so that a
+/// transaction whose statements are all serial keeps its batching and pays
+/// nothing for this. `EXPLAIN` without `ANALYZE` is excluded for the same
+/// reason it executes nothing: it is expected to be free of side effects, and
+/// writing the image back is an O(index) WAL-logged rewrite.
+///
+/// # Safety
+/// `query_desc` must be the live `QueryDesc` Postgres is starting.
+pub unsafe fn flush_before_parallel_plan(query_desc: *mut pg_sys::QueryDesc, eflags: i32) {
+    if query_desc.is_null() || eflags & pg_sys::EXEC_FLAG_EXPLAIN_ONLY as i32 != 0 {
+        return;
+    }
+    let plan = (*query_desc).plannedstmt;
+    if plan.is_null() || !(*plan).parallelModeNeeded {
+        return;
+    }
+    // In a worker this is a no-op: `PENDING` is per-process and the worker
+    // never staged anything.
+    flush_pending();
+}
+
+/// Write back anything staged for `index` before it is read.
+///
+/// A scan must see rows its own transaction inserted, and lending it the staged
+/// graph does not achieve that: the staging is backend-local, and a parallel
+/// worker executing the scan is a different process, so it would read the image
+/// on disk and silently miss them. `amcanparallel = false` does not prevent
+/// that — it stops one scan being split across workers, not a whole index scan
+/// running inside one under a Gather.
+///
+/// Writing first is what makes the rows visible to a scan in *this* backend.
+/// It is not sufficient on its own — see [`flush_before_parallel_plan`] for the
+/// half that covers a scan running in a parallel worker, which this one cannot
+/// reach. It costs a transaction that interleaves writes and reads of the same
+/// index one image write per switch, which is what such a transaction paid
+/// before any of this batching existed; a transaction that only writes, which is
+/// the shape the batching is for, never reaches here.
+///
+/// # Safety
+/// `index` must be an open brindle index relation.
+pub unsafe fn flush_pending_for(index: pg_sys::Relation) {
+    settle_pending();
+    let oid = (*index).rd_id;
+    let write = PENDING.with(|p| {
+        let mut pending = p.borrow_mut();
+        if pending.as_ref().is_some_and(|w| w.index_oid == oid) {
+            pending.take()
+        } else {
+            None
+        }
+    });
+    flush_locked(write);
+}
+
+/// Write a pending graph back, replaying onto whatever is there now if another
+/// backend has written since this transaction started.
+fn flush_locked(write: Option<PendingWrite>) {
+    let Some(write) = write else { return };
+    // SAFETY: the oid names an index this backend wrote to inside the
+    // transaction still being committed, so it exists and is lockable.
+    unsafe {
+        // The index can be gone by now — dropped, or rebuilt under a new
+        // relfilenode — while this transaction still held writes for it. There
+        // is then nothing to write back, and erroring here would fail a commit
+        // over work that no longer has anywhere to go.
+        let rel = pg_sys::try_relation_open(write.index_oid, pg_sys::RowExclusiveLock as i32);
+        if rel.is_null() {
+            return;
+        }
+
+        pg_sys::LockPage(rel, IMAGE_LOCK_BLOCK, pg_sys::ExclusiveLock as i32);
+
+        let (_, _, current) = read_meta(rel);
+
+        // Nothing here tries to work out whether the index was rebuilt. It
+        // cannot be done from the image: a TRUNCATE of an index that was built
+        // on an empty table produces a byte-identical one, so no length,
+        // generation or checksum separates the two. `ambuild` is the event that
+        // distinguishes them, it runs in this backend for both TRUNCATE and
+        // REINDEX and never for a tablespace move, and it discards the staged
+        // rows itself. Anything still staged by the time this runs therefore
+        // belongs on whatever image is here now.
+        let blob = if current == write.base_generation {
+            encode_index(&write.hnsw, &write.tids)
+        } else {
+            // Somebody else wrote while this transaction was open. Their image
+            // is the one to build on: writing ours would drop their rows. The
+            // lock was deliberately not held across the transaction, so this is
+            // the expected outcome of that choice rather than a surprise.
+            let (mut hnsw, mut tids) = load_index(rel);
+            for id in write.base_n..write.hnsw.len() {
+                let vector = write.hnsw.vector(id).to_vec();
+                let attrs = write.hnsw.attrs(id).to_vec();
+                apply_one(&mut hnsw, tids.len(), vector, attrs);
+                tids.push(write.tids[id]);
+            }
+            encode_index(&hnsw, &tids)
+        };
+        rewrite_index_blob(rel, &blob);
+
+        pg_sys::UnlockPage(rel, IMAGE_LOCK_BLOCK, pg_sys::ExclusiveLock as i32);
+        pg_sys::relation_close(rel, pg_sys::RowExclusiveLock as i32);
+    }
+}
+
+/// Discard rows staged for `index`, because it is being rebuilt.
+///
+/// `ambuild` is the only thing that can answer whether a new relfilenode is a
+/// rebuild or a move, and it is the reason the flush does not try. A rebuild
+/// supersedes the staged rows outright: TRUNCATE has emptied the heap they point
+/// at, and a REINDEX in this transaction builds from a heap that already
+/// contains them, so writing them afterwards would either corrupt the index or
+/// duplicate its entries.
+///
+/// Matched on oid rather than on the cache key, because by the time a rebuild
+/// calls this the relfilenode has already moved on from the one that was staged.
+///
+/// # Safety
+/// `index` must be an open index relation.
+pub unsafe fn forget_pending(index: pg_sys::Relation) {
+    let oid = (*index).rd_id;
+    let taken = PENDING.with(|p| {
+        let mut pending = p.borrow_mut();
+        if pending.as_ref().is_some_and(|w| w.index_oid == oid) {
+            pending.take()
+        } else {
+            None
+        }
+    });
+    let Some(write) = taken else { return };
+    // Set aside rather than dropped. If the subtransaction that is rebuilding
+    // commits, these rows are genuinely gone — the rebuild either emptied the
+    // table or indexed them itself — and the stash is cleared at transaction
+    // end. If it *aborts*, Postgres puts the old relfilenode back and these are
+    // the rows that belong to it: dropping them here would leave them live in
+    // the heap with nothing pointing at them, which no vacuum repairs, because
+    // `ambulkdelete` only removes entries for dead tuples.
+    let subid = pg_sys::GetCurrentSubTransactionId();
+    DISCARDED.with(|d| {
+        let mut stash = d.borrow_mut();
+        // At most one entry per subtransaction, and it is the first. Only that
+        // one can hold rows staged before the subtransaction began: `PENDING` is
+        // a single slot and this took it, so a second rebuild at the same depth
+        // is necessarily setting aside rows staged *after* the first — inside
+        // the subtransaction, and rolled back with it. Keeping the later one
+        // would restore rows that must go and strand the ones that must stay.
+        if stash.iter().any(|(s, _)| *s == subid) {
+            return;
+        }
+        stash.push((subid, write));
+        debug_assert_one_per_subxact(&stash);
+    });
+}
+
+/// Write back whatever this transaction has pending, for any index.
+///
+/// The transaction end does this on its own; this is for callers that need the
+/// stored image current before then, without reference to which index that is:
+/// [`flush_before_parallel_plan`], because a worker could read any of them, and
+/// tests that read the stored image directly.
+pub fn flush_pending() {
+    settle_pending();
+    let write = PENDING.with(|p| p.borrow_mut().take());
+    flush_locked(write);
+}
+
+/// Flush at commit, discard at abort.
+///
+/// `#[pg_guard]` is not decoration here: the flush can raise, and a pgrx
+/// `error!` is a Rust panic. Unwinding out of a bare `extern "C"` frame aborts
+/// the process, and for an extension that means every backend dies and the
+/// server enters crash recovery — a whole-cluster restart in place of one failed
+/// transaction.
+#[pg_guard]
+unsafe extern "C" fn xact_callback(event: pg_sys::XactEvent::Type, _arg: *mut core::ffi::c_void) {
+    match event {
+        // PRE_PREPARE matters as much as PRE_COMMIT: a two-phase transaction
+        // that only reached PREPARE would otherwise have its rows dropped here
+        // and never written, so COMMIT PREPARED would report success over an
+        // index that never received them. Writing at prepare rather than at
+        // commit publishes them slightly early, which is the behaviour every
+        // brindle write had before this batching — the index is not
+        // transactional, and making it so is the storage work's job.
+        pg_sys::XactEvent::XACT_EVENT_PRE_COMMIT
+        | pg_sys::XactEvent::XACT_EVENT_PARALLEL_PRE_COMMIT
+        | pg_sys::XactEvent::XACT_EVENT_PRE_PREPARE => {
+            // An error here aborts the transaction, which is the ordinary outcome
+            // for a commit that cannot be completed — unlike the subtransaction
+            // callback, which is why the rewind is carried out from here.
+            settle_pending();
+            let write = PENDING.with(|p| p.borrow_mut().take());
+            flush_locked(write);
+            // Any rebuild still set aside has committed with the transaction, so
+            // the rows it displaced really are gone.
+            //
+            // This is correctness, not just memory. Subtransaction ids restart
+            // with every transaction, so an entry left behind at a live subid
+            // could be handed to a *later* transaction's rollback — clobbering
+            // that transaction's own staging and rewriting a different index
+            // from a graph staged against a relation that no longer exists.
+            // What keeps that unreachable is the drain rule in the abort arm,
+            // not anything about re-parenting reaching the top-level id: an
+            // earlier version of this comment argued the latter and was wrong.
+            DISCARDED.with(|d| d.borrow_mut().clear());
+        }
+        pg_sys::XactEvent::XACT_EVENT_ABORT | pg_sys::XactEvent::XACT_EVENT_PARALLEL_ABORT => {
+            // Nothing was written, so dropping the mutations is the rollback.
+            PENDING.with(|p| *p.borrow_mut() = None);
+            DISCARDED.with(|d| d.borrow_mut().clear());
+        }
+        _ => {}
+    }
+}
+
+/// Track subtransaction boundaries so a `ROLLBACK TO` undoes the right rows.
+///
+/// Rolling back to a savepoint has to undo what came after it while keeping what
+/// came before, and a staged graph has no notion of either. Recording how many
+/// rows were staged when each subtransaction began is what draws the line.
+///
+/// This callback does arithmetic and nothing else, deliberately. It used to
+/// write the staged rows back at `SUBXACT_EVENT_START_SUB`, which was wrong
+/// twice over. An error raised while Postgres is starting a subtransaction does
+/// not abort the statement, it escalates, and for a `plpgsql` block with an
+/// `EXCEPTION` handler it ends the session with `FATAL` — and a whole-image
+/// write is exactly the kind of work that can fail. Worse, flushing at *every*
+/// boundary published rows a later `ROLLBACK TO` an outer savepoint was
+/// supposed to undo: the inner savepoint had already written them.
+///
+/// A savepoint therefore no longer forces a write-back either, so a `plpgsql`
+/// loop with an `EXCEPTION` handler keeps its batching rather than flushing per
+/// iteration.
+///
+/// `#[pg_guard]` for the reason given on [`xact_callback`].
+#[pg_guard]
+unsafe extern "C" fn subxact_callback(
+    event: pg_sys::SubXactEvent::Type,
+    my: pg_sys::SubTransactionId,
+    parent: pg_sys::SubTransactionId,
+    _arg: *mut core::ffi::c_void,
+) {
+    // A rebuild inside this subtransaction set staging aside; its fate is now
+    // known. Both arms are moves, so this stays a callback that cannot fail.
+    match event {
+        // The rebuild is undone and the old relation is back. The rows staged
+        // against it are the ones that belong to it. Anything staged *after* the
+        // rebuild is rolled back with it, so it goes.
+        pg_sys::SubXactEvent::SUBXACT_EVENT_ABORT_SUB => {
+            let restored = DISCARDED.with(|d| {
+                let mut stash = d.borrow_mut();
+                // The first match, and nothing may be left behind for this
+                // subtransaction: an entry stranded at a live subid outlives the
+                // transaction, and subtransaction ids restart with the next one.
+                let taken = stash
+                    .iter()
+                    .position(|(subid, _)| *subid == my)
+                    .map(|at| stash.remove(at).1);
+                stash.retain(|(subid, _)| *subid != my);
+                taken
+            });
+            if let Some(write) = restored {
+                PENDING.with(|p| *p.borrow_mut() = Some(write));
+            }
+        }
+        // The rebuild belongs to the parent now, and so does the question of
+        // whether it stands.
+        pg_sys::SubXactEvent::SUBXACT_EVENT_COMMIT_SUB => {
+            DISCARDED.with(|d| {
+                let mut stash = d.borrow_mut();
+                // Same rule on the way up: if the parent already has an entry it
+                // is the older one, so this one is dropped rather than moved.
+                if stash.iter().any(|(subid, _)| *subid == parent) {
+                    stash.retain(|(subid, _)| *subid != my);
+                } else {
+                    for (subid, _) in stash.iter_mut() {
+                        if *subid == my {
+                            *subid = parent;
+                        }
+                    }
+                }
+                // Both branches, not just the one that can break it: an early
+                // return past the check is how the push path came to be pinned
+                // and the re-parent path not.
+                debug_assert_one_per_subxact(&stash);
+            });
+        }
+        _ => {}
+    }
+    // Applied to the set-aside writes as well as the staged one. A write sitting
+    // in the stash is still subject to the savepoints opening and closing around
+    // it, and if its marks stop being maintained while it waits, the abort that
+    // hands it back pops a mark belonging to some deeper savepoint and keeps
+    // rows that savepoint was supposed to roll back.
+    PENDING.with(|p| {
+        if let Some(write) = p.borrow_mut().as_mut() {
+            apply_mark_event(write, event);
+        }
+    });
+    DISCARDED.with(|d| {
+        for (_, write) in d.borrow_mut().iter_mut() {
+            apply_mark_event(write, event);
+        }
+    });
+}
+
+/// Move one write's savepoint bookkeeping across a subtransaction boundary.
+fn apply_mark_event(write: &mut PendingWrite, event: pg_sys::SubXactEvent::Type) {
+    let staged = write.tids.len() - write.base_n;
+    match event {
+        pg_sys::SubXactEvent::SUBXACT_EVENT_START_SUB => {
+            // Clamped by any rewind not yet carried out: between an abort and
+            // the settle, `tids` still holds rows that are already rolled back,
+            // and `ROLLBACK TO` opens a fresh subtransaction of the same name
+            // immediately after aborting the old one.
+            write
+                .marks
+                .push(write.rewind_to.unwrap_or(staged).min(staged));
+        }
+        // The subtransaction's rows belong to its parent now.
+        pg_sys::SubXactEvent::SUBXACT_EVENT_COMMIT_SUB => {
+            write.marks.pop();
+        }
+        pg_sys::SubXactEvent::SUBXACT_EVENT_ABORT_SUB => {
+            // No mark means staging began inside the subtransaction being rolled
+            // back, so none of it survives.
+            let mark = write.marks.pop().unwrap_or(0);
+            // Only when it actually rolls something back. A mark equal to what
+            // is staged — which is every mark on a write that has been sitting
+            // in the stash, since nothing is added to it there — would otherwise
+            // schedule a reload and replay that changes nothing.
+            if mark < staged {
+                write.rewind_to = Some(write.rewind_to.unwrap_or(mark).min(mark));
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Carry out a subtransaction rollback recorded by [`subxact_callback`].
+///
+/// Split from the callback on purpose. An error raised while Postgres is
+/// starting a subtransaction does not abort the statement — it escalates, and
+/// for a `plpgsql` block with an `EXCEPTION` handler it terminates the session
+/// with `FATAL`. So the callback does arithmetic only, and the work that can
+/// fail happens here, from the ordinary paths, where a failure is an ordinary
+/// error.
+///
+/// The graph is rebuilt from the stored image rather than truncated, because
+/// removing the last few nodes from an HNSW graph does not give back the graph
+/// that would have been built without them: the survivors' edges were pruned
+/// against neighbours that are going away. Reloading and re-applying keeps the
+/// promise that a staged graph is exactly what a rebuild would have produced.
+fn settle_pending() {
+    let mark = PENDING.with(|p| p.borrow().as_ref().and_then(|w| w.rewind_to));
+    let Some(mark) = mark else { return };
+
+    let write = PENDING.with(|p| p.borrow_mut().take());
+    let Some(write) = write else { return };
+    // Nothing staged survives: dropping the whole thing is the rollback, and no
+    // reload is needed to do it.
+    if mark == 0 {
+        return;
+    }
+
+    let survivors: Vec<(Vec<f32>, Vec<AttrValue>, TidPair)> = (write.base_n..write.base_n + mark)
+        .map(|id| {
+            (
+                write.hnsw.vector(id).to_vec(),
+                write.hnsw.attrs(id).to_vec(),
+                write.tids[id],
+            )
+        })
+        .collect();
+    let (index_oid, marks) = (write.index_oid, write.marks.clone());
+    drop(write);
+
+    // SAFETY: the oid names an index this backend staged rows for inside the
+    // transaction still running, so it exists and is lockable.
+    unsafe {
+        let rel = pg_sys::try_relation_open(index_oid, pg_sys::RowExclusiveLock as i32);
+        if rel.is_null() {
+            // Dropped since. The staged rows have nowhere to go, which is what
+            // taking them above already achieved.
+            return;
+        }
+        let (mut hnsw, mut tids, generation) = load_index_with_generation(rel);
+        let base_n = hnsw.len();
+        for (vector, attrs, tid) in survivors {
+            apply_one(&mut hnsw, tids.len(), vector, attrs);
+            tids.push(tid);
+        }
+        pg_sys::relation_close(rel, pg_sys::RowExclusiveLock as i32);
+
+        PENDING.with(|p| {
+            *p.borrow_mut() = Some(PendingWrite {
+                index_oid,
+                base_generation: generation,
+                base_n,
+                hnsw,
+                tids,
+                marks,
+                rewind_to: None,
+            });
+        });
+    }
+}
+
+fn register_callbacks() {
+    CALLBACKS_REGISTERED.with(|done| {
+        if done.get() {
+            return;
+        }
+        // SAFETY: registered once per backend, and Postgres keeps the pointers.
+        unsafe {
+            pg_sys::RegisterXactCallback(Some(xact_callback), core::ptr::null_mut());
+            pg_sys::RegisterSubXactCallback(Some(subxact_callback), core::ptr::null_mut());
+        }
+        done.set(true);
+    });
 }
 
 #[cfg(test)]

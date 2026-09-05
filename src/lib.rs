@@ -32,6 +32,7 @@ pub mod vector;
 pub extern "C" fn _PG_init() {
     guc::init();
     index_am::options::init();
+    index_am::storage::init_executor_hook();
 }
 
 /// Adapt a kernel `Result` into a Postgres value, raising a clean `ERROR` on

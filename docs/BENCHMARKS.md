@@ -22,7 +22,9 @@ pgvector recall table across repeated builds, which is multi-run by construction
 because its subject
 is how far a randomised build moves; the run-to-run ranges quoted for build
 time and for the paired search-cost medians, which exist precisely to show how
-far those move; the plpgsql timing floor of ~0.016 ms; and the check that
+far those move; the plpgsql timing floor of ~0.016 ms; the insert-cost table,
+which is its own run set at a narrower vector width, with a before-column from a
+pre-change build, and names its own command; and the check that
 `max_parallel_maintenance_workers = 0` really took effect, an out-of-band look
 at `pg_stat_activity`. No figure is silently carried in from a run this file
 does not name.
@@ -226,6 +228,51 @@ for whoever has queried recently.
 One caveat the medians hide: the same table's p95 paired deltas run 3–16 ms,
 many times the median. The "1% of a query" figure is a statement about the
 median query, and the tail is worse.
+
+## What an insert costs
+
+Every write rewrites the whole stored image, so an insert's cost tracks the size
+of the index rather than the size of the row. A transaction's inserts are now
+applied to a graph held in memory and written back once when it ends, which
+helps entirely according to how they arrive.
+
+```bash
+# DIMS=32 because that is what the table below reports; the driver's default is
+# 128, and the sweep knobs keep it from running the full 100k baseline first.
+INSERTS=1 DIMS=32 ROWS=2000 QUERIES=5 scripts/bench_index.sh
+```
+
+Per row, at 32 dimensions, before and after that change:
+
+| rows in index | one row per statement | 100 rows in one statement |
+|---|---|---|
+| 2 000 | 4.43 → 3.82 ms | 2.81 → **0.38 ms** |
+| 8 000 | 13.27 → 10.56 ms | 11.79 → **0.45 ms** |
+| 20 000 | 24.55 → 25.88 ms | 25.53 → **0.61 ms** |
+
+**A row inserted with others got 7× to 42× cheaper, and the gap widens with the
+index** — that is the quadratic becoming linear. It is amortization rather than
+elimination: the write-back still costs what it costs, but once per statement
+instead of once per row, so the per-row figure grows with the index divided by
+the batch. A larger batch is cheaper per row; a batch of one is no batch at all.
+
+**A row inserted on its own did not get cheaper.** 24.55 → 25.88 ms at 20 000
+rows is a wash — repeat runs of that column land anywhere between 23.9 and 25.9
+ms, so neither direction means anything — and the smaller sizes differ by less
+than the noise between runs. Only the bulk column is emphasised above for that
+reason.
+A single-row `INSERT` is its own transaction, so there is nothing to batch with
+and it rewrites the image exactly as before. Not rewriting the whole image per
+row is paged storage, and stays with that work.
+
+An earlier version of this section claimed single-row insert had improved eight-
+fold. It had not: the measurement timed the staging and not the write-back,
+because the whole thing ran inside one transaction that never committed, and a
+transaction's rows are written when it ends. The harness commits each shape now,
+which is why these numbers are larger than the ones they replace and why the
+single-row column no longer shows a win. The fixtures are small because the
+pre-change behaviour is quadratic in the fixture and a realistic size takes
+longer to measure than anyone will wait.
 
 ## Comparison with pgvector
 

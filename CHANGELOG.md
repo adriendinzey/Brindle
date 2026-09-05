@@ -42,6 +42,82 @@ versions may break).
 
 ### Changed
 
+- **A transaction's inserts are written back to the index once, when it ends,
+  rather than once per row.** Every write rewrites the whole stored image, so
+  doing that per row made a bulk load quadratic in the table; `INSERT ... SELECT`
+  of N rows is now linear. Measured on a 20 000-row index, a row inserted as part
+  of a 100-row statement went from 25.5 ms to 0.61 ms — amortization rather than
+  elimination, so a larger statement is cheaper per row and a batch of one is no
+  batch at all.
+
+  **A single-row `INSERT` is no faster.** It is its own transaction, so it has
+  nothing to batch with and rewrites the whole image exactly as before. Not
+  rewriting the image per row needs the paged storage this format is a
+  placeholder for.
+
+  Consequences worth knowing. A transaction's own rows are visible to it before
+  it commits, as before, but they reach the index relation no earlier than the
+  first of: a query against that index, a parallel plan, a write to a second
+  brindle index, or the end of the transaction (see below) — so a crash before
+  any of those leaves the index as it was, which is what rolling that
+  transaction back means anyway. A transaction
+  that ends with `PREPARE TRANSACTION` writes them at the prepare rather than at
+  `COMMIT PREPARED`; a `ROLLBACK PREPARED` after that does **not** take them back
+  out, though heap visibility keeps them from being returned. Savepoints do not
+  force a write-back, and `ROLLBACK TO` undoes the rows *still staged* when it
+  runs — but **anything already written back cannot be taken out again**, and a
+  write-back can happen inside a savepoint: a query against that index, a
+  statement that plans a parallel scan, or a write to a second brindle index all
+  force one. Rows rolled back after that stay in the index as entries pointing at
+  dead heap tuples. They return no wrong answers — heap visibility drops them and
+  the next `VACUUM` tombstones them — but until then they are bloat, and a
+  `plpgsql` loop with an `EXCEPTION` handler keeps its batching only if it does
+  not read the index it is writing. **A table with two brindle indexes gets no
+  batching at all** — only one index's rows are staged at a time, so writes to a
+  second flush the first.
+
+  A `TRUNCATE` or `REINDEX` in the same transaction sets aside whatever that
+  transaction had staged for the index rather than writing it over the rebuild.
+  Set aside, not discarded: a rebuild inside a subtransaction that later aborts
+  is undone, relfilenode and all, and the staged rows belong to the state that
+  comes back. They are handed back if that happens and dropped once the rebuild
+  is known to stand.
+
+  One consequence of writing at the end rather than per row: a conflict between
+  two transactions is reported by the one that commits second, at its `COMMIT`,
+  rather than by the statement that caused it. Two sessions inserting different
+  vector dimensions into the same empty index is the reachable case.
+
+  **Querying a brindle index inside a transaction that has written to it forces
+  the write-back early**, and the batching restarts from there. Staged rows are
+  backend-local, so rather than lending them to a scan they are written first —
+  and because a parallel worker is a separate process that could not see them
+  either way, **any statement that runs a parallel plan also forces the
+  write-back**, whether or not it touches a brindle index. A transaction that
+  alternates `INSERT` and `SELECT` on the same index therefore gets no batching —
+  it pays what it paid before — while one that writes and then reads pays one
+  extra write-back. Bulk loads, which do not query what they are filling and plan
+  no parallel statements, are unaffected.
+
+  This installs an `ExecutorStart_hook`. It chains to any hook already present,
+  so other extensions are unaffected, and it does nothing unless the statement
+  needs parallel mode and this transaction has rows staged. `EXPLAIN` without
+  `ANALYZE` is excluded, so planning a query stays free of side effects. Note
+  that a session running with `debug_parallel_query = on` — which some test
+  suites set globally — makes *every* parallel-safe statement force the
+  write-back, and so gets no batching at all.
+
+  While a transaction is staging rows it holds a decoded copy of the index, and
+  that copy is **not bounded by `brindle.cache_max_mb`** — it exists even when
+  that is zero. A write-back that has to replay onto another backend's newer
+  image holds two decoded copies plus the encoded blob at its peak. A `TRUNCATE`
+  or `REINDEX` also sets the staged graph aside until the rebuild's fate is
+  known, so a transaction that rebuilds under several open savepoints can hold
+  one decoded graph per savepoint depth — bounded by that depth, not unbounded,
+  and released when the transaction ends.
+  A large bulk load into a wide-vector index can therefore hold a
+  substantial amount of memory for the length of the transaction. Splitting such
+  a load into several transactions bounds it, at the cost of one write-back each.
 - A backend now keeps one decoded copy of an index in memory and reuses it
   across scans, instead of reading and decoding the whole index for every query.
   On a 100k × 128 index that takes a query from ~58 ms to ~0.3 ms. The first
