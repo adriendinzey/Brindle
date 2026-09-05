@@ -18,7 +18,7 @@
 #   K        neighbors requested per query      (default 10)
 #   PGVECTOR set to 1 to also run the matched pgvector comparison (needs the
 #            vector extension installed into the same Postgres)
-#   INSERTS  set to 1 to measure insert cost against index size instead of the
+#   INSERTS  set to 1 to also measure insert cost against index size, after the
 #            query sweep — a different question, and a slow one, so it is opt-in
 #   SHAPE    set to "clustered" for 100 gaussian-ish clusters; unset means
 #            uniform random, which in high dimensions is the worst case a graph

@@ -853,6 +853,14 @@ struct PendingWrite {
 thread_local! {
     static PENDING: std::cell::RefCell<Option<PendingWrite>> =
         const { std::cell::RefCell::new(None) };
+    /// Staging set aside by a rebuild, against the subtransaction that did it.
+    ///
+    /// A rebuild is not necessarily permanent: `TRUNCATE` and `REINDEX` inside a
+    /// subtransaction that later aborts are undone, relfilenode and all. The
+    /// staged rows belong to the state that comes back, so they are kept here
+    /// until the subtransaction's fate is known rather than dropped outright.
+    static DISCARDED: std::cell::RefCell<Vec<(pg_sys::SubTransactionId, PendingWrite)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
     /// Registered once per backend; the callbacks themselves are cheap and
     /// return immediately when there is nothing pending.
     static CALLBACKS_REGISTERED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -1114,12 +1122,24 @@ fn flush_locked(write: Option<PendingWrite>) {
 /// `index` must be an open index relation.
 pub unsafe fn forget_pending(index: pg_sys::Relation) {
     let oid = (*index).rd_id;
-    PENDING.with(|p| {
+    let taken = PENDING.with(|p| {
         let mut pending = p.borrow_mut();
         if pending.as_ref().is_some_and(|w| w.index_oid == oid) {
-            *pending = None;
+            pending.take()
+        } else {
+            None
         }
     });
+    let Some(write) = taken else { return };
+    // Set aside rather than dropped. If the subtransaction that is rebuilding
+    // commits, these rows are genuinely gone — the rebuild either emptied the
+    // table or indexed them itself — and the stash is cleared at transaction
+    // end. If it *aborts*, Postgres puts the old relfilenode back and these are
+    // the rows that belong to it: dropping them here would leave them live in
+    // the heap with nothing pointing at them, which no vacuum repairs, because
+    // `ambulkdelete` only removes entries for dead tuples.
+    let subid = pg_sys::GetCurrentSubTransactionId();
+    DISCARDED.with(|d| d.borrow_mut().push((subid, write)));
 }
 
 /// Write back whatever this transaction has pending, for any index.
@@ -1160,10 +1180,21 @@ unsafe extern "C" fn xact_callback(event: pg_sys::XactEvent::Type, _arg: *mut co
             settle_pending();
             let write = PENDING.with(|p| p.borrow_mut().take());
             flush_locked(write);
+            // Any rebuild still set aside has committed with the transaction, so
+            // the rows it displaced really are gone.
+            //
+            // This is about memory, not correctness: at commit Postgres commits
+            // every open subtransaction in turn, so an entry is re-parented up
+            // the chain to the top-level id — and no `ABORT_SUB` ever fires with
+            // that id, since a top-level abort is `XACT_EVENT_ABORT`. A leaked
+            // entry could not be handed to a later transaction; it would simply
+            // hold a decoded graph for the life of the backend.
+            DISCARDED.with(|d| d.borrow_mut().clear());
         }
         pg_sys::XactEvent::XACT_EVENT_ABORT | pg_sys::XactEvent::XACT_EVENT_PARALLEL_ABORT => {
             // Nothing was written, so dropping the mutations is the rollback.
             PENDING.with(|p| *p.borrow_mut() = None);
+            DISCARDED.with(|d| d.borrow_mut().clear());
         }
         _ => {}
     }
@@ -1192,10 +1223,41 @@ unsafe extern "C" fn xact_callback(event: pg_sys::XactEvent::Type, _arg: *mut co
 #[pg_guard]
 unsafe extern "C" fn subxact_callback(
     event: pg_sys::SubXactEvent::Type,
-    _my: pg_sys::SubTransactionId,
-    _parent: pg_sys::SubTransactionId,
+    my: pg_sys::SubTransactionId,
+    parent: pg_sys::SubTransactionId,
     _arg: *mut core::ffi::c_void,
 ) {
+    // A rebuild inside this subtransaction set staging aside; its fate is now
+    // known. Both arms are moves, so this stays a callback that cannot fail.
+    match event {
+        // The rebuild is undone and the old relation is back. The rows staged
+        // against it are the ones that belong to it. Anything staged *after* the
+        // rebuild is rolled back with it, so it goes.
+        pg_sys::SubXactEvent::SUBXACT_EVENT_ABORT_SUB => {
+            let restored = DISCARDED.with(|d| {
+                let mut stash = d.borrow_mut();
+                stash
+                    .iter()
+                    .rposition(|(subid, _)| *subid == my)
+                    .map(|at| stash.remove(at).1)
+            });
+            if let Some(write) = restored {
+                PENDING.with(|p| *p.borrow_mut() = Some(write));
+            }
+        }
+        // The rebuild belongs to the parent now, and so does the question of
+        // whether it stands.
+        pg_sys::SubXactEvent::SUBXACT_EVENT_COMMIT_SUB => {
+            DISCARDED.with(|d| {
+                for (subid, _) in d.borrow_mut().iter_mut() {
+                    if *subid == my {
+                        *subid = parent;
+                    }
+                }
+            });
+        }
+        _ => {}
+    }
     PENDING.with(|p| {
         let mut pending = p.borrow_mut();
         let Some(write) = pending.as_mut() else {

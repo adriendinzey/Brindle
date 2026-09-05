@@ -71,9 +71,11 @@ BEGIN
     END IF;
 END $$;
 
--- Rolling back to a savepoint must undo only what came after it. The rows before
--- the savepoint are flushed when the subtransaction opens, which is what makes
--- discarding the rest a correct undo rather than a partial one.
+-- Rolling back to a savepoint must undo only what came after it. Opening a
+-- subtransaction records how many rows were staged at that point; the rollback
+-- keeps those and drops the rest. It used to flush them to disk instead, which
+-- both published rows an outer ROLLBACK TO had to undo and could end the session
+-- with FATAL — see savepoints_roll_back_staged_rows.sql.
 BEGIN;
 INSERT INTO defer_t SELECT 6001, ARRAY[6001.0::real, 6002.0::real];
 SAVEPOINT sp;

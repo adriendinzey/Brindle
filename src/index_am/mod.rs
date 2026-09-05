@@ -189,6 +189,11 @@ unsafe extern "C" fn ambuild(
     // would corrupt the index or duplicate its entries. This is also the only
     // place that can tell a rebuild from a plain relfilenode change: a
     // tablespace move never reaches here.
+    //
+    // Set aside rather than dropped, because a rebuild is not necessarily final:
+    // a TRUNCATE or REINDEX inside a subtransaction that aborts is undone, and
+    // the staged rows belong to the state that comes back. See
+    // [`storage::forget_pending`].
     storage::forget_pending(index);
 
     let mut state = BuildState {

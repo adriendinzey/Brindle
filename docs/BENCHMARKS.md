@@ -237,7 +237,9 @@ applied to a graph held in memory and written back once when it ends, which
 helps entirely according to how they arrive.
 
 ```bash
-INSERTS=1 scripts/bench_index.sh
+# DIMS=32 because that is what the table below reports; the driver's default is
+# 128, and the sweep knobs keep it from running the full 100k baseline first.
+INSERTS=1 DIMS=32 ROWS=2000 QUERIES=5 scripts/bench_index.sh
 ```
 
 Per row, at 32 dimensions, before and after that change:
@@ -246,7 +248,7 @@ Per row, at 32 dimensions, before and after that change:
 |---|---|---|
 | 2 000 | 4.43 → 3.82 ms | 2.81 → **0.38 ms** |
 | 8 000 | 13.27 → 10.56 ms | 11.79 → **0.45 ms** |
-| 20 000 | 24.55 → **25.88 ms** | 25.53 → **0.61 ms** |
+| 20 000 | 24.55 → 25.88 ms | 25.53 → **0.61 ms** |
 
 **A row inserted with others got 7× to 42× cheaper, and the gap widens with the
 index** — that is the quadratic becoming linear. It is amortization rather than
@@ -255,7 +257,10 @@ instead of once per row, so the per-row figure grows with the index divided by
 the batch. A larger batch is cheaper per row; a batch of one is no batch at all.
 
 **A row inserted on its own did not get cheaper.** 24.55 → 25.88 ms at 20 000
-rows is a wash, and the smaller sizes differ by less than the noise between runs.
+rows is a wash — repeat runs of that column land anywhere between 23.9 and 25.9
+ms, so neither direction means anything — and the smaller sizes differ by less
+than the noise between runs. Only the bulk column is emphasised above for that
+reason.
 A single-row `INSERT` is its own transaction, so there is nothing to batch with
 and it rewrites the image exactly as before. Not rewriting the whole image per
 row is paged storage, and stays with that work.
