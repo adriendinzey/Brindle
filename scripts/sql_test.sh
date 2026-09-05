@@ -25,6 +25,27 @@
 # the failure report shows, so make it say what was expected and what was found.
 # Expected-output files are deliberately not used: they fail on incidental
 # formatting and say "files differ" when they do.
+#
+# BEFORE TRUSTING A NEW CASE, BREAK THE MECHANISM AND WATCH IT GO RED. Every
+# case here has been confirmed to fail when the thing it names is disabled. That
+# is not a formality: cases in this directory have three times passed for a
+# reason other than the one they claimed —
+#
+#   * Postgres rechecks heap visibility for every TID an index scan returns, so
+#     "the deleted / rolled-back row is absent" holds whatever the index says.
+#     Count rows, or reclaim the freed line pointers and look for wrong answers.
+#   * An earlier step in the same case can satisfy the assertion as a side
+#     effect. Any query against a brindle index writes back the transaction's
+#     staged rows, so a scan — or an EXPLAIN, before that was excluded — placed
+#     between the INSERT and the assertion does the work the assertion is
+#     supposed to be testing.
+#   * A query wrapped in a scalar subquery becomes an InitPlan, which the leader
+#     evaluates before dispatching, so a case meant to exercise a parallel
+#     worker never reaches one.
+#
+# A mutation is cheap: edit the mechanism, run `scripts/sql_test.sh <case>`,
+# confirm FAIL, `git checkout --` the file. If the case still passes, it is not
+# testing what its name says.
 
 set -euo pipefail
 
