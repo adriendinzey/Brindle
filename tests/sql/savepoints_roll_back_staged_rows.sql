@@ -134,6 +134,54 @@ BEGIN
     END IF;
 END $$;
 
+-- Savepoints that open and close around a rebuild must still count.
+--
+-- A rebuild sets the staged graph aside until its subtransaction's fate is
+-- known. While it waits there it is not the *staged* write any more, so the
+-- bookkeeping that records where each savepoint began has to keep being applied
+-- to it -- otherwise the abort that hands it back pops a mark belonging to some
+-- deeper savepoint, and keeps rows that savepoint was supposed to roll back.
+-- The rows are live-but-rolled-back, so nothing returns a wrong answer; the
+-- index is simply carrying entries for tuples that are dead. Compare the stored
+-- graph against a control holding only the rows that should have survived.
+CREATE TABLE mk (id int, embedding real[]);
+ALTER TABLE mk SET (autovacuum_enabled = off);
+INSERT INTO mk SELECT i, ARRAY[i::real, (i + 1)::real] FROM generate_series(1, 170) i;
+CREATE INDEX mk_idx ON mk USING brindle (embedding);
+
+CREATE TABLE mk_ctl (id int, embedding real[]);
+ALTER TABLE mk_ctl SET (autovacuum_enabled = off);
+INSERT INTO mk_ctl SELECT i, ARRAY[i::real, (i + 1)::real] FROM generate_series(1, 170) i;
+CREATE INDEX mk_ctl_idx ON mk_ctl USING brindle (embedding);
+
+BEGIN;
+INSERT INTO mk VALUES (1000, ARRAY[1000.0::real, 1001.0::real]);   -- before the outer: kept
+SAVEPOINT outer_s;
+INSERT INTO mk SELECT i, ARRAY[i::real, (i + 1)::real]
+FROM generate_series(2000, 2029) i;                                -- rolled back
+SAVEPOINT inner_s;
+REINDEX INDEX mk_idx;               -- sets the staged graph aside, at inner_s
+RELEASE SAVEPOINT inner_s;          -- re-parented to outer_s
+ROLLBACK TO outer_s;                -- hands it back; the 30 rows must not survive
+COMMIT;
+
+BEGIN;
+INSERT INTO mk_ctl VALUES (1000, ARRAY[1000.0::real, 1001.0::real]);
+COMMIT;
+
+DO $$
+DECLARE got bigint; want bigint;
+BEGIN
+    got  := blob_len('mk_idx');
+    want := blob_len('mk_ctl_idx');
+    IF got <> want THEN
+        RAISE EXCEPTION
+            'stored graph is % bytes against a control of % for the same '
+            'surviving rows: a savepoint that opened and closed while the graph '
+            'was set aside by a rebuild was not accounted for', got, want;
+    END IF;
+END $$;
+
 -- A concurrent commit between staging and the rollback must not cost the
 -- transaction its own earlier rows.
 --

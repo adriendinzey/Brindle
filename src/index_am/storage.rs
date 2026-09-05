@@ -1139,7 +1139,19 @@ pub unsafe fn forget_pending(index: pg_sys::Relation) {
     // the heap with nothing pointing at them, which no vacuum repairs, because
     // `ambulkdelete` only removes entries for dead tuples.
     let subid = pg_sys::GetCurrentSubTransactionId();
-    DISCARDED.with(|d| d.borrow_mut().push((subid, write)));
+    DISCARDED.with(|d| {
+        let mut stash = d.borrow_mut();
+        // At most one entry per subtransaction, and it is the first. Only that
+        // one can hold rows staged before the subtransaction began: `PENDING` is
+        // a single slot and this took it, so a second rebuild at the same depth
+        // is necessarily setting aside rows staged *after* the first — inside
+        // the subtransaction, and rolled back with it. Keeping the later one
+        // would restore rows that must go and strand the ones that must stay.
+        if stash.iter().any(|(s, _)| *s == subid) {
+            return;
+        }
+        stash.push((subid, write));
+    });
 }
 
 /// Write back whatever this transaction has pending, for any index.
@@ -1236,10 +1248,15 @@ unsafe extern "C" fn subxact_callback(
         pg_sys::SubXactEvent::SUBXACT_EVENT_ABORT_SUB => {
             let restored = DISCARDED.with(|d| {
                 let mut stash = d.borrow_mut();
-                stash
+                // The first match, and nothing may be left behind for this
+                // subtransaction: an entry stranded at a live subid outlives the
+                // transaction, and subtransaction ids restart with the next one.
+                let taken = stash
                     .iter()
-                    .rposition(|(subid, _)| *subid == my)
-                    .map(|at| stash.remove(at).1)
+                    .position(|(subid, _)| *subid == my)
+                    .map(|at| stash.remove(at).1);
+                stash.retain(|(subid, _)| *subid != my);
+                taken
             });
             if let Some(write) = restored {
                 PENDING.with(|p| *p.borrow_mut() = Some(write));
@@ -1249,7 +1266,14 @@ unsafe extern "C" fn subxact_callback(
         // whether it stands.
         pg_sys::SubXactEvent::SUBXACT_EVENT_COMMIT_SUB => {
             DISCARDED.with(|d| {
-                for (subid, _) in d.borrow_mut().iter_mut() {
+                let mut stash = d.borrow_mut();
+                // Same rule on the way up: if the parent already has an entry it
+                // is the older one, so this one is dropped rather than moved.
+                if stash.iter().any(|(subid, _)| *subid == parent) {
+                    stash.retain(|(subid, _)| *subid != my);
+                    return;
+                }
+                for (subid, _) in stash.iter_mut() {
                     if *subid == my {
                         *subid = parent;
                     }
@@ -1258,35 +1282,54 @@ unsafe extern "C" fn subxact_callback(
         }
         _ => {}
     }
+    // Applied to the set-aside writes as well as the staged one. A write sitting
+    // in the stash is still subject to the savepoints opening and closing around
+    // it, and if its marks stop being maintained while it waits, the abort that
+    // hands it back pops a mark belonging to some deeper savepoint and keeps
+    // rows that savepoint was supposed to roll back.
     PENDING.with(|p| {
-        let mut pending = p.borrow_mut();
-        let Some(write) = pending.as_mut() else {
-            return;
-        };
-        match event {
-            pg_sys::SubXactEvent::SUBXACT_EVENT_START_SUB => {
-                // Clamped by any rewind not yet carried out: between an abort
-                // and the settle, `tids` still holds rows that are already
-                // rolled back, and `ROLLBACK TO` opens a fresh subtransaction
-                // of the same name immediately after aborting the old one.
-                let staged = write.tids.len() - write.base_n;
-                write
-                    .marks
-                    .push(write.rewind_to.unwrap_or(staged).min(staged));
-            }
-            // The subtransaction's rows belong to its parent now.
-            pg_sys::SubXactEvent::SUBXACT_EVENT_COMMIT_SUB => {
-                write.marks.pop();
-            }
-            pg_sys::SubXactEvent::SUBXACT_EVENT_ABORT_SUB => {
-                // No mark means staging began inside the subtransaction being
-                // rolled back, so none of it survives.
-                let mark = write.marks.pop().unwrap_or(0);
-                write.rewind_to = Some(write.rewind_to.unwrap_or(mark).min(mark));
-            }
-            _ => {}
+        if let Some(write) = p.borrow_mut().as_mut() {
+            apply_mark_event(write, event);
         }
     });
+    DISCARDED.with(|d| {
+        for (_, write) in d.borrow_mut().iter_mut() {
+            apply_mark_event(write, event);
+        }
+    });
+}
+
+/// Move one write's savepoint bookkeeping across a subtransaction boundary.
+fn apply_mark_event(write: &mut PendingWrite, event: pg_sys::SubXactEvent::Type) {
+    let staged = write.tids.len() - write.base_n;
+    match event {
+        pg_sys::SubXactEvent::SUBXACT_EVENT_START_SUB => {
+            // Clamped by any rewind not yet carried out: between an abort and
+            // the settle, `tids` still holds rows that are already rolled back,
+            // and `ROLLBACK TO` opens a fresh subtransaction of the same name
+            // immediately after aborting the old one.
+            write
+                .marks
+                .push(write.rewind_to.unwrap_or(staged).min(staged));
+        }
+        // The subtransaction's rows belong to its parent now.
+        pg_sys::SubXactEvent::SUBXACT_EVENT_COMMIT_SUB => {
+            write.marks.pop();
+        }
+        pg_sys::SubXactEvent::SUBXACT_EVENT_ABORT_SUB => {
+            // No mark means staging began inside the subtransaction being rolled
+            // back, so none of it survives.
+            let mark = write.marks.pop().unwrap_or(0);
+            // Only when it actually rolls something back. A mark equal to what
+            // is staged — which is every mark on a write that has been sitting
+            // in the stash, since nothing is added to it there — would otherwise
+            // schedule a reload and replay that changes nothing.
+            if mark < staged {
+                write.rewind_to = Some(write.rewind_to.unwrap_or(mark).min(mark));
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Carry out a subtransaction rollback recorded by [`subxact_callback`].

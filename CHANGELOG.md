@@ -58,8 +58,9 @@ versions may break).
   Consequences worth knowing. A transaction's own rows are visible to it before
   it commits, as before, but they reach the index relation no earlier than the
   first of: a query against that index, a parallel plan, a write to a second
-  brindle index, or the end of the transaction (see below) — so a crash before any of those leaves the index as it
-  was, which is what rolling that transaction back means anyway. A transaction
+  brindle index, or the end of the transaction (see below) — so a crash before
+  any of those leaves the index as it was, which is what rolling that
+  transaction back means anyway. A transaction
   that ends with `PREPARE TRANSACTION` writes them at the prepare rather than at
   `COMMIT PREPARED`; a `ROLLBACK PREPARED` after that does **not** take them back
   out, though heap visibility keeps them from being returned. Savepoints do not
@@ -109,7 +110,11 @@ versions may break).
   While a transaction is staging rows it holds a decoded copy of the index, and
   that copy is **not bounded by `brindle.cache_max_mb`** — it exists even when
   that is zero. A write-back that has to replay onto another backend's newer
-  image holds two decoded copies plus the encoded blob at its peak.
+  image holds two decoded copies plus the encoded blob at its peak. A `TRUNCATE`
+  or `REINDEX` also sets the staged graph aside until the rebuild's fate is
+  known, so a transaction that rebuilds under several open savepoints can hold
+  one decoded graph per savepoint depth — bounded by that depth, not unbounded,
+  and released when the transaction ends.
   A large bulk load into a wide-vector index can therefore hold a
   substantial amount of memory for the length of the transaction. Splitting such
   a load into several transactions bounds it, at the cost of one write-back each.

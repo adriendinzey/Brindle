@@ -125,16 +125,101 @@ END $$;
 
 INSERT INTO rbk SELECT i, ARRAY[i::real, (i + 1)::real] FROM generate_series(1, 50) i;
 
--- Note on what is *not* tested here: staging set aside by a rebuild that
--- commits is cleared at transaction end, and that clearing is about memory
--- rather than correctness, so no case asserts on it. At COMMIT Postgres commits
--- every open subtransaction in turn, which re-parents the entry up the chain to
--- the top-level subtransaction id -- and no SUBXACT_EVENT_ABORT_SUB ever fires
--- with that id, because a top-level abort is XACT_EVENT_ABORT instead. So an
--- entry left behind could never be handed to a later transaction; it would only
--- hold a decoded graph for the life of the backend. An earlier version of this
--- file asserted otherwise and passed with the clearing removed, which is the
--- same defect this suite keeps producing: a block that cannot fail.
+-- 5. More than one rebuild mapping to the same savepoint. Only the *first* set
+--    aside can hold rows staged before that savepoint began: staging is a single
+--    slot, so a second rebuild at the same depth is necessarily setting aside
+--    rows staged after the first, inside the subtransaction, which roll back
+--    with it. Restoring the later one hands back rows that must go and strands
+--    the ones that must stay -- the same silent loss as (1), reached three ways.
+--
+--    5a needs nothing unusual at all: two ordinary tables, truncated once each,
+--    inside one savepoint that rolls back.
+CREATE TABLE rbk2 (id int, embedding real[]);
+ALTER TABLE rbk2 SET (autovacuum_enabled = off);
+INSERT INTO rbk2 SELECT i, ARRAY[i::real, (i + 1)::real] FROM generate_series(1, 150) i;
+CREATE INDEX rbk2_idx ON rbk2 USING brindle (embedding);
+
+BEGIN;
+INSERT INTO rbk VALUES (5010, ARRAY[5010.0::real, 5011.0::real]);
+SAVEPOINT m1;
+TRUNCATE rbk;
+INSERT INTO rbk2 VALUES (5011, ARRAY[5011.0::real, 5012.0::real]);
+TRUNCATE rbk2;
+ROLLBACK TO m1;
+COMMIT;
+
+-- 5b: two rebuilds of the same index under one savepoint.
+BEGIN;
+INSERT INTO rbk VALUES (5020, ARRAY[5020.0::real, 5021.0::real]);
+SAVEPOINT m2;
+TRUNCATE rbk;
+INSERT INTO rbk VALUES (5021, ARRAY[5021.0::real, 5022.0::real]);
+TRUNCATE rbk;
+ROLLBACK TO m2;
+COMMIT;
+
+-- 5c: a rebuild in a RELEASEd inner savepoint, re-parented onto an outer one
+--     that already holds an entry of its own.
+BEGIN;
+INSERT INTO rbk VALUES (5030, ARRAY[5030.0::real, 5031.0::real]);
+SAVEPOINT m3;
+SAVEPOINT m4;
+TRUNCATE rbk;
+RELEASE SAVEPOINT m4;
+INSERT INTO rbk VALUES (5031, ARRAY[5031.0::real, 5032.0::real]);
+TRUNCATE rbk;
+ROLLBACK TO m3;
+COMMIT;
+
+DO $$
+DECLARE missing int[];
+BEGIN
+    SET LOCAL enable_seqscan = off;
+    SET LOCAL brindle.ef_search = 2000;
+    SELECT array_agg(want) INTO missing FROM unnest(ARRAY[5010, 5020, 5030]) want
+    WHERE want IS DISTINCT FROM (
+        SELECT id FROM rbk
+        ORDER BY embedding <-> ARRAY[want::real, (want + 1)::real] LIMIT 1);
+    IF missing IS NOT NULL THEN
+        RAISE EXCEPTION
+            'rows staged before a savepoint holding more than one rebuild are '
+            'not in the index: % -- a later rebuild''s staging was handed back '
+            'in place of the one that predates the savepoint', missing;
+    END IF;
+END $$;
+
+-- The second table's own row was staged *after* the savepoint, so the rollback
+-- takes it out of the heap too and its absence proves nothing. What must hold is
+-- that dropping its set-aside staging left the rest of that index intact.
+DO $$
+DECLARE heap_rows bigint; reachable bigint;
+BEGIN
+    SELECT count(*) INTO heap_rows FROM rbk2;   -- before seqscan is disabled
+    SET LOCAL enable_seqscan = off;
+    SET LOCAL brindle.ef_search = 2000;
+    SELECT count(*) INTO reachable FROM (
+        SELECT id FROM rbk2 ORDER BY embedding <-> ARRAY[1.0, 2.0]::real[] LIMIT 2000) s;
+    IF reachable <> heap_rows THEN
+        RAISE EXCEPTION
+            'index on the second table reaches % of % live rows', reachable, heap_rows;
+    END IF;
+END $$;
+
+-- Note on what is *not* tested here: staging set aside by a rebuild that stands
+-- is cleared at transaction end, and no case asserts on that clearing. It does
+-- matter -- subtransaction ids restart with every transaction, so an entry left
+-- behind at a live subid could be handed to a later transaction, which would
+-- both clobber that transaction's own staging and rewrite a different index from
+-- a graph staged against a relation that no longer exists. What makes it
+-- unreachable is the rule above: an abort drains *every* entry for its subid and
+-- a release re-parents or drops them, so nothing is ever left at a subid below
+-- the top level, and no SUBXACT_EVENT_ABORT_SUB fires with the top-level id --
+-- a top-level abort is XACT_EVENT_ABORT instead.
+--
+-- An earlier version of this file asserted the cross-transaction hazard directly
+-- and passed with the clearing removed, which was taken as evidence the hazard
+-- did not exist. It was not: the shape that strands an entry needs two rebuilds
+-- at one savepoint, which (5) above did not then cover.
 
 BEGIN;
 INSERT INTO rbk VALUES (6666, ARRAY[6666.0::real, 6667.0::real]);
