@@ -827,6 +827,17 @@ struct PendingWrite {
     /// everything from here up is what this transaction staged — which is what
     /// a replay needs, read back out of the graph rather than kept beside it.
     base_n: usize,
+    /// One entry per open subtransaction: how many rows were staged when it
+    /// began. A `ROLLBACK TO` has to leave the rows staged before its savepoint
+    /// and drop the rest, and this is what says where the line is.
+    marks: Vec<usize>,
+    /// Set by a subtransaction abort: staged rows at or above this index are
+    /// rolled back and must not reach the index.
+    ///
+    /// Recorded rather than acted on, because the abort callback is not a place
+    /// where anything may fail. [`settle_pending`] carries it out later, at a
+    /// point where an error is an ordinary error.
+    rewind_to: Option<usize>,
 }
 
 thread_local! {
@@ -842,6 +853,9 @@ thread_local! {
 /// `index` must be an open brindle index relation this backend may write.
 pub unsafe fn pending_insert(index: pg_sys::Relation, vector: Vec<f32>, tid: TidPair) {
     register_callbacks();
+    // A subtransaction rollback may be outstanding; carry it out before adding
+    // to a graph that still holds the rows it rolled back.
+    settle_pending();
     let oid = (*index).rd_id;
 
     PENDING.with(|p| {
@@ -878,6 +892,8 @@ pub unsafe fn pending_insert(index: pg_sys::Relation, vector: Vec<f32>, tid: Tid
                 base_n: hnsw.len(),
                 hnsw,
                 tids,
+                marks: Vec::new(),
+                rewind_to: None,
             });
         }
         let write = pending.as_mut().expect("just populated");
@@ -1008,6 +1024,7 @@ pub unsafe fn flush_before_parallel_plan(query_desc: *mut pg_sys::QueryDesc, efl
 /// # Safety
 /// `index` must be an open brindle index relation.
 pub unsafe fn flush_pending_for(index: pg_sys::Relation) {
+    settle_pending();
     let oid = (*index).rd_id;
     let write = PENDING.with(|p| {
         let mut pending = p.borrow_mut();
@@ -1102,11 +1119,19 @@ pub unsafe fn forget_pending(index: pg_sys::Relation) {
 /// [`flush_before_parallel_plan`], because a worker could read any of them, and
 /// tests that read the stored image directly.
 pub fn flush_pending() {
+    settle_pending();
     let write = PENDING.with(|p| p.borrow_mut().take());
     flush_locked(write);
 }
 
 /// Flush at commit, discard at abort.
+///
+/// `#[pg_guard]` is not decoration here: the flush can raise, and a pgrx
+/// `error!` is a Rust panic. Unwinding out of a bare `extern "C"` frame aborts
+/// the process, and for an extension that means every backend dies and the
+/// server enters crash recovery — a whole-cluster restart in place of one failed
+/// transaction.
+#[pg_guard]
 unsafe extern "C" fn xact_callback(event: pg_sys::XactEvent::Type, _arg: *mut core::ffi::c_void) {
     match event {
         // PRE_PREPARE matters as much as PRE_COMMIT: a two-phase transaction
@@ -1119,6 +1144,10 @@ unsafe extern "C" fn xact_callback(event: pg_sys::XactEvent::Type, _arg: *mut co
         pg_sys::XactEvent::XACT_EVENT_PRE_COMMIT
         | pg_sys::XactEvent::XACT_EVENT_PARALLEL_PRE_COMMIT
         | pg_sys::XactEvent::XACT_EVENT_PRE_PREPARE => {
+            // An error here aborts the transaction, which is the ordinary outcome
+            // for a commit that cannot be completed — unlike the subtransaction
+            // callback, which is why the rewind is carried out from here.
+            settle_pending();
             let write = PENDING.with(|p| p.borrow_mut().take());
             flush_locked(write);
         }
@@ -1130,36 +1159,130 @@ unsafe extern "C" fn xact_callback(event: pg_sys::XactEvent::Type, _arg: *mut co
     }
 }
 
-/// Flush before a subtransaction starts, and discard on its rollback.
-///
-/// One consequence worth naming: `BeginInternalSubTransaction` runs outside
-/// plpgsql's `PG_TRY`, so a write-back that fails here aborts the whole
-/// transaction rather than being caught by the `EXCEPTION` handler that opened
-/// the subtransaction. That is the right outcome for an I/O failure — the
-/// alternative is a handler swallowing the loss of the rows staged before it —
-/// but it is not what a reader of the handler would expect.
+/// Track subtransaction boundaries so a `ROLLBACK TO` undoes the right rows.
 ///
 /// Rolling back to a savepoint has to undo what came after it while keeping what
-/// came before. Flushing at the boundary puts everything before the savepoint on
-/// disk, so discarding the pending mutations is exactly the right undo. The cost
-/// is that a plpgsql block with an EXCEPTION handler opens a subtransaction per
-/// iteration and so flushes per row — no worse than not batching at all, which
-/// is what it would otherwise get.
+/// came before, and a staged graph has no notion of either. Recording how many
+/// rows were staged when each subtransaction began is what draws the line.
+///
+/// This callback does arithmetic and nothing else, deliberately. It used to
+/// write the staged rows back at `SUBXACT_EVENT_START_SUB`, which was wrong
+/// twice over. An error raised while Postgres is starting a subtransaction does
+/// not abort the statement, it escalates, and for a `plpgsql` block with an
+/// `EXCEPTION` handler it ends the session with `FATAL` — and a whole-image
+/// write is exactly the kind of work that can fail. Worse, flushing at *every*
+/// boundary published rows a later `ROLLBACK TO` an outer savepoint was
+/// supposed to undo: the inner savepoint had already written them.
+///
+/// A savepoint therefore no longer forces a write-back either, so a `plpgsql`
+/// loop with an `EXCEPTION` handler keeps its batching rather than flushing per
+/// iteration.
+///
+/// `#[pg_guard]` for the reason given on [`xact_callback`].
+#[pg_guard]
 unsafe extern "C" fn subxact_callback(
     event: pg_sys::SubXactEvent::Type,
     _my: pg_sys::SubTransactionId,
     _parent: pg_sys::SubTransactionId,
     _arg: *mut core::ffi::c_void,
 ) {
-    match event {
-        pg_sys::SubXactEvent::SUBXACT_EVENT_START_SUB => {
-            let write = PENDING.with(|p| p.borrow_mut().take());
-            flush_locked(write);
+    PENDING.with(|p| {
+        let mut pending = p.borrow_mut();
+        let Some(write) = pending.as_mut() else {
+            return;
+        };
+        match event {
+            pg_sys::SubXactEvent::SUBXACT_EVENT_START_SUB => {
+                // Clamped by any rewind not yet carried out: between an abort
+                // and the settle, `tids` still holds rows that are already
+                // rolled back, and `ROLLBACK TO` opens a fresh subtransaction
+                // of the same name immediately after aborting the old one.
+                let staged = write.tids.len();
+                write
+                    .marks
+                    .push(write.rewind_to.unwrap_or(staged).min(staged));
+            }
+            // The subtransaction's rows belong to its parent now.
+            pg_sys::SubXactEvent::SUBXACT_EVENT_COMMIT_SUB => {
+                write.marks.pop();
+            }
+            pg_sys::SubXactEvent::SUBXACT_EVENT_ABORT_SUB => {
+                // No mark means staging began inside the subtransaction being
+                // rolled back, so none of it survives.
+                let mark = write.marks.pop().unwrap_or(write.base_n);
+                write.rewind_to = Some(write.rewind_to.unwrap_or(mark).min(mark));
+            }
+            _ => {}
         }
-        pg_sys::SubXactEvent::SUBXACT_EVENT_ABORT_SUB => {
-            PENDING.with(|p| *p.borrow_mut() = None);
+    });
+}
+
+/// Carry out a subtransaction rollback recorded by [`subxact_callback`].
+///
+/// Split from the callback on purpose. An error raised while Postgres is
+/// starting a subtransaction does not abort the statement — it escalates, and
+/// for a `plpgsql` block with an `EXCEPTION` handler it terminates the session
+/// with `FATAL`. So the callback does arithmetic only, and the work that can
+/// fail happens here, from the ordinary paths, where a failure is an ordinary
+/// error.
+///
+/// The graph is rebuilt from the stored image rather than truncated, because
+/// removing the last few nodes from an HNSW graph does not give back the graph
+/// that would have been built without them: the survivors' edges were pruned
+/// against neighbours that are going away. Reloading and re-applying keeps the
+/// promise that a staged graph is exactly what a rebuild would have produced.
+fn settle_pending() {
+    let mark = PENDING.with(|p| p.borrow().as_ref().and_then(|w| w.rewind_to));
+    let Some(mark) = mark else { return };
+
+    let write = PENDING.with(|p| p.borrow_mut().take());
+    let Some(write) = write else { return };
+    // Nothing staged survives: dropping the whole thing is the rollback, and no
+    // reload is needed to do it.
+    if mark <= write.base_n {
+        return;
+    }
+
+    let survivors: Vec<(Vec<f32>, Vec<AttrValue>, TidPair)> = (write.base_n..mark)
+        .map(|id| {
+            (
+                write.hnsw.vector(id).to_vec(),
+                write.hnsw.attrs(id).to_vec(),
+                write.tids[id],
+            )
+        })
+        .collect();
+    let (index_oid, marks) = (write.index_oid, write.marks.clone());
+    drop(write);
+
+    // SAFETY: the oid names an index this backend staged rows for inside the
+    // transaction still running, so it exists and is lockable.
+    unsafe {
+        let rel = pg_sys::try_relation_open(index_oid, pg_sys::RowExclusiveLock as i32);
+        if rel.is_null() {
+            // Dropped since. The staged rows have nowhere to go, which is what
+            // taking them above already achieved.
+            return;
         }
-        _ => {}
+        let (mut hnsw, mut tids, generation) = load_index_with_generation(rel);
+        let base_n = hnsw.len();
+        for (vector, attrs, tid) in survivors {
+            apply_one(&mut hnsw, tids.len(), vector, attrs);
+            tids.push(tid);
+        }
+        pg_sys::relation_close(rel, pg_sys::RowExclusiveLock as i32);
+
+        PENDING.with(|p| {
+            *p.borrow_mut() = Some(PendingWrite {
+                index_oid,
+                base_generation: generation,
+                base_n,
+                hnsw,
+                tids,
+                marks,
+                rewind_to: None,
+            });
+        });
     }
 }
 
