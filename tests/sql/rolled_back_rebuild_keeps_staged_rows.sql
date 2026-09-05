@@ -205,6 +205,47 @@ BEGIN
     END IF;
 END $$;
 
+-- 6. A rebuild in a savepoint that is RELEASEd onto a subtransaction which
+--    already holds set-aside staging. The release has to drop the inner entry
+--    rather than move it, or the two collide and the stash holds two writes for
+--    one subtransaction -- the state that makes the restore ambiguous and that
+--    (5) shows losing rows. Nothing here rolls back, so the assertions below are
+--    about the end state; the invariant itself is what this shape pins.
+CREATE TABLE rbk3 (id int, embedding real[]);
+ALTER TABLE rbk3 SET (autovacuum_enabled = off);
+INSERT INTO rbk3 SELECT i, ARRAY[i::real, (i + 1)::real] FROM generate_series(1, 120) i;
+CREATE INDEX rbk3_idx ON rbk3 USING brindle (embedding);
+
+BEGIN;
+INSERT INTO rbk3 VALUES (6100, ARRAY[6100.0::real, 6101.0::real]);
+TRUNCATE rbk3;                      -- sets staging aside at the top level
+INSERT INTO rbk3 VALUES (6101, ARRAY[6101.0::real, 6102.0::real]);
+SAVEPOINT p;
+TRUNCATE rbk3;                      -- sets aside again, one level down
+RELEASE SAVEPOINT p;                -- re-parents onto an entry that already exists
+INSERT INTO rbk3 VALUES (6102, ARRAY[6102.0::real, 6103.0::real]);
+COMMIT;
+
+DO $$
+DECLARE heap_rows bigint; reachable bigint; nearest int;
+BEGIN
+    SELECT count(*) INTO heap_rows FROM rbk3;      -- before seqscan is disabled
+    SET LOCAL enable_seqscan = off;
+    SET LOCAL brindle.ef_search = 2000;
+    SELECT count(*) INTO reachable FROM (
+        SELECT id FROM rbk3 ORDER BY embedding <-> ARRAY[6102.0, 6103.0]::real[] LIMIT 2000) s;
+    IF reachable <> heap_rows THEN
+        RAISE EXCEPTION
+            'index reaches % of % live rows after a rebuild released onto one '
+            'that had already set staging aside', reachable, heap_rows;
+    END IF;
+    SELECT id INTO nearest FROM rbk3
+    ORDER BY embedding <-> ARRAY[6102.0, 6103.0]::real[] LIMIT 1;
+    IF nearest IS DISTINCT FROM 6102 THEN
+        RAISE EXCEPTION 'the row inserted after the released rebuild is missing: %', nearest;
+    END IF;
+END $$;
+
 -- Note on what is *not* tested here: staging set aside by a rebuild that stands
 -- is cleared at transaction end, and no case asserts on that clearing. It does
 -- matter -- subtransaction ids restart with every transaction, so an entry left

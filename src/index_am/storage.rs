@@ -646,6 +646,31 @@ pub struct CachedIndex {
 /// that scan ends. Freeing it outright instead is a use-after-free.
 type CacheRef = std::rc::Rc<CachedIndex>;
 
+/// At most one set-aside write per subtransaction — the invariant the stash
+/// rests on, checked wherever it could be broken.
+///
+/// Two rules maintain it: dropping a duplicate at push time, and dropping
+/// rather than moving on a re-parent collision. Neither can be caught by
+/// asserting on behaviour — with the invariant held, restoring the first
+/// matching entry and draining the rest can never differ from restoring the
+/// last, so the suite stays green when any single rule is reverted and only
+/// goes red when two are. Removing them one at a time would therefore pass CI
+/// at each step and silently reopen a data loss.
+///
+/// So this is checked at both points where it can break rather than inferred
+/// from what a query returns, and the SQL suite exercises it because it
+/// installs a debug build. The drain in the abort arm stays as the net: it is
+/// unreachable while the invariant holds, which is the point.
+fn debug_assert_one_per_subxact(stash: &[(pg_sys::SubTransactionId, PendingWrite)]) {
+    debug_assert!(
+        !stash
+            .iter()
+            .enumerate()
+            .any(|(i, (a, _))| stash[..i].iter().any(|(b, _)| a == b)),
+        "brindle: more than one set-aside write for one subtransaction"
+    );
+}
+
 /// Identifies the *physical* relation, so a rebuild that writes a new
 /// relfilenode cannot be mistaken for the index the cached copy came from,
 /// whatever its generation happens to say.
@@ -1160,19 +1185,7 @@ pub unsafe fn forget_pending(index: pg_sys::Relation) {
             return;
         }
         stash.push((subid, write));
-        // The three rules that maintain this — dropping a duplicate here,
-        // dropping rather than moving on a re-parent collision, and draining
-        // every entry for an aborting subid — are deliberately redundant: with
-        // any one of them in place the suite still passes, so none can be
-        // mutation-tested while the others stand. Assert the invariant instead,
-        // which the SQL suite runs against because it installs a debug build.
-        debug_assert!(
-            !stash
-                .iter()
-                .enumerate()
-                .any(|(i, (a, _))| stash[..i].iter().any(|(b, _)| a == b)),
-            "brindle: more than one set-aside write for one subtransaction"
-        );
+        debug_assert_one_per_subxact(&stash);
     });
 }
 
@@ -1302,6 +1315,7 @@ unsafe extern "C" fn subxact_callback(
                         *subid = parent;
                     }
                 }
+                debug_assert_one_per_subxact(&stash);
             });
         }
         _ => {}
