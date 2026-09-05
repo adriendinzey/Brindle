@@ -912,6 +912,9 @@ fn apply_one(hnsw: &mut Hnsw, expected_id: usize, vector: Vec<f32>, attrs: Vec<A
 /// it.
 static mut PRIOR_EXECUTOR_START: pg_sys::ExecutorStart_hook_type = None;
 
+/// Whether [`init_executor_hook`] has already run in this backend.
+static mut EXECUTOR_HOOK_INSTALLED: bool = false;
+
 /// Install the executor hook that flushes staged rows before a parallel plan.
 ///
 /// Valid only from `_PG_init`: the hook variable is process-global and is read
@@ -921,6 +924,16 @@ pub fn init_executor_hook() {
     // SAFETY: `_PG_init` runs once per backend during library load, before any
     // executor invocation, so nothing can be reading the hook chain here.
     unsafe {
+        // Calling this twice would record our own hook as the previous link and
+        // recurse without bound on the next statement. Postgres loads a library
+        // once, so this is misuse rather than a reachable state — but it is a
+        // hang rather than an error, so refuse it outright. A latch rather than
+        // comparing against the installed pointer: function-pointer equality is
+        // not dependable across codegen units.
+        if EXECUTOR_HOOK_INSTALLED {
+            error!("brindle: init_executor_hook called twice; it is valid only from _PG_init");
+        }
+        EXECUTOR_HOOK_INSTALLED = true;
         PRIOR_EXECUTOR_START = pg_sys::ExecutorStart_hook;
         pg_sys::ExecutorStart_hook = Some(executor_start);
     }
@@ -932,7 +945,7 @@ unsafe extern "C" fn executor_start(query_desc: *mut pg_sys::QueryDesc, eflags: 
     // Before delegating, not after: `standard_ExecutorStart` is what builds the
     // plan state, and the flush wants to happen while this is still plainly the
     // leader's own transaction doing an ordinary write.
-    flush_before_parallel_plan(query_desc);
+    flush_before_parallel_plan(query_desc, eflags);
 
     match PRIOR_EXECUTOR_START {
         Some(prior) => prior(query_desc, eflags),
@@ -956,12 +969,14 @@ unsafe extern "C" fn executor_start(query_desc: *mut pg_sys::QueryDesc, eflags: 
 ///
 /// Gated on `parallelModeNeeded` rather than run for every statement, so that a
 /// transaction whose statements are all serial keeps its batching and pays
-/// nothing for this.
+/// nothing for this. `EXPLAIN` without `ANALYZE` is excluded for the same
+/// reason it executes nothing: it is expected to be free of side effects, and
+/// writing the image back is an O(index) WAL-logged rewrite.
 ///
 /// # Safety
 /// `query_desc` must be the live `QueryDesc` Postgres is starting.
-pub unsafe fn flush_before_parallel_plan(query_desc: *mut pg_sys::QueryDesc) {
-    if query_desc.is_null() {
+pub unsafe fn flush_before_parallel_plan(query_desc: *mut pg_sys::QueryDesc, eflags: i32) {
+    if query_desc.is_null() || eflags & pg_sys::EXEC_FLAG_EXPLAIN_ONLY as i32 != 0 {
         return;
     }
     let plan = (*query_desc).plannedstmt;
@@ -1083,8 +1098,9 @@ pub unsafe fn forget_pending(index: pg_sys::Relation) {
 /// Write back whatever this transaction has pending, for any index.
 ///
 /// The transaction end does this on its own; this is for callers that need the
-/// stored image current before then — tests that read it directly, which is why
-/// the flush is exercised rather than only reached at commit.
+/// stored image current before then, without reference to which index that is:
+/// [`flush_before_parallel_plan`], because a worker could read any of them, and
+/// tests that read the stored image directly.
 pub fn flush_pending() {
     let write = PENDING.with(|p| p.borrow_mut().take());
     flush_locked(write);

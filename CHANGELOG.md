@@ -81,7 +81,11 @@ versions may break).
 
   This installs an `ExecutorStart_hook`. It chains to any hook already present,
   so other extensions are unaffected, and it does nothing unless the statement
-  needs parallel mode and this transaction has rows staged.
+  needs parallel mode and this transaction has rows staged. `EXPLAIN` without
+  `ANALYZE` is excluded, so planning a query stays free of side effects. Note
+  that a session running with `debug_parallel_query = on` — which some test
+  suites set globally — makes *every* parallel-safe statement force the
+  write-back, and so gets no batching at all.
 
   While a transaction is staging rows it holds a decoded copy of the index, and
   that copy is **not bounded by `brindle.cache_max_mb`** — it exists even when

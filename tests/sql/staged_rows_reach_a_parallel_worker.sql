@@ -32,19 +32,19 @@ WHERE name IN ('debug_parallel_query', 'force_parallel_mode') \gset
 -- dollar-quoted body.
 BEGIN;
 SET LOCAL enable_seqscan = off;
-INSERT INTO pw VALUES (1201, ARRAY[1201.0::real, 1202.0::real]);
-
--- The parallel query runs FIRST, before any serial scan. That ordering is the
--- whole test. A serial scan writes the staged rows back, so one placed ahead of
--- this would satisfy the parallel assertion as a side effect and the case could
--- never fail on its own claim -- which is exactly how an earlier version of this
--- file passed against code where the parallel path was broken.
 SELECT set_config(:'force_parallel_guc', 'on', true) \gset force_
 
--- The query also has to be written so the scan actually reaches a worker, and
--- that is easy to lose by accident: wrapping it in a scalar subquery makes it an
--- InitPlan, which the *leader* evaluates before dispatching, so no worker ever
--- opens the index. Guard the plan rather than trusting the shape to stay put.
+-- The plan guard runs BEFORE the insert, so that nothing at all sits between
+-- staging the row and the query that asserts on it.
+--
+-- Two separate traps meet here. The query has to be shaped so the scan really
+-- reaches a worker -- wrapping it in a scalar subquery makes it an InitPlan,
+-- which the *leader* evaluates before dispatching, so no worker ever opens the
+-- index. And the guard itself runs EXPLAIN, which goes through the same
+-- ExecutorStart hook as the real query; while EXPLAIN without ANALYZE is
+-- excluded from the flush, running it after the insert would still leave the
+-- assertion resting on that exclusion holding rather than on the mechanism
+-- under test. Ordering it first makes both moot.
 DO $$
 DECLARE line text; plan text := '';
 BEGIN
@@ -67,6 +67,11 @@ BEGIN
     END IF;
 END $$;
 
+INSERT INTO pw VALUES (1201, ARRAY[1201.0::real, 1202.0::real]);
+
+-- Nothing between the insert above and this query. A serial scan, or any other
+-- statement that triggers the write-back, would satisfy this as a side effect
+-- and the case could never fail on its own claim.
 SELECT id AS parallel_nearest FROM pw
 ORDER BY embedding <-> ARRAY[1201.0, 1202.0]::real[] LIMIT 1 \gset
 SELECT set_config(:'force_parallel_guc', 'off', true) \gset force_
