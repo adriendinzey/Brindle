@@ -827,12 +827,22 @@ struct PendingWrite {
     /// everything from here up is what this transaction staged — which is what
     /// a replay needs, read back out of the graph rather than kept beside it.
     base_n: usize,
-    /// One entry per open subtransaction: how many rows were staged when it
+    /// How many rows this transaction had staged when each open subtransaction
     /// began. A `ROLLBACK TO` has to leave the rows staged before its savepoint
     /// and drop the rest, and this is what says where the line is.
+    ///
+    /// Counts of *staged* rows, not indices into `tids`. [`settle_pending`]
+    /// reloads the stored image, and another backend may have committed since
+    /// staging began, so `base_n` is not stable across a transaction — an
+    /// absolute index recorded against one base silently means something else
+    /// against the next. A count does not move.
+    ///
+    /// Shorter than the subtransaction depth whenever one opened with nothing
+    /// staged: no `PendingWrite` existed to record it. The `unwrap_or` in the
+    /// abort arm is what covers that.
     marks: Vec<usize>,
-    /// Set by a subtransaction abort: staged rows at or above this index are
-    /// rolled back and must not reach the index.
+    /// Set by a subtransaction abort: staged rows past this many are rolled back
+    /// and must not reach the index. Also a count, for the reason above.
     ///
     /// Recorded rather than acted on, because the abort callback is not a place
     /// where anything may fail. [`settle_pending`] carries it out later, at a
@@ -1197,7 +1207,7 @@ unsafe extern "C" fn subxact_callback(
                 // and the settle, `tids` still holds rows that are already
                 // rolled back, and `ROLLBACK TO` opens a fresh subtransaction
                 // of the same name immediately after aborting the old one.
-                let staged = write.tids.len();
+                let staged = write.tids.len() - write.base_n;
                 write
                     .marks
                     .push(write.rewind_to.unwrap_or(staged).min(staged));
@@ -1209,7 +1219,7 @@ unsafe extern "C" fn subxact_callback(
             pg_sys::SubXactEvent::SUBXACT_EVENT_ABORT_SUB => {
                 // No mark means staging began inside the subtransaction being
                 // rolled back, so none of it survives.
-                let mark = write.marks.pop().unwrap_or(write.base_n);
+                let mark = write.marks.pop().unwrap_or(0);
                 write.rewind_to = Some(write.rewind_to.unwrap_or(mark).min(mark));
             }
             _ => {}
@@ -1239,11 +1249,11 @@ fn settle_pending() {
     let Some(write) = write else { return };
     // Nothing staged survives: dropping the whole thing is the rollback, and no
     // reload is needed to do it.
-    if mark <= write.base_n {
+    if mark == 0 {
         return;
     }
 
-    let survivors: Vec<(Vec<f32>, Vec<AttrValue>, TidPair)> = (write.base_n..mark)
+    let survivors: Vec<(Vec<f32>, Vec<AttrValue>, TidPair)> = (write.base_n..write.base_n + mark)
         .map(|id| {
             (
                 write.hnsw.vector(id).to_vec(),

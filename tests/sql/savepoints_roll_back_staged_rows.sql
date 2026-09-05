@@ -103,23 +103,102 @@ ALTER TABLE sp2 SET (autovacuum_enabled = off);
 INSERT INTO sp2 SELECT i, ARRAY[i::real, (i + 1)::real] FROM generate_series(1, 400) i;
 CREATE INDEX sp2_idx ON sp2 USING brindle (embedding);
 
+SELECT blob_len('sp2_idx') AS sp2_before \gset
+
+BEGIN;
+-- The savepoint opens before anything is staged, so there is no mark to fall
+-- back on and the rollback has to discard all of it.
+SAVEPOINT outer_sp;
+INSERT INTO sp2 SELECT i, ARRAY[i::real, (i + 1)::real] FROM generate_series(8100, 8149) i;
+ROLLBACK TO outer_sp;
+COMMIT;
+
+-- Read *after* the commit. Staged rows are not written until the transaction
+-- ends, so a reading taken inside it cannot observe what this is asserting --
+-- which is how an earlier version of this block passed against code that let
+-- the rolled-back rows through.
+SELECT blob_len('sp2_idx') AS sp2_after \gset
+SELECT set_config('brindle_test.sp2_before', :'sp2_before', false) \gset carry_
+SELECT set_config('brindle_test.sp2_after', :'sp2_after', false) \gset carry_
+
 DO $$
-DECLARE before_len bigint; after_len bigint;
+DECLARE
+    before_len bigint := current_setting('brindle_test.sp2_before')::bigint;
+    after_len  bigint := current_setting('brindle_test.sp2_after')::bigint;
 BEGIN
-    before_len := blob_len('sp2_idx');
-    BEGIN
-        -- The savepoint opens before anything is staged, so there is no mark.
-        INSERT INTO sp2 SELECT i, ARRAY[i::real, (i + 1)::real]
-        FROM generate_series(8100, 8149) i;
-        RAISE EXCEPTION 'roll back';
-    EXCEPTION WHEN OTHERS THEN
-        NULL;
-    END;
-    after_len := blob_len('sp2_idx');
     IF after_len <> before_len THEN
         RAISE EXCEPTION
             'stored graph grew from % to % bytes across a subtransaction that '
             'staged rows and rolled back: they survived their own rollback',
             before_len, after_len;
+    END IF;
+END $$;
+
+-- A concurrent commit between staging and the rollback must not cost the
+-- transaction its own earlier rows.
+--
+-- The marks that say where each savepoint began are counts of staged rows, not
+-- positions in the stored graph, precisely because of this: rolling back
+-- reloads the image, another backend may have grown it in the meantime, and a
+-- position recorded against the old image means something else against the new
+-- one. Recorded as positions, every mark lands below the reloaded base and the
+-- next ROLLBACK TO discards rows that were committed -- live in the heap, absent
+-- from the index, with nothing to repair them.
+CREATE EXTENSION IF NOT EXISTS dblink;
+CREATE TABLE cw (id int, embedding real[]);
+ALTER TABLE cw SET (autovacuum_enabled = off);
+INSERT INTO cw SELECT i, ARRAY[i::real, (i + 1)::real] FROM generate_series(1, 400) i;
+CREATE INDEX cw_idx ON cw USING brindle (embedding);
+
+SELECT set_config('brindle_test.conn',
+                  'host=' || current_setting('unix_socket_directories')
+                  || ' port=' || current_setting('port')
+                  || ' dbname=' || current_database(), false) \gset carry_
+
+BEGIN;
+INSERT INTO cw VALUES (1001, ARRAY[1001.0::real, 1002.0::real]);  -- before a: must survive
+SAVEPOINT a;
+INSERT INTO cw VALUES (1002, ARRAY[1002.0::real, 1003.0::real]);  -- before b: must survive
+SAVEPOINT b;
+INSERT INTO cw VALUES (1003, ARRAY[1003.0::real, 1004.0::real]);  -- after b: rolled back
+ROLLBACK TO b;
+-- Another backend grows the stored image while this transaction holds staged
+-- rows and an outstanding rewind.
+SELECT dblink_exec(current_setting('brindle_test.conn'),
+                   'INSERT INTO cw SELECT i, ARRAY[i::real, (i + 1)::real]
+                    FROM generate_series(2001, 2100) i');
+INSERT INTO cw VALUES (1004, ARRAY[1004.0::real, 1005.0::real]);  -- forces the rewind to be carried out
+ROLLBACK TO b;
+COMMIT;
+
+DO $$
+DECLARE missing int[];
+BEGIN
+    SET LOCAL enable_seqscan = off;
+    SELECT array_agg(want) INTO missing FROM unnest(ARRAY[1001, 1002]) want
+    WHERE want IS DISTINCT FROM (
+        SELECT id FROM cw
+        ORDER BY embedding <-> ARRAY[want::real, (want + 1)::real] LIMIT 1);
+    IF missing IS NOT NULL THEN
+        RAISE EXCEPTION
+            'rows committed before the rolled-back savepoint are missing from '
+            'the index: % -- they are live in the heap and nothing will repair '
+            'them', missing;
+    END IF;
+END $$;
+
+-- And the other backend's rows, and the rolled-back ones, are as they should be.
+DO $$
+DECLARE nearest int; leaked int;
+BEGIN
+    SET LOCAL enable_seqscan = off;
+    SELECT id INTO nearest FROM cw
+    ORDER BY embedding <-> ARRAY[2050.0, 2051.0]::real[] LIMIT 1;
+    IF nearest IS DISTINCT FROM 2050 THEN
+        RAISE EXCEPTION 'the concurrent backend''s rows are not in the index: got %', nearest;
+    END IF;
+    SELECT count(*) INTO leaked FROM cw WHERE id IN (1003, 1004);
+    IF leaked <> 0 THEN
+        RAISE EXCEPTION 'rolled-back rows % are live in the heap', leaked;
     END IF;
 END $$;
