@@ -704,8 +704,15 @@ fn note_stash_invariant(_stash: &[(pg_sys::SubTransactionId, PendingWrite)]) {}
 /// could not raise. Only from paths where an error is an ordinary error.
 #[cfg(debug_assertions)]
 fn debug_assert_stash_invariant(stash: &[(pg_sys::SubTransactionId, PendingWrite)]) {
+    // Read *and clear*: the flag reports the transaction that broke the
+    // invariant, not every transaction after it. Left set, one violation would
+    // fail every later commit in the backend and blame statements that did
+    // nothing — which is the opposite of what recording rather than raising is
+    // for. Clearing before the assertion is deliberate; the panic below unwinds
+    // past anything that would otherwise reset it.
+    let noted = STASH_INVARIANT_BROKEN.with(|broken| broken.replace(false));
     debug_assert!(
-        !has_duplicate_subxact(stash) && !STASH_INVARIANT_BROKEN.with(|b| b.get()),
+        !has_duplicate_subxact(stash) && !noted,
         "brindle: more than one set-aside write for one subtransaction"
     );
 }
@@ -1304,6 +1311,10 @@ unsafe extern "C" fn xact_callback(event: pg_sys::XactEvent::Type, _arg: *mut co
             // Nothing was written, so dropping the mutations is the rollback.
             PENDING.with(|p| *p.borrow_mut() = None);
             DISCARDED.with(|d| d.borrow_mut().clear());
+            // Including anything recorded but not yet reported: an aborting
+            // transaction must not hand its violation to the next one.
+            #[cfg(debug_assertions)]
+            STASH_INVARIANT_BROKEN.with(|broken| broken.set(false));
         }
         _ => {}
     }
