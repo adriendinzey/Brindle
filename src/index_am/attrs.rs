@@ -80,6 +80,22 @@ pub unsafe fn value_from_datum(
     Some(value)
 }
 
+/// Whether two supported types compare within one [`AttrValue`] variant.
+///
+/// The operator families keep integers with integers and floats with floats, so
+/// this only ever refuses a pairing someone added later without teaching
+/// [`value_from_datum`] about it.
+fn same_family(a: pg_sys::Oid, b: pg_sys::Oid) -> bool {
+    let integral = |t: pg_sys::Oid| {
+        matches!(
+            t,
+            pg_sys::BOOLOID | pg_sys::INT2OID | pg_sys::INT4OID | pg_sys::INT8OID
+        )
+    };
+    let floating = |t: pg_sys::Oid| matches!(t, pg_sys::FLOAT4OID | pg_sys::FLOAT8OID);
+    (integral(a) && integral(b)) || (floating(a) && floating(b))
+}
+
 /// Read the attribute row for one heap tuple, in key-column order.
 ///
 /// `values`/`isnull` are the arrays Postgres passes to a build callback or
@@ -146,13 +162,26 @@ unsafe fn atom_from_key(index: pg_sys::Relation, key: &pg_sys::ScanKeyData) -> O
     if col >= count(index) {
         return None;
     }
-    // The comparison value's own type, which is the column's type unless the
-    // operator is cross-type — in which case reading it as the column's type
-    // would reinterpret the datum, so refuse it.
-    if key.sk_subtype != pg_sys::InvalidOid && key.sk_subtype != column_type(index, col) {
+    // Read the argument as *its own* type, not the column's. A cross-type
+    // operator — `bigint_col = 7`, where the literal is `int4` — carries the
+    // right-hand type in `sk_subtype`, and reading that datum as the column's
+    // type would reinterpret four bytes as eight. `value_from_datum` refusing an
+    // unknown type is what keeps this safe if the families ever gain a member
+    // this code does not know.
+    let arg_type = if key.sk_subtype == pg_sys::InvalidOid {
+        column_type(index, col)
+    } else {
+        key.sk_subtype
+    };
+    let value = value_from_datum(arg_type, key.sk_argument, false)?;
+    // Both sides must land in the same `AttrValue` variant, or the comparison is
+    // not one the core can make: an `Int` never orders against a `Float`, so
+    // such an atom would silently match nothing rather than fail. The operator
+    // families pair integers with integers and floats with floats, so this
+    // guards against a member added later rather than a case reachable today.
+    if !same_family(column_type(index, col), arg_type) {
         return None;
     }
-    let value = value_from_datum(column_type(index, col), key.sk_argument, false)?;
 
     let atom = match key.sk_strategy {
         STRATEGY_EQ => Atom::Eq { col, value },
@@ -217,18 +246,64 @@ pub unsafe fn predicate_from_keys(
 // atom — matching SQL, where a comparison involving NaN is not true.
 extension_sql!(
     r#"
+CREATE OPERATOR FAMILY brindle_integer_ops USING brindle;
+CREATE OPERATOR FAMILY brindle_float_ops USING brindle;
+
+CREATE OPERATOR CLASS brindle_int2_ops DEFAULT FOR TYPE int2
+    USING brindle FAMILY brindle_integer_ops AS OPERATOR 1 <, OPERATOR 2 <=, OPERATOR 3 =, OPERATOR 4 >=, OPERATOR 5 >;
+CREATE OPERATOR CLASS brindle_int4_ops DEFAULT FOR TYPE int4
+    USING brindle FAMILY brindle_integer_ops AS OPERATOR 1 <, OPERATOR 2 <=, OPERATOR 3 =, OPERATOR 4 >=, OPERATOR 5 >;
+CREATE OPERATOR CLASS brindle_int8_ops DEFAULT FOR TYPE int8
+    USING brindle FAMILY brindle_integer_ops AS OPERATOR 1 <, OPERATOR 2 <=, OPERATOR 3 =, OPERATOR 4 >=, OPERATOR 5 >;
+CREATE OPERATOR CLASS brindle_float4_ops DEFAULT FOR TYPE float4
+    USING brindle FAMILY brindle_float_ops AS OPERATOR 1 <, OPERATOR 2 <=, OPERATOR 3 =, OPERATOR 4 >=, OPERATOR 5 >;
+CREATE OPERATOR CLASS brindle_float8_ops DEFAULT FOR TYPE float8
+    USING brindle FAMILY brindle_float_ops AS OPERATOR 1 <, OPERATOR 2 <=, OPERATOR 3 =, OPERATOR 4 >=, OPERATOR 5 >;
 CREATE OPERATOR CLASS brindle_bool_ops DEFAULT FOR TYPE bool USING brindle AS
     OPERATOR 1 <, OPERATOR 2 <=, OPERATOR 3 =, OPERATOR 4 >=, OPERATOR 5 >;
-CREATE OPERATOR CLASS brindle_int2_ops DEFAULT FOR TYPE int2 USING brindle AS
-    OPERATOR 1 <, OPERATOR 2 <=, OPERATOR 3 =, OPERATOR 4 >=, OPERATOR 5 >;
-CREATE OPERATOR CLASS brindle_int4_ops DEFAULT FOR TYPE int4 USING brindle AS
-    OPERATOR 1 <, OPERATOR 2 <=, OPERATOR 3 =, OPERATOR 4 >=, OPERATOR 5 >;
-CREATE OPERATOR CLASS brindle_int8_ops DEFAULT FOR TYPE int8 USING brindle AS
-    OPERATOR 1 <, OPERATOR 2 <=, OPERATOR 3 =, OPERATOR 4 >=, OPERATOR 5 >;
-CREATE OPERATOR CLASS brindle_float4_ops DEFAULT FOR TYPE float4 USING brindle AS
-    OPERATOR 1 <, OPERATOR 2 <=, OPERATOR 3 =, OPERATOR 4 >=, OPERATOR 5 >;
-CREATE OPERATOR CLASS brindle_float8_ops DEFAULT FOR TYPE float8 USING brindle AS
-    OPERATOR 1 <, OPERATOR 2 <=, OPERATOR 3 =, OPERATOR 4 >=, OPERATOR 5 >;
+
+ALTER OPERATOR FAMILY brindle_integer_ops USING brindle ADD
+    OPERATOR 1 < (int2, int4),
+    OPERATOR 2 <= (int2, int4),
+    OPERATOR 3 = (int2, int4),
+    OPERATOR 4 >= (int2, int4),
+    OPERATOR 5 > (int2, int4),
+    OPERATOR 1 < (int2, int8),
+    OPERATOR 2 <= (int2, int8),
+    OPERATOR 3 = (int2, int8),
+    OPERATOR 4 >= (int2, int8),
+    OPERATOR 5 > (int2, int8),
+    OPERATOR 1 < (int4, int2),
+    OPERATOR 2 <= (int4, int2),
+    OPERATOR 3 = (int4, int2),
+    OPERATOR 4 >= (int4, int2),
+    OPERATOR 5 > (int4, int2),
+    OPERATOR 1 < (int4, int8),
+    OPERATOR 2 <= (int4, int8),
+    OPERATOR 3 = (int4, int8),
+    OPERATOR 4 >= (int4, int8),
+    OPERATOR 5 > (int4, int8),
+    OPERATOR 1 < (int8, int2),
+    OPERATOR 2 <= (int8, int2),
+    OPERATOR 3 = (int8, int2),
+    OPERATOR 4 >= (int8, int2),
+    OPERATOR 5 > (int8, int2),
+    OPERATOR 1 < (int8, int4),
+    OPERATOR 2 <= (int8, int4),
+    OPERATOR 3 = (int8, int4),
+    OPERATOR 4 >= (int8, int4),
+    OPERATOR 5 > (int8, int4);
+ALTER OPERATOR FAMILY brindle_float_ops USING brindle ADD
+    OPERATOR 1 < (float4, float8),
+    OPERATOR 2 <= (float4, float8),
+    OPERATOR 3 = (float4, float8),
+    OPERATOR 4 >= (float4, float8),
+    OPERATOR 5 > (float4, float8),
+    OPERATOR 1 < (float8, float4),
+    OPERATOR 2 <= (float8, float4),
+    OPERATOR 3 = (float8, float4),
+    OPERATOR 4 >= (float8, float4),
+    OPERATOR 5 > (float8, float4);
 "#,
     name = "brindle_attribute_opclasses",
     requires = [brindle_amhandler],

@@ -81,6 +81,13 @@ struct ScanSearch {
     /// The search's results as heap addresses, nearest first.
     results: Vec<TidPair>,
     cursor: usize,
+    /// Whether the executor must re-test this scan's rows against the original
+    /// quals, because a scan key was refused rather than pushed.
+    ///
+    /// Held here rather than written once in `amrescan`: `amgettuple` sets
+    /// `xs_recheck` before returning each tuple, which is the contract, and it
+    /// has to say what this scan actually decided rather than a constant.
+    recheck: bool,
 }
 
 impl ScanSearch {
@@ -89,6 +96,7 @@ impl ScanSearch {
             query: Vec::new(),
             results: Vec::new(),
             cursor: 0,
+            recheck: false,
         }
     }
 
@@ -146,6 +154,11 @@ impl ScanSearch {
     /// a plain `WHERE attr = v` against this index with no distance clause at
     /// all. Erroring on that would make a legitimate plan fail; it is priced,
     /// not refused.
+    ///
+    /// It materialises every match at once, outside `work_mem` accounting, so a
+    /// selective-looking predicate over a large index can still build a large
+    /// vector. The cost estimate keeps the planner away unless nothing else can
+    /// serve, which in practice means someone has turned sequential scans off.
     ///
     /// # Safety
     /// `index` must be the open index relation this scan was opened against.
@@ -317,6 +330,7 @@ pub(super) unsafe extern "C" fn amrescan(
         (*scan).numberOfKeys as usize,
     );
     (*scan).xs_recheck = pushed.recheck;
+    search.recheck = pushed.recheck;
 
     // No distance clause: answer the predicate alone rather than refusing. With
     // the attributes as search keys the planner can reach this index without an
@@ -358,12 +372,19 @@ pub(super) unsafe extern "C" fn amgettuple(
     // `scan.kill_prior_tuple` asks the AM to mark the previously returned
     // entry dead. Recording that needs the same machinery as vacuum
     // integration; ignoring the hint is always legal, just less efficient.
-    match scan_search(scan).next() {
+    let search = scan_search(scan);
+    let recheck = search.recheck;
+    match search.next() {
         Ok(Some((block, offset))) => {
             item_pointer_set_all(&mut (*scan).xs_heaptid, block, offset);
-            // The graph ranks whole rows against the query, so neither the row
-            // nor its position needs re-checking above the AM.
-            (*scan).xs_recheck = false;
+            // Only the rows this scan could not filter for itself need
+            // re-testing. Writing `false` here unconditionally — which is what
+            // this did while nothing ever set it — silently discards the
+            // recheck `amrescan` asked for, and the executor then trusts a
+            // result the index never enforced.
+            (*scan).xs_recheck = recheck;
+            // The graph ranks whole rows against the query, so the *ordering*
+            // never needs re-checking above the AM.
             (*scan).xs_recheckorderby = false;
             true
         }

@@ -31,7 +31,11 @@ versions may break).
   candidates before the filter is applied.
 
   Equality and range comparisons (`=`, `<`, `<=`, `>`, `>=`) are pushed for
-  `bool`, `int2`, `int4`, `int8`, `float4` and `float8` columns. A `NULL`
+  `bool`, `int2`, `int4`, `int8`, `float4` and `float8` columns. Comparisons
+  work across widths within a family — `bigint_col = 42` pushes without the
+  literal needing a cast — because the integer types share one operator family
+  and the float types another. Integers and floats do not mix, since the stored
+  value and the bound have to compare as one type. A `NULL`
   attribute satisfies no comparison, as in SQL. Anything the index cannot
   express — a `<>`, an expression, an unsupported type — is left to the
   executor, never dropped, and the index sets the recheck flag for any qual it

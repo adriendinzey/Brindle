@@ -112,8 +112,57 @@ BEGIN
     END IF;
 END $$;
 
--- A qual this access method does not claim stays the executor's job. It must
--- still be applied -- never silently dropped.
+-- A qual that *reaches* this access method and is refused by it must still be
+-- applied, by the executor, on the rows the scan hands back.
+--
+-- `bucket <> 7` will not do for this, though it looks like it should: `<>` is in
+-- no brindle operator family, so the planner never makes it a scan key and the
+-- access method never sees it. An earlier version of this block used exactly
+-- that and therefore tested Postgres's own executor filter -- it passed with the
+-- recheck plumbing removed entirely, which is how a real defect shipped.
+--
+-- What does reach the access method and get refused is a scan key whose value
+-- turns out to be NULL at run time. `ExecIndexEvalRuntimeKeys` marks it
+-- SK_ISNULL, `atom_from_key` declines it (a comparison against NULL is never
+-- true, so it cannot be expressed as an atom), and the scan must then set the
+-- recheck flag -- or every row it returns is one the query excluded.
+DO $$
+DECLARE returned bigint;
+BEGIN
+    SET LOCAL enable_seqscan = off;
+    SET LOCAL brindle.ef_search = 200;
+    SELECT count(*) INTO returned FROM (
+        SELECT id FROM sel WHERE bucket = (SELECT NULL::int)
+        ORDER BY embedding <-> ARRAY[500.0, 10.0, 20.0]::real[] LIMIT 5) s;
+    IF returned <> 0 THEN
+        RAISE EXCEPTION
+            'a scan key the index refused was dropped instead of rechecked: '
+            '% rows came back for `bucket = NULL`, which is never true', returned;
+    END IF;
+END $$;
+
+-- And the same shape as a nest-loop parameter, which is how it turns up in real
+-- queries: an optional filter whose driving value is NULL for some outer rows.
+DO $$
+DECLARE leaked bigint;
+BEGIN
+    SET LOCAL enable_seqscan = off;
+    SET LOCAL brindle.ef_search = 200;
+    CREATE TEMP TABLE probe(v int);
+    INSERT INTO probe VALUES (7), (NULL);
+    SELECT count(*) INTO leaked FROM probe p
+    LEFT JOIN LATERAL (
+        SELECT id FROM sel WHERE bucket = p.v
+        ORDER BY embedding <-> ARRAY[500.0, 10.0, 20.0]::real[] LIMIT 3) s ON true
+    WHERE p.v IS NULL AND s.id IS NOT NULL;
+    IF leaked <> 0 THEN
+        RAISE EXCEPTION
+            'a NULL nest-loop parameter returned % rows; the refused scan key '
+            'was not rechecked', leaked;
+    END IF;
+END $$;
+
+-- A qual the planner never offers the index at all stays the executor's job.
 DO $$
 DECLARE violations bigint;
 BEGIN

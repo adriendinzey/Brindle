@@ -293,8 +293,8 @@ unsafe extern "C" fn aminsert(
     _index_unchanged: bool,
     _index_info: *mut pg_sys::IndexInfo,
 ) -> bool {
-    // SAFETY: single-column AM (amcanmulticol=false), so values[0]/isnull[0] is
-    // the only entry Postgres filled in.
+    // SAFETY: values[0]/isnull[0] is the vector — key column 1 — and any further
+    // key columns are filterable attributes, read below.
     if *isnull {
         return false; // NULL vectors are not indexed; a distance scan can't rank them
     }

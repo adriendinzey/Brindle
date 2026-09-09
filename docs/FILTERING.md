@@ -129,14 +129,27 @@ Filterable columns must have a brindle operator class, which ships for `bool`,
 `CREATE INDEX` with Postgres's own "no default operator class" error rather than
 being silently unfilterable.
 
-Supported predicate shapes in Tier 1:
-- **equality / label**: `tenant_id = 42`, `status = 'active'` → compact label
-  dictionary + per-node label bits, matched with a bitwise test.
-- **numeric range**: `price < 50`, `created_at BETWEEN ...` → store the scalar,
-  compare during traversal.
+Supported predicate shapes in Tier 1, as shipped:
+- **equality**: `tenant_id = 42` — on any of the numeric types above.
+- **range**: `price < 50`, `score BETWEEN 1 AND 9` — `<`, `<=`, `>=`, `>`.
 - **conjunctions** of the above (`AND`).
 
+Comparisons work across widths within a family, so `bigint_col = 42` pushes
+without the literal needing a cast; integers and floats do not mix, because the
+stored value and the bound have to compare as one type.
+
 These are evaluated with zero heap access during traversal — the whole point.
+
+Not yet shipped, and refused at `CREATE INDEX` rather than silently ignored:
+**string labels** (`status = 'active'`, which wants the dictionary encoding this
+document describes for `AttrValue::Int`) and **dates and timestamps** (which
+would map onto the integer path). `OR` and `NOT` are Tier 1 gaps too: the
+predicate model has an `And` conjunction only, and anything else stays with the
+executor.
+
+Anything the index cannot express is left to the executor rather than dropped,
+and the scan reports a recheck for it — so a refused qual costs recall, never
+correctness.
 
 ### Tier 2 — bitmap handoff
 
