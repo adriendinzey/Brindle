@@ -208,6 +208,11 @@ DECLARE
         'i2 = 42::int8', 'i2 < 42::int4', 'i2 <= 42::int4',
         'i8 = 42::int4', 'i8 > 400::int2', 'i8 >= 400::int2',
         'f4 = 1.5::float8', 'f4 > 50::float8', 'f4 <= 50::float8',
+        -- The `f8` pair carries the cross-type *read* rather than the boundary:
+        -- `f8` holds integral values here, so nothing sits on 0.1 and the two
+        -- return the same count. Inclusivity is pinned by the pairs above, whose
+        -- bounds do occur in the fixture -- so do not drop those on the grounds
+        -- that this strategy is already covered.
         'f8 = 1.5::float4', 'f8 > 0.1::float4', 'f8 >= 0.1::float4'
     ];
     shape text; plan text; line text; via_index bigint; via_heap bigint;
@@ -241,7 +246,8 @@ BEGIN
         IF via_index <> via_heap THEN
             RAISE EXCEPTION
                 'the qual `%` returns % rows through the index against % from a '
-                'heap scan -- the argument is being read as the wrong type',
+                'heap scan -- either the argument is being read as the wrong '
+                'type, or a strategy maps to the wrong bound',
                 shape, via_index, via_heap;
         END IF;
     END LOOP;

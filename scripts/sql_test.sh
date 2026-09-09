@@ -47,15 +47,22 @@
 # confirm FAIL, `git checkout --` the file. If the case still passes, it is not
 # testing what its name says.
 #
-# One thing these cases are NOT isolated from: a long-running transaction in
-# another session on the same cluster. A database per case separates committed
-# state, but the xmin horizon is cluster-wide, so a sibling worktree — or a stray
-# psql — holding a transaction open makes `CREATE INDEX` and `REINDEX` index
-# recently-dead tuples, and cases that count rows then fail for reasons that have
-# nothing to do with the code. Two cases failed exactly this way during a review
-# here, from a `CREATE INDEX ... WITH (gamma = 64)` left running in another
-# database. If cases fail in ways the diff cannot explain, check
-# `pg_stat_activity` for a transaction older than the run.
+# One thing these cases are NOT isolated from: another session on the same
+# cluster running a transaction that has *written*. A database per case separates
+# committed state, but the oldest running XID is cluster-wide and clamps every
+# database's removable-tuple horizon, so `CREATE INDEX` and `REINDEX` then index
+# recently-dead tuples and cases that count rows fail for reasons the diff cannot
+# explain. Two failed exactly this way during a review here, from a
+# `CREATE INDEX ... WITH (gamma = 64)` left running in another database.
+#
+# A transaction that has only *read* is harmless however long it runs — an
+# assigned XID is what matters, which means any INSERT/DELETE/CREATE INDEX.
+# Measured: the same case passes against an idle cluster and against a
+# long-running REPEATABLE READ reader, and fails against a writer.
+#
+# So the column to look at is `backend_xid IS NOT NULL`, not `backend_xmin` —
+# `backend_xmin` is set for harmless readers too, and will send you after the
+# wrong session.
 
 set -euo pipefail
 
