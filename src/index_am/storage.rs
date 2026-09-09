@@ -647,29 +647,70 @@ pub struct CachedIndex {
 type CacheRef = std::rc::Rc<CachedIndex>;
 
 /// At most one set-aside write per subtransaction — the invariant the stash
-/// rests on, checked wherever it could be broken.
+/// rests on.
 ///
 /// Two rules maintain it: dropping a duplicate at push time, and dropping
-/// rather than moving on a re-parent collision. Neither can be caught by
-/// asserting on behaviour — with the invariant held, restoring the first
+/// rather than moving on a re-parent collision. Neither could be caught by
+/// asserting on behaviour alone — with the invariant held, restoring the first
 /// matching entry and draining the rest can never differ from restoring the
-/// last, so the suite stays green when any single rule is reverted and only
-/// goes red when two are. Removing them one at a time would therefore pass CI
-/// at each step and silently reopen a data loss.
+/// last, so the suite *would* stay green when any single rule is reverted and
+/// go red only when two are. Removing them one at a time would therefore pass
+/// CI at each step and silently reopen a data loss.
 ///
-/// So this is checked at both points where it can break rather than inferred
-/// from what a query returns, and the SQL suite exercises it because it
-/// installs a debug build. The drain in the abort arm stays as the net: it is
-/// unreachable while the invariant holds, which is the point.
-fn debug_assert_one_per_subxact(stash: &[(pg_sys::SubTransactionId, PendingWrite)]) {
+/// So the invariant is checked directly, and the SQL suite exercises it because
+/// it installs a debug build — which is the whole of case 6's protection in
+/// `rolled_back_rebuild_keeps_staged_rows.sql`, since that case's end state is
+/// identical either way. Running that suite `--release` would silently retire
+/// it.
+///
+/// The drain in the abort arm stays as the net: unreachable while the invariant
+/// holds, which is the point, and reverting it alone is provably
+/// behaviour-identical rather than an untested gap.
+///
+/// Three call sites, of which two can actually break the invariant: the push,
+/// and the re-parent's moving branch. Its dropping branch only removes entries
+/// and is checked for symmetry.
+///
+/// # Where this may and may not raise
+///
+/// [`note_stash_invariant`] records a violation and never raises; it is what the
+/// subtransaction callback calls, because an error raised while Postgres is
+/// starting or ending a subtransaction escalates rather than aborting the
+/// statement — a `plpgsql` `EXCEPTION` block turns it into a lost session and,
+/// from `CommitSubTransaction`, a clog state that fails recovery. That is the
+/// same hazard [`subxact_callback`] is built to avoid, and a tripwire is not
+/// worth reintroducing it. [`debug_assert_stash_invariant`] does the raising,
+/// from ordinary paths only.
+fn has_duplicate_subxact(stash: &[(pg_sys::SubTransactionId, PendingWrite)]) -> bool {
+    stash
+        .iter()
+        .enumerate()
+        .any(|(i, (a, _))| stash[..i].iter().any(|(b, _)| a == b))
+}
+
+/// Record a violation without raising. Safe from a subtransaction callback.
+#[cfg(debug_assertions)]
+fn note_stash_invariant(stash: &[(pg_sys::SubTransactionId, PendingWrite)]) {
+    if has_duplicate_subxact(stash) {
+        STASH_INVARIANT_BROKEN.with(|broken| broken.set(true));
+    }
+}
+
+#[cfg(not(debug_assertions))]
+fn note_stash_invariant(_stash: &[(pg_sys::SubTransactionId, PendingWrite)]) {}
+
+/// Raise if the invariant is broken now, or was found broken somewhere that
+/// could not raise. Only from paths where an error is an ordinary error.
+#[cfg(debug_assertions)]
+fn debug_assert_stash_invariant(stash: &[(pg_sys::SubTransactionId, PendingWrite)]) {
     debug_assert!(
-        !stash
-            .iter()
-            .enumerate()
-            .any(|(i, (a, _))| stash[..i].iter().any(|(b, _)| a == b)),
+        !has_duplicate_subxact(stash) && !STASH_INVARIANT_BROKEN.with(|b| b.get()),
         "brindle: more than one set-aside write for one subtransaction"
     );
 }
+
+#[cfg(not(debug_assertions))]
+fn debug_assert_stash_invariant(_stash: &[(pg_sys::SubTransactionId, PendingWrite)]) {}
 
 /// Identifies the *physical* relation, so a rebuild that writes a new
 /// relfilenode cannot be mistaken for the index the cached copy came from,
@@ -895,6 +936,10 @@ thread_local! {
     /// until the subtransaction's fate is known rather than dropped outright.
     static DISCARDED: std::cell::RefCell<Vec<(pg_sys::SubTransactionId, PendingWrite)>> =
         const { std::cell::RefCell::new(Vec::new()) };
+    /// Set when the one-entry-per-subtransaction invariant is found broken
+    /// somewhere that must not raise. Reported from an ordinary path instead.
+    #[cfg(debug_assertions)]
+    static STASH_INVARIANT_BROKEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// Registered once per backend; the callbacks themselves are cheap and
     /// return immediately when there is nothing pending.
     static CALLBACKS_REGISTERED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -1185,7 +1230,9 @@ pub unsafe fn forget_pending(index: pg_sys::Relation) {
             return;
         }
         stash.push((subid, write));
-        debug_assert_one_per_subxact(&stash);
+        // `ambuild` is an ordinary statement context, so this one may raise —
+        // and it also reports anything a callback recorded earlier.
+        debug_assert_stash_invariant(&stash);
     });
 }
 
@@ -1225,6 +1272,7 @@ unsafe extern "C" fn xact_callback(event: pg_sys::XactEvent::Type, _arg: *mut co
             // for a commit that cannot be completed — unlike the subtransaction
             // callback, which is why the rewind is carried out from here.
             settle_pending();
+            DISCARDED.with(|d| debug_assert_stash_invariant(&d.borrow()));
             let write = PENDING.with(|p| p.borrow_mut().take());
             flush_locked(write);
             // Any rebuild still set aside has committed with the transaction, so
@@ -1317,8 +1365,9 @@ unsafe extern "C" fn subxact_callback(
                 }
                 // Both branches, not just the one that can break it: an early
                 // return past the check is how the push path came to be pinned
-                // and the re-parent path not.
-                debug_assert_one_per_subxact(&stash);
+                // and the re-parent path not. Recorded rather than raised —
+                // this is a subtransaction callback.
+                note_stash_invariant(&stash);
             });
         }
         _ => {}
