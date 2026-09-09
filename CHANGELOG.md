@@ -36,10 +36,17 @@ versions may break).
   literal needing a cast — because the integer types share one operator family
   and the float types another. Integers and floats do not mix, since the stored
   value and the bound have to compare as one type. A `NULL`
-  attribute satisfies no comparison, as in SQL. Anything the index cannot
-  express — a `<>`, an expression, an unsupported type — is left to the
-  executor, never dropped, and the index sets the recheck flag for any qual it
-  declined to enforce itself.
+  attribute satisfies no comparison, as in SQL.
+
+  A qual the planner never offers the index — a `<>`, an expression, an
+  unsupported column type — stays with the executor as it always did. A scan key
+  the index *does* receive and cannot express, such as one whose value turns out
+  to be NULL at run time or a `NaN` bound, is refused rather than dropped: the
+  scan reports a recheck and the executor re-tests every row it returns.
+
+  One known gap, in the missing-rows direction only: the index orders floats by
+  IEEE 754 while PostgreSQL gives them a total order, so a row whose stored
+  value is `NaN` fails a comparison PostgreSQL would satisfy.
 
   Because the attributes are search keys, the planner may also choose this index
   for a plain `WHERE attr = v` with no `ORDER BY` at all. That now works — it

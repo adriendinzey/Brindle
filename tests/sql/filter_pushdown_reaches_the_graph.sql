@@ -177,6 +177,104 @@ BEGIN
     END IF;
 END $$;
 
+-- Comparisons across widths within a family must push *and* be exact.
+--
+-- The integer half of this survives almost any mistake by accident: integer
+-- datums sign-extend, so reading a narrow one as a wider type round-trips for
+-- small values. The float half does not. A `float8` column compared against a
+-- `float4` literal is the one pairing where reading the argument as the
+-- *column's* type instead of its own reinterprets the bit pattern, and the
+-- result is a returned row that fails the predicate — which is the one thing
+-- this index may never do.
+CREATE TABLE widths (
+    id int, i2 int2, i8 int8, f4 float4, f8 float8, embedding real[]
+);
+ALTER TABLE widths SET (autovacuum_enabled = off);
+INSERT INTO widths
+SELECT i, (i % 300)::int2, (i % 500)::int8, (i % 100)::float4, (i % 100)::float8,
+       ARRAY[(i % 200)::real, (i / 200)::real]
+FROM generate_series(1, 4000) i;
+CREATE INDEX widths_idx ON widths USING brindle (embedding, i2, i8, f4, f8);
+
+DO $$
+DECLARE
+    shapes text[] := ARRAY[
+        'i2 = 42::int8', 'i2 < 42::int4', 'i8 = 42::int4', 'i8 > 400::int2',
+        'f4 = 1.5::float8', 'f4 > 50::float8', 'f8 = 1.5::float4', 'f8 > 0.1::float4'
+    ];
+    shape text; plan text; line text; via_index bigint; via_heap bigint;
+BEGIN
+    SET LOCAL brindle.ef_search = 6000;
+    FOREACH shape IN ARRAY shapes LOOP
+        -- It has to reach the access method, or the rest measures the executor.
+        plan := '';
+        SET LOCAL enable_seqscan = off;
+        FOR line IN EXECUTE
+            'EXPLAIN SELECT count(*) FROM widths WHERE ' || shape
+        LOOP
+            plan := plan || line || E'\n';
+        END LOOP;
+        IF plan NOT LIKE '%Index Cond%' THEN
+            RAISE EXCEPTION
+                'the qual `%` did not reach the index -- a cross-type comparison '
+                'silently degraded to post-filtering:%', shape, E'\n' || plan;
+        END IF;
+        EXECUTE 'SELECT count(*) FROM widths WHERE ' || shape INTO via_index;
+
+        SET LOCAL enable_indexscan = off;
+        SET LOCAL enable_seqscan = on;
+        EXECUTE 'SELECT count(*) FROM widths WHERE ' || shape INTO via_heap;
+        RESET enable_indexscan;
+
+        IF via_index <> via_heap THEN
+            RAISE EXCEPTION
+                'the qual `%` returns % rows through the index against % from a '
+                'heap scan -- the argument is being read as the wrong type',
+                shape, via_index, via_heap;
+        END IF;
+    END LOOP;
+END $$;
+
+-- A NaN bound must not be pushed. The core orders floats by IEEE 754, where NaN
+-- compares equal to nothing; PostgreSQL gives floats a total order in which
+-- `'NaN' = 'NaN'` is true and NaN sorts above everything. Pushing such a bound
+-- would answer a different question than the query asked, so the scan refuses it
+-- and the executor -- which has the right semantics -- decides.
+--
+-- The rows a *stored* NaN would add are a separate, filed gap; this asserts only
+-- the query-side half, by comparing against a heap scan rather than a constant.
+CREATE TABLE nan_t (id int, f8 float8, embedding real[]);
+ALTER TABLE nan_t SET (autovacuum_enabled = off);
+INSERT INTO nan_t
+SELECT i, CASE WHEN i % 200 = 0 THEN 'NaN'::float8 ELSE (i % 100)::float8 END,
+       ARRAY[(i % 200)::real, (i / 200)::real]
+FROM generate_series(1, 404) i;
+CREATE INDEX nan_idx ON nan_t USING brindle (embedding, f8);
+
+DO $$
+DECLARE
+    shapes text[] := ARRAY[
+        'f8 = ''NaN''::float8', 'f8 < ''NaN''::float8', 'f8 > ''NaN''::float8'
+    ];
+    shape text; via_index bigint; via_heap bigint;
+BEGIN
+    SET LOCAL brindle.ef_search = 2000;
+    FOREACH shape IN ARRAY shapes LOOP
+        SET LOCAL enable_seqscan = off;
+        SET LOCAL enable_indexscan = on;
+        EXECUTE 'SELECT count(*) FROM nan_t WHERE ' || shape INTO via_index;
+        SET LOCAL enable_indexscan = off;
+        SET LOCAL enable_seqscan = on;
+        EXECUTE 'SELECT count(*) FROM nan_t WHERE ' || shape INTO via_heap;
+        IF via_index <> via_heap THEN
+            RAISE EXCEPTION
+                'the qual `%` returns % rows through the index against % from a '
+                'heap scan -- a NaN bound was pushed with IEEE semantics instead '
+                'of being refused', shape, via_index, via_heap;
+        END IF;
+    END LOOP;
+END $$;
+
 -- An index with no attribute columns at all still works, unfiltered.
 CREATE TABLE plain (id int, embedding real[]);
 ALTER TABLE plain SET (autovacuum_enabled = off);
