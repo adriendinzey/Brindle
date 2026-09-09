@@ -681,6 +681,7 @@ type CacheRef = std::rc::Rc<CachedIndex>;
 /// same hazard [`subxact_callback`] is built to avoid, and a tripwire is not
 /// worth reintroducing it. [`debug_assert_stash_invariant`] does the raising,
 /// from ordinary paths only.
+#[cfg(debug_assertions)]
 fn has_duplicate_subxact(stash: &[(pg_sys::SubTransactionId, PendingWrite)]) -> bool {
     stash
         .iter()
@@ -711,6 +712,17 @@ fn debug_assert_stash_invariant(stash: &[(pg_sys::SubTransactionId, PendingWrite
 
 #[cfg(not(debug_assertions))]
 fn debug_assert_stash_invariant(_stash: &[(pg_sys::SubTransactionId, PendingWrite)]) {}
+
+/// The same, reaching the stash itself — so that in a release build the whole
+/// thing disappears rather than leaving a thread-local access and a `RefCell`
+/// borrow behind on the commit path.
+#[cfg(debug_assertions)]
+fn debug_assert_stash_invariant_now() {
+    DISCARDED.with(|d| debug_assert_stash_invariant(&d.borrow()));
+}
+
+#[cfg(not(debug_assertions))]
+fn debug_assert_stash_invariant_now() {}
 
 /// Identifies the *physical* relation, so a rebuild that writes a new
 /// relfilenode cannot be mistaken for the index the cached copy came from,
@@ -1272,7 +1284,7 @@ unsafe extern "C" fn xact_callback(event: pg_sys::XactEvent::Type, _arg: *mut co
             // for a commit that cannot be completed — unlike the subtransaction
             // callback, which is why the rewind is carried out from here.
             settle_pending();
-            DISCARDED.with(|d| debug_assert_stash_invariant(&d.borrow()));
+            debug_assert_stash_invariant_now();
             let write = PENDING.with(|p| p.borrow_mut().take());
             flush_locked(write);
             // Any rebuild still set aside has committed with the transaction, so
