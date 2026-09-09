@@ -46,6 +46,16 @@
 # A mutation is cheap: edit the mechanism, run `scripts/sql_test.sh <case>`,
 # confirm FAIL, `git checkout --` the file. If the case still passes, it is not
 # testing what its name says.
+#
+# One thing these cases are NOT isolated from: a long-running transaction in
+# another session on the same cluster. A database per case separates committed
+# state, but the xmin horizon is cluster-wide, so a sibling worktree — or a stray
+# psql — holding a transaction open makes `CREATE INDEX` and `REINDEX` index
+# recently-dead tuples, and cases that count rows then fail for reasons that have
+# nothing to do with the code. Two cases failed exactly this way during a review
+# here, from a `CREATE INDEX ... WITH (gamma = 64)` left running in another
+# database. If cases fail in ways the diff cannot explain, check
+# `pg_stat_activity` for a transaction older than the run.
 
 set -euo pipefail
 

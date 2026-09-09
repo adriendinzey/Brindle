@@ -198,13 +198,25 @@ CREATE INDEX widths_idx ON widths USING brindle (embedding, i2, i8, f4, f8);
 
 DO $$
 DECLARE
+    -- All five strategies in both families, and the bounds are values that
+    -- occur in the fixture so an inclusive/exclusive slip changes the count.
+    -- `<=` and `>=` are here for a second reason: the four range arms differ
+    -- only in which of `lo`/`hi` takes the bound, so copying one into another
+    -- and forgetting to swap them is a one-line mistake that returns every row
+    -- in the table for a predicate nothing satisfies.
     shapes text[] := ARRAY[
-        'i2 = 42::int8', 'i2 < 42::int4', 'i8 = 42::int4', 'i8 > 400::int2',
-        'f4 = 1.5::float8', 'f4 > 50::float8', 'f8 = 1.5::float4', 'f8 > 0.1::float4'
+        'i2 = 42::int8', 'i2 < 42::int4', 'i2 <= 42::int4',
+        'i8 = 42::int4', 'i8 > 400::int2', 'i8 >= 400::int2',
+        'f4 = 1.5::float8', 'f4 > 50::float8', 'f4 <= 50::float8',
+        'f8 = 1.5::float4', 'f8 > 0.1::float4', 'f8 >= 0.1::float4'
     ];
     shape text; plan text; line text; via_index bigint; via_heap bigint;
 BEGIN
-    SET LOCAL brindle.ef_search = 6000;
+    -- No `ef_search` here on purpose: `count(*)` has no ORDER BY, so it takes
+    -- the whole-graph path, which reads every node and ignores the budget. That
+    -- is what makes an index-against-heap count comparison exact rather than
+    -- truncated by the search budget — the point of this block is the predicate,
+    -- not recall.
     FOREACH shape IN ARRAY shapes LOOP
         -- It has to reach the access method, or the rest measures the executor.
         plan := '';
@@ -256,12 +268,22 @@ DECLARE
     shapes text[] := ARRAY[
         'f8 = ''NaN''::float8', 'f8 < ''NaN''::float8', 'f8 > ''NaN''::float8'
     ];
-    shape text; via_index bigint; via_heap bigint;
+    shape text; plan text; line text; via_index bigint; via_heap bigint;
 BEGIN
-    SET LOCAL brindle.ef_search = 2000;
     FOREACH shape IN ARRAY shapes LOOP
         SET LOCAL enable_seqscan = off;
         SET LOCAL enable_indexscan = on;
+        -- As above: without this the block could compare a heap scan against a
+        -- heap scan and pass, if the qual ever stopped reaching the index.
+        plan := '';
+        FOR line IN EXECUTE 'EXPLAIN SELECT count(*) FROM nan_t WHERE ' || shape LOOP
+            plan := plan || line || E'\n';
+        END LOOP;
+        IF plan NOT LIKE '%Index Cond%' THEN
+            RAISE EXCEPTION
+                'the qual `%` did not reach the index, so comparing it against a '
+                'heap scan proves nothing:%', shape, E'\n' || plan;
+        END IF;
         EXECUTE 'SELECT count(*) FROM nan_t WHERE ' || shape INTO via_index;
         SET LOCAL enable_indexscan = off;
         SET LOCAL enable_seqscan = on;
