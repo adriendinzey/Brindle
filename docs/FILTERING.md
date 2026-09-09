@@ -103,22 +103,53 @@ Brindle ships this in increasing order of difficulty:
 
 ### Tier 1 — indexed attributes (first target)
 
-At `CREATE INDEX` time, the user declares which columns participate in filtering;
-Brindle stores those attribute values **inside the index** next to each vector:
+At `CREATE INDEX` time, the user declares which columns participate in filtering
+as **key columns after the vector**; Brindle stores those attribute values
+**inside the index** next to each vector:
 
 ```sql
-CREATE INDEX ON docs USING brindle (embedding vector_cosine_ops)
-  INCLUDE (tenant_id, status, price);     -- filterable attrs co-located
+CREATE INDEX ON docs USING brindle (embedding, tenant_id, status, price);
 ```
 
-Supported predicate shapes in Tier 1:
-- **equality / label**: `tenant_id = 42`, `status = 'active'` → compact label
-  dictionary + per-node label bits, matched with a bitwise test.
-- **numeric range**: `price < 50`, `created_at BETWEEN ...` → store the scalar,
-  compare during traversal.
+**Not `INCLUDE (...)`, and the distinction is the whole mechanism.** Postgres
+matches a `WHERE` clause to an index column only if that column is part of the
+*search key*. An `INCLUDE` column is payload: it can satisfy an index-only scan,
+but a qual on it never reaches the access method — the planner leaves it as an
+executor `Filter`, so the scan returns its `ef_search` candidates and the filter
+is applied afterwards. That is post-filtering, which is the thing this design
+exists to avoid, and it under-fills `LIMIT k` exactly when the predicate is
+selective enough to matter.
+
+An earlier draft of this document specified `INCLUDE`. It was wrong: measured,
+the access method received `nkeys = 0` and the plan read `Filter:` rather than
+`Index Cond:`.
+
+Filterable columns must have a brindle operator class, which ships for `bool`,
+`int2`, `int4`, `int8`, `float4` and `float8`. Anything else is refused at
+`CREATE INDEX` with Postgres's own "no default operator class" error rather than
+being silently unfilterable.
+
+Supported predicate shapes in Tier 1, as shipped:
+- **equality**: `tenant_id = 42` — on any of the numeric types above.
+- **range**: `price < 50`, `score BETWEEN 1 AND 9` — `<`, `<=`, `>=`, `>`.
 - **conjunctions** of the above (`AND`).
 
+Comparisons work across widths within a family, so `bigint_col = 42` pushes
+without the literal needing a cast; integers and floats do not mix, because the
+stored value and the bound have to compare as one type.
+
 These are evaluated with zero heap access during traversal — the whole point.
+
+Not yet shipped, and refused at `CREATE INDEX` rather than silently ignored:
+**string labels** (`status = 'active'`, which wants the dictionary encoding this
+document describes for `AttrValue::Int`) and **dates and timestamps** (which
+would map onto the integer path). `OR` and `NOT` are Tier 1 gaps too: the
+predicate model has an `And` conjunction only, and anything else stays with the
+executor.
+
+Anything the index cannot express is left to the executor rather than dropped,
+and the scan reports a recheck for it — so a refused qual costs recall, never
+correctness.
 
 ### Tier 2 — bitmap handoff
 

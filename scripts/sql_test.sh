@@ -46,6 +46,23 @@
 # A mutation is cheap: edit the mechanism, run `scripts/sql_test.sh <case>`,
 # confirm FAIL, `git checkout --` the file. If the case still passes, it is not
 # testing what its name says.
+#
+# One thing these cases are NOT isolated from: another session on the same
+# cluster running a transaction that has *written*. A database per case separates
+# committed state, but the oldest running XID is cluster-wide and clamps every
+# database's removable-tuple horizon, so `CREATE INDEX` and `REINDEX` then index
+# recently-dead tuples and cases that count rows fail for reasons the diff cannot
+# explain. Two failed exactly this way during a review here, from a
+# `CREATE INDEX ... WITH (gamma = 64)` left running in another database.
+#
+# A transaction that has only *read* is harmless however long it runs — an
+# assigned XID is what matters, which means any INSERT/DELETE/CREATE INDEX.
+# Measured: the same case passes against an idle cluster and against a
+# long-running REPEATABLE READ reader, and fails against a writer.
+#
+# So the column to look at is `backend_xid IS NOT NULL`, not `backend_xmin` —
+# `backend_xmin` is set for harmless readers too, and will send you after the
+# wrong session.
 
 set -euo pipefail
 

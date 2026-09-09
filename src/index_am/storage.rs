@@ -974,7 +974,12 @@ thread_local! {
 ///
 /// # Safety
 /// `index` must be an open brindle index relation this backend may write.
-pub unsafe fn pending_insert(index: pg_sys::Relation, vector: Vec<f32>, tid: TidPair) {
+pub unsafe fn pending_insert(
+    index: pg_sys::Relation,
+    vector: Vec<f32>,
+    attrs: Vec<AttrValue>,
+    tid: TidPair,
+) {
     register_callbacks();
     // A subtransaction rollback may be outstanding; carry it out before adding
     // to a graph that still holds the rows it rolled back.
@@ -1020,9 +1025,9 @@ pub unsafe fn pending_insert(index: pg_sys::Relation, vector: Vec<f32>, tid: Tid
             });
         }
         let write = pending.as_mut().expect("just populated");
-        // The vector moves straight into the graph. Nothing else keeps a copy:
-        // a replay reads the staged rows back out of it.
-        apply_one(&mut write.hnsw, write.tids.len(), vector, Vec::new());
+        // The vector and its attributes move straight into the graph. Nothing
+        // else keeps a copy: a replay reads the staged rows back out of it.
+        apply_one(&mut write.hnsw, write.tids.len(), vector, attrs);
         write.tids.push(tid);
     });
 }

@@ -39,8 +39,10 @@ use pgrx::itemptr::item_pointer_set_all;
 use pgrx::prelude::*;
 use pgrx::{pg_guard, pg_sys};
 
+use super::attrs;
 use super::opclass;
 use super::storage::{self, TidPair};
+use crate::filter::Predicate;
 use crate::guc;
 use crate::hnsw::HnswError;
 
@@ -79,6 +81,13 @@ struct ScanSearch {
     /// The search's results as heap addresses, nearest first.
     results: Vec<TidPair>,
     cursor: usize,
+    /// Whether the executor must re-test this scan's rows against the original
+    /// quals, because a scan key was refused rather than pushed.
+    ///
+    /// Held here rather than written once in `amrescan`: `amgettuple` sets
+    /// `xs_recheck` before returning each tuple, which is the contract, and it
+    /// has to say what this scan actually decided rather than a constant.
+    recheck: bool,
 }
 
 impl ScanSearch {
@@ -87,6 +96,7 @@ impl ScanSearch {
             query: Vec::new(),
             results: Vec::new(),
             cursor: 0,
+            recheck: false,
         }
     }
 
@@ -97,7 +107,12 @@ impl ScanSearch {
     ///
     /// # Safety
     /// `index` must be the open index relation this scan was opened against.
-    unsafe fn start(&mut self, index: pg_sys::Relation, query: Vec<f32>) -> Result<(), ScanError> {
+    unsafe fn start(
+        &mut self,
+        index: pg_sys::Relation,
+        query: Vec<f32>,
+        predicate: &Predicate,
+    ) -> Result<(), ScanError> {
         self.query = query;
         self.cursor = 0;
         // Cleared before the search rather than after: a search that fails must
@@ -116,9 +131,50 @@ impl ScanSearch {
         // flushes for that case in `storage::flush_before_parallel_plan`.
         storage::flush_pending_for(index);
         let handle = storage::cached_index(index);
-        let found = handle.graph().search(&self.query, budget, budget)?;
+        // One entry point for both shapes: an unfiltered scan is the match-all
+        // predicate, which the traversal short-circuits, so there is no separate
+        // path to keep in step.
+        let found = handle
+            .graph()
+            .search_filtered(&self.query, budget, budget, predicate)?;
         self.results.reserve(found.len());
         for (_, id) in found {
+            match handle.tids().get(id) {
+                Some(&tid) => self.results.push(tid),
+                None => return Err(ScanError::UnmappedNode(id)),
+            }
+        }
+        Ok(())
+    }
+
+    /// Begin a scan that has a predicate but no ordering: every matching row,
+    /// in whatever order the graph holds them.
+    ///
+    /// Legal now that the attribute columns are search keys — Postgres may plan
+    /// a plain `WHERE attr = v` against this index with no distance clause at
+    /// all. Erroring on that would make a legitimate plan fail; it is priced,
+    /// not refused.
+    ///
+    /// It materialises every match at once, outside `work_mem` accounting, so a
+    /// selective-looking predicate over a large index can still build a large
+    /// vector. The cost estimate keeps the planner away unless nothing else can
+    /// serve, which in practice means someone has turned sequential scans off.
+    ///
+    /// # Safety
+    /// `index` must be the open index relation this scan was opened against.
+    unsafe fn start_unordered(
+        &mut self,
+        index: pg_sys::Relation,
+        predicate: &Predicate,
+    ) -> Result<(), ScanError> {
+        self.query = Vec::new();
+        self.cursor = 0;
+        self.results.clear();
+        storage::flush_pending_for(index);
+        let handle = storage::cached_index(index);
+        let matched = handle.graph().matching(predicate);
+        self.results.reserve(matched.len());
+        for id in matched {
             match handle.tids().get(id) {
                 Some(&tid) => self.results.push(tid),
                 None => return Err(ScanError::UnmappedNode(id)),
@@ -248,11 +304,43 @@ pub(super) unsafe extern "C" fn amrescan(
         );
     }
 
-    if (*scan).numberOfOrderBys < 1 || (*scan).orderByData.is_null() {
-        error!("brindle: an index scan needs an ORDER BY <distance operator> clause");
+    // An index-only scan asks the access method to hand back the indexed tuple
+    // itself. This one cannot: the graph stores vectors and attributes, but not
+    // as index tuples, and there is no descriptor here to rebuild one from.
+    //
+    // The planner reaches this for a query that needs *no* columns at all —
+    // `SELECT count(*)` — because a covering check over an empty column set
+    // succeeds trivially, whatever `amcanreturn` says. Postgres then fails with
+    // "no data returned for index-only scan", and only for heap pages that are
+    // all-visible, so the same query can work before a VACUUM and fail after.
+    // Say what is actually wrong instead.
+    if (*scan).xs_want_itup {
+        error!("brindle: this index cannot serve an index-only scan");
     }
 
     let search = scan_search(scan);
+
+    // The scan keys are the `WHERE` clauses the planner matched to this index's
+    // attribute columns. Anything this AM cannot express is not dropped: it sets
+    // the recheck flag, so the executor re-tests every row the scan returns.
+    // SAFETY: keyData holds numberOfKeys initialized keys, copied above.
+    let pushed = attrs::predicate_from_keys(
+        (*scan).indexRelation,
+        (*scan).keyData,
+        (*scan).numberOfKeys as usize,
+    );
+    (*scan).xs_recheck = pushed.recheck;
+    search.recheck = pushed.recheck;
+
+    // No distance clause: answer the predicate alone rather than refusing. With
+    // the attributes as search keys the planner can reach this index without an
+    // `ORDER BY`, and that plan has to work.
+    if (*scan).numberOfOrderBys < 1 || (*scan).orderByData.is_null() {
+        if let Err(e) = search.start_unordered((*scan).indexRelation, &pushed.predicate) {
+            error!("brindle: {e}");
+        }
+        return;
+    }
     // SAFETY: orderByData holds numberOfOrderBys initialized keys, checked above.
     let key = &*(*scan).orderByData;
     if key.sk_flags & pg_sys::SK_ISNULL as i32 != 0 {
@@ -265,7 +353,8 @@ pub(super) unsafe extern "C" fn amrescan(
     // call against a scan that re-searches the graph anyway.
     let query =
         super::f32_vec_from_datum(opclass::index_kind((*scan).indexRelation), key.sk_argument);
-    if let Err(e) = search.start((*scan).indexRelation, query) {
+
+    if let Err(e) = search.start((*scan).indexRelation, query, &pushed.predicate) {
         error!("brindle: {e}");
     }
 }
@@ -283,12 +372,19 @@ pub(super) unsafe extern "C" fn amgettuple(
     // `scan.kill_prior_tuple` asks the AM to mark the previously returned
     // entry dead. Recording that needs the same machinery as vacuum
     // integration; ignoring the hint is always legal, just less efficient.
-    match scan_search(scan).next() {
+    let search = scan_search(scan);
+    let recheck = search.recheck;
+    match search.next() {
         Ok(Some((block, offset))) => {
             item_pointer_set_all(&mut (*scan).xs_heaptid, block, offset);
-            // The graph ranks whole rows against the query, so neither the row
-            // nor its position needs re-checking above the AM.
-            (*scan).xs_recheck = false;
+            // Only the rows this scan could not filter for itself need
+            // re-testing. Writing `false` here unconditionally — which is what
+            // this did while nothing ever set it — silently discards the
+            // recheck `amrescan` asked for, and the executor then trusts a
+            // result the index never enforced.
+            (*scan).xs_recheck = recheck;
+            // The graph ranks whole rows against the query, so the *ordering*
+            // never needs re-checking above the AM.
             (*scan).xs_recheckorderby = false;
             true
         }
@@ -1038,7 +1134,14 @@ mod tests {
         let mut search = ScanSearch::new();
 
         Spi::run("SET brindle.ef_search = 137").expect("set");
-        unsafe { search.start(relation.as_ptr(), QUERY.to_vec()) }.expect("start");
+        unsafe {
+            search.start(
+                relation.as_ptr(),
+                QUERY.to_vec(),
+                &crate::filter::Predicate::All,
+            )
+        }
+        .expect("start");
         assert_eq!(
             search.results.len(),
             137,
@@ -1046,7 +1149,14 @@ mod tests {
         );
 
         Spi::run("SET brindle.ef_search = 41").expect("set");
-        unsafe { search.start(relation.as_ptr(), QUERY.to_vec()) }.expect("start");
+        unsafe {
+            search.start(
+                relation.as_ptr(),
+                QUERY.to_vec(),
+                &crate::filter::Predicate::All,
+            )
+        }
+        .expect("start");
         assert_eq!(
             search.results.len(),
             41,
@@ -1054,7 +1164,14 @@ mod tests {
         );
 
         Spi::run("RESET brindle.ef_search").expect("reset");
-        unsafe { search.start(relation.as_ptr(), QUERY.to_vec()) }.expect("start");
+        unsafe {
+            search.start(
+                relation.as_ptr(),
+                QUERY.to_vec(),
+                &crate::filter::Predicate::All,
+            )
+        }
+        .expect("start");
         assert_eq!(
             search.results.len(),
             64,

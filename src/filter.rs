@@ -22,8 +22,15 @@ use std::ops::Bound;
 ///
 /// `Float` equality and ordering follow IEEE 754: `NaN` is never equal to
 /// anything (including itself) and never orders, so a `NaN` value or bound
-/// satisfies no atom. That mirrors SQL's "comparisons involving NULL/NaN are
-/// not true" and keeps [`Predicate::matches`] total.
+/// satisfies no atom, which keeps [`Predicate::matches`] total.
+///
+/// **This is not PostgreSQL's rule.** PostgreSQL gives floats a total order so
+/// that btree works: `'NaN' = 'NaN'` is true, and NaN sorts above every other
+/// value, so `'NaN' > 1e308` is true. A row whose stored value is NaN therefore
+/// fails an atom here that SQL would satisfy — it costs rows, never wrong ones.
+/// The index layer refuses to push a NaN *bound* for this reason; a NaN stored
+/// in a column is the remaining gap, and closing it means ordering values the
+/// way PostgreSQL does rather than the way IEEE 754 does.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum AttrValue {
     /// Signed integer: ids, counts, booleans (`0`/`1`), or dictionary-encoded
