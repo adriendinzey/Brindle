@@ -39,8 +39,10 @@ use pgrx::itemptr::item_pointer_set_all;
 use pgrx::prelude::*;
 use pgrx::{pg_guard, pg_sys};
 
+use super::attrs;
 use super::opclass;
 use super::storage::{self, TidPair};
+use crate::filter::Predicate;
 use crate::guc;
 use crate::hnsw::HnswError;
 
@@ -97,7 +99,12 @@ impl ScanSearch {
     ///
     /// # Safety
     /// `index` must be the open index relation this scan was opened against.
-    unsafe fn start(&mut self, index: pg_sys::Relation, query: Vec<f32>) -> Result<(), ScanError> {
+    unsafe fn start(
+        &mut self,
+        index: pg_sys::Relation,
+        query: Vec<f32>,
+        predicate: &Predicate,
+    ) -> Result<(), ScanError> {
         self.query = query;
         self.cursor = 0;
         // Cleared before the search rather than after: a search that fails must
@@ -116,9 +123,45 @@ impl ScanSearch {
         // flushes for that case in `storage::flush_before_parallel_plan`.
         storage::flush_pending_for(index);
         let handle = storage::cached_index(index);
-        let found = handle.graph().search(&self.query, budget, budget)?;
+        // One entry point for both shapes: an unfiltered scan is the match-all
+        // predicate, which the traversal short-circuits, so there is no separate
+        // path to keep in step.
+        let found = handle
+            .graph()
+            .search_filtered(&self.query, budget, budget, predicate)?;
         self.results.reserve(found.len());
         for (_, id) in found {
+            match handle.tids().get(id) {
+                Some(&tid) => self.results.push(tid),
+                None => return Err(ScanError::UnmappedNode(id)),
+            }
+        }
+        Ok(())
+    }
+
+    /// Begin a scan that has a predicate but no ordering: every matching row,
+    /// in whatever order the graph holds them.
+    ///
+    /// Legal now that the attribute columns are search keys — Postgres may plan
+    /// a plain `WHERE attr = v` against this index with no distance clause at
+    /// all. Erroring on that would make a legitimate plan fail; it is priced,
+    /// not refused.
+    ///
+    /// # Safety
+    /// `index` must be the open index relation this scan was opened against.
+    unsafe fn start_unordered(
+        &mut self,
+        index: pg_sys::Relation,
+        predicate: &Predicate,
+    ) -> Result<(), ScanError> {
+        self.query = Vec::new();
+        self.cursor = 0;
+        self.results.clear();
+        storage::flush_pending_for(index);
+        let handle = storage::cached_index(index);
+        let matched = handle.graph().matching(predicate);
+        self.results.reserve(matched.len());
+        for id in matched {
             match handle.tids().get(id) {
                 Some(&tid) => self.results.push(tid),
                 None => return Err(ScanError::UnmappedNode(id)),
@@ -248,11 +291,28 @@ pub(super) unsafe extern "C" fn amrescan(
         );
     }
 
-    if (*scan).numberOfOrderBys < 1 || (*scan).orderByData.is_null() {
-        error!("brindle: an index scan needs an ORDER BY <distance operator> clause");
-    }
-
     let search = scan_search(scan);
+
+    // The scan keys are the `WHERE` clauses the planner matched to this index's
+    // attribute columns. Anything this AM cannot express is not dropped: it sets
+    // the recheck flag, so the executor re-tests every row the scan returns.
+    // SAFETY: keyData holds numberOfKeys initialized keys, copied above.
+    let pushed = attrs::predicate_from_keys(
+        (*scan).indexRelation,
+        (*scan).keyData,
+        (*scan).numberOfKeys as usize,
+    );
+    (*scan).xs_recheck = pushed.recheck;
+
+    // No distance clause: answer the predicate alone rather than refusing. With
+    // the attributes as search keys the planner can reach this index without an
+    // `ORDER BY`, and that plan has to work.
+    if (*scan).numberOfOrderBys < 1 || (*scan).orderByData.is_null() {
+        if let Err(e) = search.start_unordered((*scan).indexRelation, &pushed.predicate) {
+            error!("brindle: {e}");
+        }
+        return;
+    }
     // SAFETY: orderByData holds numberOfOrderBys initialized keys, checked above.
     let key = &*(*scan).orderByData;
     if key.sk_flags & pg_sys::SK_ISNULL as i32 != 0 {
@@ -265,7 +325,8 @@ pub(super) unsafe extern "C" fn amrescan(
     // call against a scan that re-searches the graph anyway.
     let query =
         super::f32_vec_from_datum(opclass::index_kind((*scan).indexRelation), key.sk_argument);
-    if let Err(e) = search.start((*scan).indexRelation, query) {
+
+    if let Err(e) = search.start((*scan).indexRelation, query, &pushed.predicate) {
         error!("brindle: {e}");
     }
 }
@@ -1038,7 +1099,14 @@ mod tests {
         let mut search = ScanSearch::new();
 
         Spi::run("SET brindle.ef_search = 137").expect("set");
-        unsafe { search.start(relation.as_ptr(), QUERY.to_vec()) }.expect("start");
+        unsafe {
+            search.start(
+                relation.as_ptr(),
+                QUERY.to_vec(),
+                &crate::filter::Predicate::All,
+            )
+        }
+        .expect("start");
         assert_eq!(
             search.results.len(),
             137,
@@ -1046,7 +1114,14 @@ mod tests {
         );
 
         Spi::run("SET brindle.ef_search = 41").expect("set");
-        unsafe { search.start(relation.as_ptr(), QUERY.to_vec()) }.expect("start");
+        unsafe {
+            search.start(
+                relation.as_ptr(),
+                QUERY.to_vec(),
+                &crate::filter::Predicate::All,
+            )
+        }
+        .expect("start");
         assert_eq!(
             search.results.len(),
             41,
@@ -1054,7 +1129,14 @@ mod tests {
         );
 
         Spi::run("RESET brindle.ef_search").expect("reset");
-        unsafe { search.start(relation.as_ptr(), QUERY.to_vec()) }.expect("start");
+        unsafe {
+            search.start(
+                relation.as_ptr(),
+                QUERY.to_vec(),
+                &crate::filter::Predicate::All,
+            )
+        }
+        .expect("start");
         assert_eq!(
             search.results.len(),
             64,

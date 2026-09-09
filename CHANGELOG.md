@@ -10,6 +10,37 @@ versions may break).
 
 ### Added
 
+- **Filtered vector search from SQL.** A `WHERE` clause on an indexed attribute
+  column is pushed into the graph traversal, so the search returns *k* rows that
+  satisfy the predicate rather than *k* nearest rows that are then filtered down
+  to fewer:
+
+  ```sql
+  CREATE INDEX ON docs USING brindle (embedding, tenant_id, price);
+  SELECT id FROM docs
+   WHERE tenant_id = 7 AND price < 50
+   ORDER BY embedding <-> $1 LIMIT 10;
+  ```
+
+  Filterable columns are **key columns after the vector**, not `INCLUDE`
+  columns: Postgres only matches a qual to a column in the search key, so a
+  predicate on an `INCLUDE` column never reaches the index and the executor
+  filters afterwards. Measured at 1% selectivity on 20 000 rows, pushdown
+  returns the full 10 requested rows at recall 0.9 against an exact scan; the
+  same query filtered afterwards comes up short, because `ef_search` bounds the
+  candidates before the filter is applied.
+
+  Equality and range comparisons (`=`, `<`, `<=`, `>`, `>=`) are pushed for
+  `bool`, `int2`, `int4`, `int8`, `float4` and `float8` columns. A `NULL`
+  attribute satisfies no comparison, as in SQL. Anything the index cannot
+  express — a `<>`, an expression, an unsupported type — is left to the
+  executor, never dropped, and the index sets the recheck flag for any qual it
+  declined to enforce itself.
+
+  Because the attributes are search keys, the planner may also choose this index
+  for a plain `WHERE attr = v` with no `ORDER BY` at all. That now works — it
+  reads every node and tests the predicate — but is priced so the planner
+  reaches for it only when nothing else can serve.
 - PostgreSQL extension scaffold (`CREATE EXTENSION brindle`), built with pgrx.
 - Distance kernels — squared L2, cosine, and (negative) inner product — exposed
   to SQL as `brindle_l2_distance`, `brindle_cosine_distance`,

@@ -9,6 +9,7 @@
 //! ranks by and the type its column holds both come from the index's operator
 //! class — see [`opclass`].
 
+pub mod attrs;
 pub mod opclass;
 pub mod options;
 pub mod scan;
@@ -39,14 +40,20 @@ fn brindle_amhandler(_fcinfo: pg_sys::FunctionCallInfo) -> PgBox<pg_sys::IndexAm
     let mut routine =
         unsafe { PgBox::<pg_sys::IndexAmRoutine>::alloc_node(pg_sys::NodeTag::T_IndexAmRoutine) };
 
-    routine.amstrategies = 0; // ordering operators only, so no fixed strategy set
+    // Attribute operator classes use btree's 1..5 for their comparisons; the
+    // vector classes' ordering operators live in the same numbering but are
+    // distinguished by purpose, not by number.
+    routine.amstrategies = attrs::MAX_STRATEGY;
     routine.amsupport = opclass::SUPPORT_PROCS; // distance, metric, indexed type
     routine.amoptsprocnum = 0;
     routine.amcanorder = false;
     routine.amcanorderbyop = true; // distance ORDER BY is the point of this AM
     routine.amcanbackward = false;
     routine.amcanunique = false;
-    routine.amcanmulticol = false;
+    // Key column 1 is the vector; the columns after it are filterable
+    // attributes, which have to be *key* columns for their quals to reach this
+    // access method at all. See `attrs`.
+    routine.amcanmulticol = true;
     routine.amoptionalkey = true; // ORDER BY-only scans carry no key clause
     routine.amsearcharray = false;
     routine.amsearchnulls = false;
@@ -153,7 +160,7 @@ unsafe fn f32_vec_from_array_datum(datum: pg_sys::Datum) -> Vec<f32> {
 /// Per-tuple callback for `table_index_build_scan`.
 #[pg_guard]
 unsafe extern "C" fn build_callback(
-    _index: pg_sys::Relation,
+    index: pg_sys::Relation,
     tid: pg_sys::ItemPointer,
     values: *mut pg_sys::Datum,
     isnull: *mut bool,
@@ -167,11 +174,13 @@ unsafe extern "C" fn build_callback(
     if *isnull {
         return; // NULL vectors are not indexed; a distance scan can't rank them
     }
-    // SAFETY: single-column AM (amcanmulticol=false), so values[0]/isnull[0]
-    // is the only entry, and we just checked it is not null. `tid` points at
-    // the scanned tuple's live ItemPointerData for the duration of this call.
+    // SAFETY: values[0]/isnull[0] is the vector — key column 1 — and we just
+    // checked it is not null. Any further key columns are filterable
+    // attributes, read below. `tid` points at the scanned tuple's live
+    // ItemPointerData for the duration of this call.
     let vector = f32_vec_from_datum(state.kind, *values);
-    match state.hnsw.insert(vector) {
+    let row = attrs::row_from_datums(index, values, isnull);
+    match state.hnsw.insert_with_attrs(vector, row) {
         Ok(_) => state.heap_tids.push(item_pointer_get_both(*tid)),
         Err(e) => error!("brindle: {e}"),
     }
@@ -298,7 +307,8 @@ unsafe extern "C" fn aminsert(
     // inserted, valid for this call. Staging takes no lock and writes no page;
     // an error below unwinds to abort, which discards the staged rows along
     // with everything else the transaction was holding.
-    storage::pending_insert(index, vector, item_pointer_get_both(*heap_tid));
+    let row = attrs::row_from_datums(index, values, isnull);
+    storage::pending_insert(index, vector, row, item_pointer_get_both(*heap_tid));
     true
 }
 
@@ -467,10 +477,16 @@ unsafe extern "C" fn amcostestimate(
     // SAFETY: Postgres always passes valid, writable out-pointers to
     // amcostestimate, and `path` is the candidate IndexPath being costed.
 
-    // The AM has no search operators, so without an ORDER BY distance clause it
-    // has nothing to contribute: price it out of the plan. A partial index gets
-    // here, because a matching predicate alone is enough for the planner to
-    // build a candidate path.
+    // Without an ORDER BY distance clause there is nothing to rank, so the scan
+    // degrades to reading every node and testing the predicate — correct (see
+    // `ScanSearch::start_unordered`) but linear, and a btree on the same column
+    // beats it every time. Price it out so the planner reaches for it only when
+    // nothing else can serve. A partial index gets here too, because a matching
+    // predicate alone is enough for the planner to build a candidate path.
+    //
+    // This used to say the AM had no search operators at all. It has them now —
+    // the attribute columns' comparisons — which is exactly why this path became
+    // reachable and had to start working rather than erroring.
     if (*path).indexorderbys.is_null() {
         *index_startup_cost = DISABLED_COST;
         *index_total_cost = DISABLED_COST;

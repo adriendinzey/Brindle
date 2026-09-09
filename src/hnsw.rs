@@ -555,6 +555,20 @@ impl Hnsw {
         !self.deleted[id] && self.node_matches(id, predicate)
     }
 
+    /// Every live node satisfying `predicate`, in insertion order.
+    ///
+    /// The whole-graph scan an index scan with no `ORDER BY` needs: with no
+    /// query vector there is nothing to rank against, so the answer is a set
+    /// rather than a ranking, and the graph's edges are beside the point. Linear
+    /// in the number of nodes — which is why [`Hnsw::search_filtered`] exists
+    /// and why the cost estimate should keep the planner away from this unless
+    /// it really wants every match.
+    pub fn matching(&self, predicate: &Predicate) -> Vec<usize> {
+        (0..self.n)
+            .filter(|&id| self.admissible(id, Some(predicate)))
+            .collect()
+    }
+
     /// Score `id` and fold it into `beam`, unless it was already considered or
     /// is too far to improve on the results already held. Reports whether it
     /// actually joined the frontier.

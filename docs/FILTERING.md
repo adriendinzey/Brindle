@@ -103,13 +103,31 @@ Brindle ships this in increasing order of difficulty:
 
 ### Tier 1 — indexed attributes (first target)
 
-At `CREATE INDEX` time, the user declares which columns participate in filtering;
-Brindle stores those attribute values **inside the index** next to each vector:
+At `CREATE INDEX` time, the user declares which columns participate in filtering
+as **key columns after the vector**; Brindle stores those attribute values
+**inside the index** next to each vector:
 
 ```sql
-CREATE INDEX ON docs USING brindle (embedding vector_cosine_ops)
-  INCLUDE (tenant_id, status, price);     -- filterable attrs co-located
+CREATE INDEX ON docs USING brindle (embedding, tenant_id, status, price);
 ```
+
+**Not `INCLUDE (...)`, and the distinction is the whole mechanism.** Postgres
+matches a `WHERE` clause to an index column only if that column is part of the
+*search key*. An `INCLUDE` column is payload: it can satisfy an index-only scan,
+but a qual on it never reaches the access method — the planner leaves it as an
+executor `Filter`, so the scan returns its `ef_search` candidates and the filter
+is applied afterwards. That is post-filtering, which is the thing this design
+exists to avoid, and it under-fills `LIMIT k` exactly when the predicate is
+selective enough to matter.
+
+An earlier draft of this document specified `INCLUDE`. It was wrong: measured,
+the access method received `nkeys = 0` and the plan read `Filter:` rather than
+`Index Cond:`.
+
+Filterable columns must have a brindle operator class, which ships for `bool`,
+`int2`, `int4`, `int8`, `float4` and `float8`. Anything else is refused at
+`CREATE INDEX` with Postgres's own "no default operator class" error rather than
+being silently unfilterable.
 
 Supported predicate shapes in Tier 1:
 - **equality / label**: `tenant_id = 42`, `status = 'active'` → compact label
