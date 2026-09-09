@@ -291,6 +291,20 @@ pub(super) unsafe extern "C" fn amrescan(
         );
     }
 
+    // An index-only scan asks the access method to hand back the indexed tuple
+    // itself. This one cannot: the graph stores vectors and attributes, but not
+    // as index tuples, and there is no descriptor here to rebuild one from.
+    //
+    // The planner reaches this for a query that needs *no* columns at all —
+    // `SELECT count(*)` — because a covering check over an empty column set
+    // succeeds trivially, whatever `amcanreturn` says. Postgres then fails with
+    // "no data returned for index-only scan", and only for heap pages that are
+    // all-visible, so the same query can work before a VACUUM and fail after.
+    // Say what is actually wrong instead.
+    if (*scan).xs_want_itup {
+        error!("brindle: this index cannot serve an index-only scan");
+    }
+
     let search = scan_search(scan);
 
     // The scan keys are the `WHERE` clauses the planner matched to this index's
