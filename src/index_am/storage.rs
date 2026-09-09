@@ -671,6 +671,13 @@ type CacheRef = std::rc::Rc<CachedIndex>;
 /// and the re-parent's moving branch. Its dropping branch only removes entries
 /// and is checked for symmetry.
 ///
+/// One consequence for anyone writing a case against this: a violation is
+/// reported only if the transaction that broke it reaches a raising site — its
+/// own commit, or a later `ambuild`. A transaction that records one and then
+/// rolls back drops it, deliberately, rather than blaming the next transaction.
+/// So **a case pinning the re-parent rule has to commit**, or it cannot fail.
+/// Case 6 in `rolled_back_rebuild_keeps_staged_rows.sql` does.
+///
 /// # Where this may and may not raise
 ///
 /// [`note_stash_invariant`] records a violation and never raises; it is what the
