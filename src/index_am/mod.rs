@@ -183,6 +183,19 @@ unsafe extern "C" fn ambuild(
     index: pg_sys::Relation,
     index_info: *mut pg_sys::IndexInfo,
 ) -> *mut pg_sys::IndexBuildResult {
+    // A rebuild supersedes anything this transaction had staged for the index.
+    // TRUNCATE has emptied the heap those rows point at, and a REINDEX here
+    // builds from a heap that already contains them — writing them afterwards
+    // would corrupt the index or duplicate its entries. This is also the only
+    // place that can tell a rebuild from a plain relfilenode change: a
+    // tablespace move never reaches here.
+    //
+    // Set aside rather than dropped, because a rebuild is not necessarily final:
+    // a TRUNCATE or REINDEX inside a subtransaction that aborts is undone, and
+    // the staged rows belong to the state that comes back. See
+    // [`storage::forget_pending`].
+    storage::forget_pending(index);
+
     let mut state = BuildState {
         hnsw: Hnsw::new(build_params(index)),
         heap_tids: Vec::new(),
@@ -218,6 +231,9 @@ unsafe extern "C" fn ambuild(
 
 #[pg_guard]
 unsafe extern "C" fn ambuildempty(index: pg_sys::Relation) {
+    // As in `ambuild`: whatever was staged is superseded by the empty image.
+    storage::forget_pending(index);
+
     // The init fork of an unlogged index: an empty graph, so the index is
     // valid (and empty) after a crash resets the main fork from it.
     let hnsw = Hnsw::new(build_params(index));
@@ -230,19 +246,28 @@ unsafe extern "C" fn ambuildempty(index: pg_sys::Relation) {
 
 /// Add one heap tuple to the persisted graph, returning whether it was indexed.
 ///
-/// The strategy is load-modify-store: read the whole index back, insert into
-/// the in-memory graph, write the whole image out again. Graph quality is
-/// therefore exactly a rebuild's — the point of doing it this way — but the
-/// cost is O(index) per row, which suits a trickle of inserts and not a bulk
-/// load. Loading a large table is still far faster as `COPY` followed by
-/// `CREATE INDEX`. That cost is O(index) *WAL* too — the whole image is logged
-/// as full page images per row, so one insert into a 4 MB index writes ~4 MB of
-/// WAL, which replicas and archiving pay for as well.
+/// The row is inserted into a graph held for the transaction and written back
+/// once, at the end, rather than per row. Graph quality is exactly a rebuild's
+/// either way — the point of doing it this way — but the stored format has no
+/// way to add a node without rewriting the whole image, so a per-row write back
+/// makes a bulk load quadratic in both bytes written and WAL. Staging pays that
+/// image rewrite once per transaction instead of once per row.
 ///
-/// The whole sequence runs under an exclusive [`storage::IMAGE_LOCK_BLOCK`]
-/// lock, so that two inserts cannot each load the image the other is replacing
-/// and lose a row, and so that a concurrent scan reads one image rather than
-/// halves of two.
+/// What that does *not* buy is a cheaper single-row `INSERT`: it is its own
+/// transaction, so it still writes the whole image, and the cost is the same
+/// O(index) it always was. Only a multi-row transaction gains, and the O(index)
+/// per *transaction* remains — it goes when the stored format does, not before.
+///
+/// Nothing is locked while a row is staged. Two transactions can therefore each
+/// stage against the same starting image, and the second to commit would
+/// otherwise write an image with no trace of the first; [`storage::flush_locked`]
+/// is what closes that, by taking the lock at write-back and replaying the
+/// staged rows onto the current image whenever the generation has moved under
+/// it. A scan does not read staged state at all: it is written back first, by
+/// [`storage::flush_pending_for`] for a scan in this backend and by
+/// [`storage::flush_before_parallel_plan`] for one that will run in a parallel
+/// worker — a separate process, which could not see staged rows however they
+/// were handed around here.
 ///
 /// TODO: append the new node and its edges to the stored graph in place rather
 /// than rewriting the whole image.
@@ -269,34 +294,11 @@ unsafe extern "C" fn aminsert(
     let vector = f32_vec_from_datum(opclass::index_kind(index), *values);
 
     // SAFETY: `index` is the open index relation Postgres locked for this
-    // insert. An error below unwinds to abort, which releases the page lock
-    // along with every other lock the transaction holds.
-    pg_sys::LockPage(
-        index,
-        storage::IMAGE_LOCK_BLOCK,
-        pg_sys::ExclusiveLock as i32,
-    );
-
-    let (mut hnsw, mut tids) = storage::load_index(index);
-    let id = match hnsw.insert(vector) {
-        Ok(id) => id,
-        Err(e) => error!("brindle: {e}"),
-    };
-    // Ids are dense insertion order and the load checked that the graph and the
-    // table have the same length, so the new id addresses the slot being filled.
-    if id != tids.len() {
-        error!("brindle: index graph and heap-pointer table are out of step");
-    }
-    // SAFETY: `heap_tid` points at the ItemPointerData of the tuple being
-    // inserted, valid for this call.
-    tids.push(item_pointer_get_both(*heap_tid));
-
-    storage::rewrite_index_blob(index, &storage::encode_index(&hnsw, &tids));
-    pg_sys::UnlockPage(
-        index,
-        storage::IMAGE_LOCK_BLOCK,
-        pg_sys::ExclusiveLock as i32,
-    );
+    // insert, and `heap_tid` points at the ItemPointerData of the tuple being
+    // inserted, valid for this call. Staging takes no lock and writes no page;
+    // an error below unwinds to abort, which discards the staged rows along
+    // with everything else the transaction was holding.
+    storage::pending_insert(index, vector, item_pointer_get_both(*heap_tid));
     true
 }
 
@@ -586,6 +588,11 @@ mod tests {
     /// The persisted graph and heap-pointer table of an index, read back the
     /// way every future reader will read them.
     fn load_persisted(index: &str) -> (Hnsw, Vec<TidPair>) {
+        // Inserts are applied to a graph held for the transaction and written
+        // back when it ends, so reading the stored image means ending that
+        // deferral first. Doing it here puts the flush under test rather than
+        // leaving it to a commit no `#[pg_test]` ever performs.
+        storage::flush_pending();
         // SAFETY: the index exists; PgRelation holds AccessShare on it for the
         // duration of the read.
         let relation = unsafe { PgRelation::open_with_name(index) }.expect("open index");
@@ -603,6 +610,9 @@ mod tests {
     }
 
     fn index_pages(index: &str) -> i64 {
+        // As in `load_persisted`: the stored image only grows when the
+        // transaction's pending writes are flushed.
+        storage::flush_pending();
         Spi::get_one::<i64>(&format!(
             "SELECT pg_relation_size('{index}') / current_setting('block_size')::bigint"
         ))

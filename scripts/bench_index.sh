@@ -18,6 +18,8 @@
 #   K        neighbors requested per query      (default 10)
 #   PGVECTOR set to 1 to also run the matched pgvector comparison (needs the
 #            vector extension installed into the same Postgres)
+#   INSERTS  set to 1 to also measure insert cost against index size, after the
+#            query sweep — a different question, and a slow one, so it is opt-in
 #   SHAPE    set to "clustered" for 100 gaussian-ish clusters; unset means
 #            uniform random, which in high dimensions is the worst case a graph
 #            index can face and says more about the fixture than the index
@@ -81,6 +83,14 @@ EOF
   --set=queries="$QUERIES" --set=k="$K" \
   ${clustered_flag} \
   --file benches/sql/index_baseline.sql
+
+if [[ "${INSERTS:-0}" == "1" ]]; then
+  echo
+  echo "==> insert cost against index size"
+  "$bindir/psql" --host "$host" --port "$port" --dbname "$db" --quiet --no-psqlrc \
+    --set=ON_ERROR_STOP=1 --set=dims="$DIMS" \
+    --file benches/sql/insert_cost.sql
+fi
 
 if [[ "${PGVECTOR:-0}" == "1" ]]; then
   echo

@@ -70,7 +70,9 @@ pub fn init() {
          per backend rather than shared — so the server-wide cost is this times \
          the connections that touch an index. An index that does not fit is \
          decoded per scan instead of cached, and lowering the setting releases \
-         copies already held. Zero disables caching entirely.",
+         copies already held. Zero disables caching entirely — though a \
+         transaction staging inserts still holds a copy of the index it is \
+         writing to, which this does not bound.",
         &CACHE_MAX_MB,
         MIN_CACHE_MAX_MB,
         MAX_CACHE_MAX_MB,
