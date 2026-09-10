@@ -20,17 +20,18 @@ use std::ops::Bound;
 /// bytes of payload. String categories are expected to be dictionary-encoded to
 /// [`AttrValue::Int`] by the caller, so matching never touches the heap.
 ///
-/// `Float` equality and ordering follow IEEE 754: `NaN` is never equal to
-/// anything (including itself) and never orders, so a `NaN` value or bound
-/// satisfies no atom, which keeps [`Predicate::matches`] total.
+/// `Float` equality and ordering follow **PostgreSQL's** total order, not IEEE
+/// 754: `'NaN' = 'NaN'` is true and NaN sorts above every other value, so
+/// `'NaN' > 1e308` is true. `Null` is the only value that orders with nothing,
+/// so it satisfies no atom, which keeps [`Predicate::matches`] total.
 ///
-/// **This is not PostgreSQL's rule.** PostgreSQL gives floats a total order so
-/// that btree works: `'NaN' = 'NaN'` is true, and NaN sorts above every other
-/// value, so `'NaN' > 1e308` is true. A row whose stored value is NaN therefore
-/// fails an atom here that SQL would satisfy — it costs rows, never wrong ones.
-/// The index layer refuses to push a NaN *bound* for this reason; a NaN stored
-/// in a column is the remaining gap, and closing it means ordering values the
-/// way PostgreSQL does rather than the way IEEE 754 does.
+/// An earlier version followed IEEE 754 here, on the reasoning that a NaN row
+/// failing an atom "costs rows, never wrong ones". That does not survive
+/// negation: measured on 400 rows plus two storing NaN, `score >= 1` returned
+/// 398 rows by sequential scan and 396 through the index, and the `NOT EXISTS`
+/// form of the same predicate returned 4 and **6** — the dropped rows came back
+/// as invented ones. This order decides which rows an index returns, so it has
+/// to be the order SQL uses.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum AttrValue {
     /// Signed integer: ids, counts, booleans (`0`/`1`), or dictionary-encoded
@@ -44,38 +45,63 @@ pub enum AttrValue {
 }
 
 impl AttrValue {
-    /// Order two values *within the same numeric type*. Returns `None` when they
-    /// aren't order-comparable — different variants, a `Null`, or a `NaN` — which
-    /// range matching treats as "does not match".
+    /// Order two values *within the same numeric type*, the way PostgreSQL's
+    /// btree does. Returns `None` only when they aren't order-comparable at all
+    /// — different variants, or a `Null` — which range matching treats as "does
+    /// not match".
+    ///
+    /// Floats use [`pg_float_cmp`], which places `NaN` above every other value
+    /// and equal to itself. That is PostgreSQL's rule, not IEEE 754's, and it is
+    /// deliberate: this order decides which rows an index returns, and an index
+    /// whose answer differs from a sequential scan's is wrong however defensible
+    /// its arithmetic.
     #[inline]
     fn num_cmp(&self, other: &AttrValue) -> Option<Ordering> {
         match (self, other) {
             (AttrValue::Int(a), AttrValue::Int(b)) => Some(a.cmp(b)),
-            (AttrValue::Float(a), AttrValue::Float(b)) => a.partial_cmp(b),
+            (AttrValue::Float(a), AttrValue::Float(b)) => Some(pg_float_cmp(*a, *b)),
             _ => None,
         }
     }
 
-    /// Whether this value can take part in an ordered comparison at all. `Null`
-    /// (absent) and a `NaN` `Float` (indeterminate) cannot, so they satisfy no
-    /// range atom — not even one with both sides unbounded.
+    /// Whether this value can take part in an ordered comparison at all. Only
+    /// `Null` (absent) cannot, so it satisfies no range atom — not even one with
+    /// both sides unbounded. A `NaN` orders fine under PostgreSQL's rule; see
+    /// [`AttrValue::num_cmp`].
     #[inline]
     fn is_orderable(&self) -> bool {
-        match self {
-            AttrValue::Int(_) => true,
-            AttrValue::Float(f) => !f.is_nan(),
-            AttrValue::Null => false,
-        }
+        !matches!(self, AttrValue::Null)
     }
 }
 
-/// Type-strict equality with SQL/IEEE semantics: distinct variants never match,
-/// and `Null`/`NaN` never match (they fall through to `false`).
+/// Order two floats the way PostgreSQL's `float8_cmp` does: ordinary comparison
+/// where it is defined, and `NaN` above everything and equal to itself where it
+/// is not.
+///
+/// Not `f64::total_cmp`, which is the obvious-looking shortcut and is wrong
+/// here: it ranks `-0.0` below `0.0`, while SQL holds them equal. Comparing
+/// normally first gets that right and leaves only the NaN cases, which is
+/// exactly the shape of PostgreSQL's own implementation.
+#[inline]
+fn pg_float_cmp(a: f64, b: f64) -> Ordering {
+    match a.partial_cmp(&b) {
+        Some(ord) => ord,
+        // `partial_cmp` is `None` only when one side is NaN.
+        None if a.is_nan() && b.is_nan() => Ordering::Equal,
+        None if a.is_nan() => Ordering::Greater,
+        None => Ordering::Less,
+    }
+}
+
+/// Type-strict equality with PostgreSQL's semantics: distinct variants never
+/// match, `Null` never matches, and `NaN` equals itself — which `==` on `f64`
+/// does not, hence [`pg_float_cmp`] rather than `==`. Not `total_cmp` either;
+/// that one's doc says why.
 #[inline]
 fn eq_matches(value: &AttrValue, target: &AttrValue) -> bool {
     match (value, target) {
         (AttrValue::Int(a), AttrValue::Int(b)) => a == b,
-        (AttrValue::Float(a), AttrValue::Float(b)) => a == b,
+        (AttrValue::Float(a), AttrValue::Float(b)) => pg_float_cmp(*a, *b) == Ordering::Equal,
         _ => false,
     }
 }
@@ -137,8 +163,8 @@ impl Atom {
         };
         match self {
             Atom::Eq { value: target, .. } => eq_matches(value, target),
-            // A non-orderable value (`Null`/`NaN`) satisfies no range, including
-            // one with unbounded sides.
+            // A non-orderable value (`Null`) satisfies no range, including one
+            // with unbounded sides.
             Atom::Range { lo, hi, .. } => {
                 value.is_orderable() && lower_matches(value, lo) && upper_matches(value, hi)
             }
@@ -209,21 +235,56 @@ mod tests {
         assert!(!eq(0, AttrValue::Int(0)).matches(&row));
     }
 
+    /// NaN follows PostgreSQL's total order, not IEEE 754's: equal to itself,
+    /// and above every other value. Each case below is what `psql` answers for
+    /// the same comparison — the point of the rule is that those two agree, so
+    /// an index scan and a sequential scan return the same rows.
     #[test]
-    fn nan_never_matches() {
-        let row = [AttrValue::Float(f64::NAN)];
-        assert!(!eq(0, AttrValue::Float(f64::NAN)).matches(&row));
-        assert!(!eq(0, AttrValue::Float(1.0)).matches(&row));
-        // A NaN value also satisfies no range bound.
-        assert!(!range(0, Bound::Unbounded, Bound::Unbounded).matches(&row));
-        // ...and neither does a NaN *bound* against a real value.
-        let row = [AttrValue::Float(1.0)];
+    fn nan_follows_postgres_ordering() {
+        let nan = [AttrValue::Float(f64::NAN)];
+
+        // SELECT 'NaN'::float8 = 'NaN'  → true
+        assert!(eq(0, AttrValue::Float(f64::NAN)).matches(&nan));
+        // SELECT 'NaN'::float8 = 1      → false
+        assert!(!eq(0, AttrValue::Float(1.0)).matches(&nan));
+
+        // SELECT 'NaN'::float8 >= 1     → true  (NaN sorts above everything)
+        assert!(range(0, Bound::Included(AttrValue::Float(1.0)), Bound::Unbounded).matches(&nan));
+        // SELECT 'NaN'::float8 <= 1e308 → false
+        assert!(!range(
+            0,
+            Bound::Unbounded,
+            Bound::Included(AttrValue::Float(1e308))
+        )
+        .matches(&nan));
+        // An unbounded range holds every non-NULL value, NaN included.
+        assert!(range(0, Bound::Unbounded, Bound::Unbounded).matches(&nan));
+
+        // ...and a NaN *bound* is answerable too, so the index layer no longer
+        // has to refuse one: SELECT 1::float8 < 'NaN' → true.
+        let one = [AttrValue::Float(1.0)];
+        assert!(range(
+            0,
+            Bound::Unbounded,
+            Bound::Excluded(AttrValue::Float(f64::NAN))
+        )
+        .matches(&one));
+        // SELECT 1::float8 >= 'NaN' → false
         assert!(!range(
             0,
             Bound::Included(AttrValue::Float(f64::NAN)),
             Bound::Unbounded
         )
-        .matches(&row));
+        .matches(&one));
+
+        // -0.0 and 0.0 are equal in SQL, and `f64::total_cmp` — the obvious way
+        // to write this rule — says otherwise. This case is why the comparison
+        // is PostgreSQL's shape and not that one-liner.
+        let neg_zero = [AttrValue::Float(-0.0)];
+        assert!(eq(0, AttrValue::Float(0.0)).matches(&neg_zero));
+        assert!(
+            range(0, Bound::Included(AttrValue::Float(0.0)), Bound::Unbounded).matches(&neg_zero)
+        );
     }
 
     #[test]

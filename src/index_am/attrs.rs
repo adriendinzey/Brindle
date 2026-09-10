@@ -174,20 +174,6 @@ unsafe fn atom_from_key(index: pg_sys::Relation, key: &pg_sys::ScanKeyData) -> O
         key.sk_subtype
     };
     let value = value_from_datum(arg_type, key.sk_argument, false)?;
-    // A NaN bound is refused rather than pushed, because the core orders floats
-    // by IEEE 754 and PostgreSQL does not: PostgreSQL gives floats a total order
-    // so btree works, in which `'NaN' = 'NaN'` is true and NaN sorts above every
-    // other value. Pushing a NaN bound would answer a different question than
-    // the query asked; refusing it hands the whole comparison to the executor,
-    // which has the right semantics.
-    //
-    // This does not cover a NaN *stored* in the column — that still fails an
-    // ordinary `> 100`, which PostgreSQL would satisfy. Fixing that means
-    // changing how the core orders values, so it is filed rather than patched
-    // here; it costs rows, never wrong ones.
-    if matches!(value, AttrValue::Float(f) if f.is_nan()) {
-        return None;
-    }
     // Both sides must land in the same `AttrValue` variant, or the comparison is
     // not one the core can make: an `Int` never orders against a `Float`, so
     // such an atom would silently match nothing rather than fail. The operator
@@ -256,10 +242,11 @@ pub unsafe fn predicate_from_keys(
 // is required. Each is DEFAULT for its type, so `USING brindle (embedding, col)`
 // resolves without the user naming a class.
 //
-// `float4`/`float8` are here for completeness. The core orders floats by IEEE
-// 754 while PostgreSQL gives them a total order, so a stored NaN fails a
-// comparison PostgreSQL would satisfy; a NaN *bound* is refused above rather
-// than pushed. See `AttrValue`.
+// `float4`/`float8` included. The core orders floats the way PostgreSQL's btree
+// does — `'NaN' = 'NaN'` true, NaN above every other value — so a comparison on
+// a float column returns the same rows through this index as through a
+// sequential scan, whether the NaN is a stored value or the bound. See
+// `AttrValue`.
 extension_sql!(
     r#"
 CREATE OPERATOR FAMILY brindle_integer_ops USING brindle;

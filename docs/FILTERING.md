@@ -252,6 +252,12 @@ Anything the index cannot express is left to the executor rather than dropped,
 and the scan reports a recheck for it — so a refused qual costs recall, never
 correctness.
 
+Float comparisons follow PostgreSQL's total order, not IEEE 754's: `'NaN' =
+'NaN'` is true and `NaN` sorts above every other value. That matters because a
+recheck can only *remove* rows the index returned, never recover ones it never
+returned — so an index that drops rows cannot be made correct at the boundary,
+and the ordering itself has to match SQL's.
+
 ### Tier 2 — bitmap handoff
 
 For predicates Brindle doesn't store inline, accept a precomputed **`roaring`-style

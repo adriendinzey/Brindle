@@ -41,12 +41,12 @@ versions may break).
   A qual the planner never offers the index — a `<>`, an expression, an
   unsupported column type — stays with the executor as it always did. A scan key
   the index *does* receive and cannot express, such as one whose value turns out
-  to be NULL at run time or a `NaN` bound, is refused rather than dropped: the
-  scan reports a recheck and the executor re-tests every row it returns.
+  to be NULL at run time, is refused rather than dropped: the scan reports a
+  recheck and the executor re-tests every row it returns.
 
-  One known gap, in the missing-rows direction only: the index orders floats by
-  IEEE 754 while PostgreSQL gives them a total order, so a row whose stored
-  value is `NaN` fails a comparison PostgreSQL would satisfy.
+  Float comparisons follow PostgreSQL's total order, in which `'NaN' = 'NaN'` is
+  true and `NaN` sorts above every other value — so a row storing `NaN`, and a
+  `NaN` bound, return what a sequential scan returns.
 
   Because the attributes are search keys, the planner may also choose this index
   for a plain `WHERE attr = v` with no `ORDER BY` at all. That now works — it
@@ -84,6 +84,18 @@ versions may break).
 
 ### Changed
 
+- **Fixed: a float comparison could return the wrong rows.** The index ordered
+  floats by IEEE 754, where `NaN` compares with nothing, while PostgreSQL gives
+  floats a total order in which `'NaN' = 'NaN'` holds and `NaN` sorts above
+  everything. A row storing `NaN` was therefore dropped from a comparison SQL
+  would satisfy: on 400 rows plus two storing `NaN`, `WHERE score >= 1` returned
+  398 rows by sequential scan and 396 through the index.
+
+  This was documented as costing rows and never wrong ones, which does not
+  survive negation — under `NOT EXISTS` the dropped rows came back as *extra*
+  ones, 4 by sequential scan against 6 through the index. Float comparisons now
+  follow PostgreSQL's rule, so both agree. A `NaN` bound is no longer refused at
+  the boundary either, since it is now answerable.
 - **A filter that correlates with vector position is now answered.** When the
   matching rows sit *away* from the query — a tenant whose documents cluster, a
   price band, a date range — the search previously could not reach them at all:
