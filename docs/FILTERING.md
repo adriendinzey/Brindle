@@ -93,8 +93,97 @@ node would let one unit of allowance queue an entire neighbor list, each member 
 which then pays a two-hop scan of its own when popped: work quadratic in the
 degree, and so worst on exactly the γ-dense graphs the feature is built around.
 With the per-node charge, an unsatisfiable predicate over a 20 000-node graph
-costs ~0.9 ms and ~36 k predicate evaluations per query, and that bill is flat in
-the size of the graph.
+costs ~530 expansions and ~610 vector distances per query, and that bill is flat
+in the size of the graph.
+
+### (c) a predicate-aware descent, so the search starts somewhere useful
+
+(a) and (b) both work *locally*: they keep the matching subgraph connected around
+wherever the search already is. Neither answers the prior question of **where to
+start**, and that is a separate failure with a much sharper edge.
+
+The layer descent picks an entry point near the *query*. When the predicate
+correlates with position — a tenant whose documents cluster, a price band, a
+date range — the matching rows are not near the query at all, and layer 0 cannot
+get to them: one hop there covers one node's spacing, so crossing a region of
+*n* non-matching nodes costs an allowance proportional to *n*. Measured on a
+10 000-node grid whose filter selects columns 46 apart, this returned **zero
+rows** — not degraded recall, none — at every `ef_search` below 5000, while an
+uncorrelated filter of the same 5% selectivity was answered essentially
+perfectly. Raising γ does not help: γ = 1, 4 and 16 all returned nothing.
+Densifying edges reconnects a *thinned* neighborhood; it does not move the
+search somewhere else.
+
+The upper layers are the answer, because they are built for exactly this — each
+one is sparser, so a hop there covers far more ground. So the descent does two
+things per layer instead of one:
+
+```
+nav  = search_layer(query, [nav], ef=1, layer=lc)              # unfiltered, as before
+seed = search_layer(query, [nav, seed], ef=1, layer=lc, pred)  # nearest match on this layer
+```
+
+Navigation is untouched: the nearest node to the query does not depend on the
+filter, and filtering that walk would move where an unfiltered search lands. The
+second call is the new one — a predicate-aware probe, seeded from where
+navigation just arrived *and* from what the layer above found, which hands one
+foothold in the matching set down to the next layer. Layer 0 is then entered
+from both: the usual entry point, and a node that actually matches. It starts
+inside the matching region instead of tens of hops from it.
+
+One foothold per layer is enough; carrying 2, 4 or 8 down measured no better,
+because what the probe has to get right is *which region*, and the layer below
+re-probes from wherever it lands.
+
+### What bounds all this
+
+A filtered search may walk through nodes it can never return, so the result heap
+cannot be what stops it — under a selective predicate that heap is exactly what
+stays empty. Two allowances do, both totals for the whole search (a per-layer
+allowance would multiply by a layer count that grows with the graph) and both
+sized from `ef_search`, but as separate multiples of it: the width of the result
+beam and the distance a search must cover to *find* results answer different
+questions, and tying them together is what made a matching region a few dozen
+hops away unreachable at any sane `ef_search`.
+
+| Allowance | Default | Scope | What it bounds |
+|---|---|---|---|
+| detours | `4 × ef_search` non-matching nodes enqueued | one for the descent, one for layer 0 | the walk through a region with no matches within two hops |
+| expansions | `16 × ef_search` nodes popped and expanded | the whole search | the search as a whole, whatever the predicate does |
+
+The detour allowance is *per phase* rather than per search, because the descent
+probe and the layer-0 walk spend it on different jobs — finding a region that
+matches, then searching inside it — and the probe's job is the one with no
+natural limit, since a probe that finds nothing keeps looking. Sharing one pot
+lets the probe arrive at layer 0 with nothing left, which is exactly the query
+that most needs a fallback there: measured on a 100 000-node graph with 18
+matching rows, one pot returned no rows at all where two return some. It is the
+split that matters, not the total; both halves stay fixed multiples of
+`ef_search`, so the bill is still flat in the size of the graph.
+
+The second exists because the first cannot bound everything. A node that
+*matches* but is tombstoned never triggers a detour — it satisfies the predicate
+— yet it can never fill the result heap either, and a filtered search
+deliberately keeps going while that heap is under-filled. With every match
+deleted, nothing about the predicate ends the walk: measured, the search expanded
+206 nodes at n = 2000 and 2007 at n = 20 000, i.e. Θ(*n*). The expansion
+allowance holds it to 235 and 1036 — the second being the ceiling itself.
+
+The *unfiltered* path has the same shape of hole and still has it: with every row
+tombstoned it expands 2143 nodes at n = 2000 and 21 329 at n = 20 000. Bounding
+that means changing where an unfiltered search stops, which is a decision about
+plain HNSW recall rather than about filtering, so it is left alone here — the
+allowances above are drawn on by the filtered path only, and an unfiltered search
+is unchanged in results and in cost.
+
+The detour default is 4× rather than 1× because it is measurably free where it
+is not needed. On the correlated fixture it lifts recall@10 from 0.93 to 1.00 at
+5% selectivity and from 0.67 to 0.90 at 1%; on an *uncorrelated* filter recall
+and cost are identical at 1× and 4×, to the distance, because a detour is only
+ever charged where two hops turn up no match at all, which there is almost
+nowhere. What it does cost is ~3× on a predicate nothing satisfies — 144
+expansions per query at 1×, 528 at 4× — a bill that stays flat in the size of
+the graph.
 
 ## 3. How predicates reach the index
 
@@ -173,6 +262,10 @@ Being explicit about this boundary is part of the project's credibility.
 | `ef_construction` | build | candidate pool at build | build quality vs time |
 | `gamma` (γ) | build | edge density multiplier for filter-robustness | filter recall vs memory/build |
 | `brindle.ef_search` | query GUC | candidate pool at search | recall vs latency |
+
+`ef_search` is the only query-time knob: the filtered path's two allowances are
+fixed multiples of it (§2, "What bounds all this") rather than settings of their
+own, so raising it widens the beam and the reach together.
 
 ## 5. How we'll prove it works
 
