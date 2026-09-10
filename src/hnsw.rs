@@ -217,6 +217,14 @@ struct Traversal {
     /// while that heap is under-filled. A graph whose every match is deleted
     /// would therefore be walked end to end. This is the bound that holds
     /// whatever the predicate does.
+    ///
+    /// It bounds the predicate-aware layer searches, which is not the whole of a
+    /// query: the descent's navigation half runs unfiltered and is left exactly
+    /// as it was, and an unfiltered layer search has this same missing stop
+    /// condition when nothing is admissible. That is unreachable while any live
+    /// row exists — navigation admits every live node whatever the predicate
+    /// says — and shows up only with the whole table tombstoned, where plain
+    /// unfiltered search has always had it too.
     expansions: usize,
     cost: SearchCost,
 }
@@ -3278,6 +3286,13 @@ mod tests {
         // deleted, nothing about the predicate bounds the walk, and the search
         // used to expand the graph end to end: 206 nodes at n = 2000 but 2007 at
         // n = 20 000, i.e. Θ(n), and 156 ms at n = 100k.
+        //
+        // Only the matching rows are deleted here, which is the case the
+        // allowance actually bounds. Tombstone the *whole* table and the
+        // descent's unfiltered navigation has nothing admissible either, so it
+        // sweeps as a plain unfiltered search always has: 363 expansions at
+        // n = 2000 and 2353 at n = 20 000, against a 1024 allowance. Bounding
+        // that means changing where an unfiltered search stops.
         let pred = selectivity(10);
         let mut costs = Vec::new();
         for n in [2000usize, 20_000] {
@@ -3300,6 +3315,12 @@ mod tests {
         }
         // The expansion allowance is 16x ef, so a tenfold graph may cost at most
         // the slack between the small case and that ceiling — never tenfold.
+        //
+        // The extra ef is what the descent's *navigation* spends: it runs
+        // unfiltered and so draws on no allowance. It stays small here because
+        // only the matching rows are deleted, leaving navigation plenty that is
+        // admissible; tombstone the whole table and that term is unbounded, as
+        // it is for a plain unfiltered search. Observed 1036 of 1088.
         let ceiling = 16 * 64 + 64;
         assert!(
             costs[1] <= ceiling,

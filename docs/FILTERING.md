@@ -139,17 +139,17 @@ re-probes from wherever it lands.
 
 A filtered search may walk through nodes it can never return, so the result heap
 cannot be what stops it — under a selective predicate that heap is exactly what
-stays empty. Two allowances do, both totals for the whole search (a per-layer
-allowance would multiply by a layer count that grows with the graph) and both
-sized from `ef_search`, but as separate multiples of it: the width of the result
-beam and the distance a search must cover to *find* results answer different
-questions, and tying them together is what made a matching region a few dozen
-hops away unreachable at any sane `ef_search`.
+stays empty. Two allowances do. Neither is *per layer*, since a per-layer
+allowance would multiply by a layer count that grows with the graph; both are
+sized from `ef_search`, but as separate multiples of it, because the width of the
+result beam and the distance a search must cover to *find* results answer
+different questions — tying them together is what made a matching region a few
+dozen hops away unreachable at any sane `ef_search`.
 
 | Allowance | Default | Scope | What it bounds |
 |---|---|---|---|
-| detours | `4 × ef_search` non-matching nodes enqueued | one for the descent, one for layer 0 | the walk through a region with no matches within two hops |
-| expansions | `16 × ef_search` nodes popped and expanded | the whole search | the search as a whole, whatever the predicate does |
+| detours | `4 × ef_search` non-matching nodes enqueued | one for the descent probe, one for layer 0 | the walk through a region with no matches within two hops |
+| expansions | `16 × ef_search` nodes popped and expanded | every predicate-aware layer search, together | the filtered walk, whatever the predicate does |
 
 The detour allowance is *per phase* rather than per search, because the descent
 probe and the layer-0 walk spend it on different jobs — finding a region that
@@ -169,12 +169,24 @@ deleted, nothing about the predicate ends the walk: measured, the search expande
 206 nodes at n = 2000 and 2007 at n = 20 000, i.e. Θ(*n*). The expansion
 allowance holds it to 235 and 1036 — the second being the ceiling itself.
 
-The *unfiltered* path has the same shape of hole and still has it: with every row
-tombstoned it expands 2143 nodes at n = 2000 and 21 329 at n = 20 000. Bounding
-that means changing where an unfiltered search stops, which is a decision about
-plain HNSW recall rather than about filtering, so it is left alone here — the
-allowances above are drawn on by the filtered path only, and an unfiltered search
-is unchanged in results and in cost.
+**What it does not bound, and the honest limit of the claim.** Only the
+predicate-aware layer searches draw on it. The descent's *navigation* half runs
+unfiltered — deliberately, so that where an unfiltered search lands does not
+change — and an unfiltered layer search has the same missing stop condition:
+nothing is admissible, so the farthest-result cutoff is never armed and it sweeps
+the layer. That is invisible while any live row exists, because navigation admits
+every live node whatever the predicate says. It shows up when *every* row is
+tombstoned, not merely every matching one: measured on the same fixture, a
+filtered search then expands 363 nodes at n = 2000 and 2353 at n = 20 000, of
+which the allowance accounts for 1024 and the unbounded navigation for the rest.
+
+So the ceiling above bounds the filtered walk, not the whole query. A plain
+unfiltered search has the same hole and always did — with every row tombstoned it
+expands 2143 nodes at n = 2000 and 21 329 at n = 20 000. Closing it means
+changing where an unfiltered search stops, which is a decision about plain HNSW
+recall rather than about filtering, so it is left alone here: the allowances are
+drawn on by the filtered path only, and an unfiltered search is unchanged in
+results and in cost.
 
 The detour default is 4× rather than 1× because it is measurably free where it
 is not needed. On the correlated fixture it lifts recall@10 from 0.93 to 1.00 at

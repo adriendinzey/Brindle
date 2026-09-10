@@ -102,15 +102,21 @@ versions may break).
   Uncorrelated filters — the case that already worked — are unchanged in recall
   and cost roughly 10% more per query in vector distances. See
   `docs/FILTERING.md` § 2(c).
-- **A filtered search now has a cost ceiling that does not grow with the index.**
+- **The filtered walk now has a cost ceiling that does not grow with the index.**
   A tombstoned row still satisfies a predicate, so a graph whose matching rows
   have all been deleted gave the traversal nothing to stop on and it walked the
   whole index — 156 ms at 100 000 rows. Filtered traversal is now bounded by a
   total expansion allowance (16 × `ef_search`) as well as by the existing detour
   allowance, which holds that case flat: measured 206 → 2007 node expansions
   from n = 2000 to n = 20 000 before, and 235 → 1036 (the ceiling) after.
-  Unfiltered search has the same hole and still has it — bounding that is a
-  decision about plain HNSW recall, not about filtering.
+
+  The ceiling covers the predicate-aware part of a query and not the whole of it.
+  Unfiltered search has the same missing stop condition and still has it, and a
+  filtered query's layer descent navigates unfiltered — so a table with *every*
+  row tombstoned, rather than merely every matching one, still costs work
+  proportional to the index (2353 node expansions at n = 20 000 against a 1024
+  allowance). Closing that is a decision about plain HNSW recall rather than
+  about filtering.
 - **A transaction's inserts are written back to the index once, when it ends,
   rather than once per row.** Every write rewrites the whole stored image, so
   doing that per row made a bulk load quadratic in the table; `INSERT ... SELECT`
