@@ -144,54 +144,64 @@ recovered from the catalogs alone.
 
 ### On storage (the honest tradeoff)
 
-pgvector stores its HNSW graph in Postgres buffer pages, so it is crash-safe,
-WAL-logged, and replication-safe. That is the "correct" design and the eventual
-target (Phase 3+). Early phases keep the graph **in memory and rebuild it on
-load**, because graph algorithms + filtering are the differentiating work and the
-buffer-manager integration is largely orthogonal systems plumbing. The roadmap
-calls this out explicitly so the tradeoff is never hidden.
+pgvector stores its HNSW graph in Postgres buffer pages, so a write touches only
+the pages it changes. Brindle's index lives in the same relation's pages and its
+writes *are* WAL-logged — it is crash-safe and reaches replicas — but as
+whole-fork page images rather than per-page records, so **WAL volume is O(index)
+per write-back** and a scan rebuilds the whole graph in memory before it can walk
+it. That is the interim shape, kept deliberately: graph algorithms and filtering
+are the differentiating work, and buffer-manager integration is largely
+orthogonal systems plumbing. The roadmap calls it out so the tradeoff is never
+hidden.
 
 The page layout that replaces the interim blob — metapage, element tuples,
 neighbor chunks, and the locking and WAL plan around them — is specified in
 [STORAGE.md](STORAGE.md). What the interim blob costs is measured in
-[BENCHMARKS.md](BENCHMARKS.md): 59–61 ms of every query, against at most a few
-milliseconds of actual search.
+[BENCHMARKS.md](BENCHMARKS.md). It used to be 59–61 ms of *every* query; a
+per-backend cache of the decoded graph moved it off the warm path, so a scan now
+costs 0.34 ms once its backend has a copy and 57.9 ms when it does not. The cost
+did not go away — it is paid per backend instead of per query, and bought with a
+private ~89 MB copy of the index.
 
-## 5. Module map (target)
+## 5. Module map
+
+As built. The pure core is the top level; `index_am/` is the Postgres boundary.
 
 ```
 src/
   lib.rs            # pg_module_magic, extension entry, #[pg_extern] surface
-  distance.rs       # pure distance kernels + unit tests          [Phase 0 ✓]
-  vector.rs         # metric selection / validation over slices          [Phase 1]
-  pg_vector.rs      # the brindle_vector type: layout, I/O, operators     [Phase 1]
-  hnsw/
-    mod.rs          # graph types, params (M, ef_construction)     [Phase 1]
-    build.rs        # incremental insert, layer assignment         [Phase 1]
-    search.rs       # greedy search, candidate heap                [Phase 1]
-    acorn.rs        # γ-dense edges + predicate-aware traversal     [Phase 2]
-  filter.rs         # predicate model: labels, ranges, bitmaps     [Phase 2]
+  distance.rs       # pure distance kernels + unit tests
+  vector.rs         # metric selection / validation over slices
+  pg_vector.rs      # the brindle_vector type: layout, I/O, operators
+  hnsw.rs           # graph, build, layered search, γ-dense edges,
+                    #   predicate-aware traversal, codec
+  filter.rs         # predicate model: equality + numeric ranges, AND
+  fusion.rs         # RRF over ranked lists
+  guc.rs            # session GUCs: brindle.ef_search, brindle.cache_max_mb
   index_am/
-    mod.rs          # IndexAmRoutine wiring                        [Phase 1]
-    opclass.rs      # operator classes: metric + indexed type      [Phase 1]
-    options.rs      # per-index WITH (m, ef_construction, gamma)   [Phase 1]
-    scan.rs         # ambeginscan/amgettuple/amrescan              [Phase 1]
-  hybrid.rs         # RRF fusion over vector + tsvector ranks      [Phase 4]
-  quantize.rs       # scalar/binary quantization                  [Phase 5]
-  guc.rs            # session GUCs: brindle.ef_search, ...         [Phase 1]
-benches/            # criterion micro-benchmarks
-bench/              # ann-benchmarks-style recall@k vs QPS harness [Phase 5]
+    mod.rs          # IndexAmRoutine wiring, ambuild, aminsert, vacuum
+    opclass.rs      # operator classes: metric + indexed type
+    options.rs      # per-index WITH (m, ef_construction, gamma)
+    scan.rs         # ambeginscan/amgettuple/amrescan/amendscan
+    attrs.rs        # scan keys → predicate atoms; inline attribute rows
+    storage.rs      # the stored index image, paging, and the backend cache
+benches/            # criterion micro-benchmarks (distance, graph decode)
 ```
 
-## 6. Public SQL surface (target)
+Not built, and where they will go when they are: `quantize.rs` (RaBitQ, Phase 5)
+and the hybrid SQL surface that `fusion.rs` feeds (Phase 4). `hnsw.rs` is one
+module rather than the `hnsw/` package this section used to predict — splitting
+it is worth doing when it stops being navigable, not before.
+
+## 6. Public SQL surface
 
 ```sql
--- Phase 0 (works today): distance functions over real[]
+-- Works today: distance functions over real[]
 brindle_l2_distance(a real[], b real[])      -> real
 brindle_cosine_distance(a real[], b real[])  -> real
 brindle_inner_product(a real[], b real[])    -> real
 
--- Phase 1 (works today): the vector type, its operators, and an index whose
+-- Works today: the vector type, its operators, and an index whose
 -- operator class picks the metric. Operator spelling is pgvector's:
 -- `<->` L2, `<#>` (negative) inner product, `<=>` cosine.
 CREATE TABLE docs (id int, embedding brindle_vector);
@@ -199,17 +209,30 @@ INSERT INTO docs VALUES (1, '[0.1,0.2,0.3]');   -- or ARRAY[...]::real[]
 CREATE INDEX ON docs USING brindle (embedding brindle_vector_cosine_ops);
 SELECT id FROM docs ORDER BY embedding <=> $1 LIMIT 10;
 
--- Phase 1 (remaining): build/query knobs
+-- Works today: build/query knobs
 CREATE INDEX ON docs USING brindle (embedding brindle_vector_cosine_ops)
-  WITH (m = 16, ef_construction = 64);
+  WITH (m = 16, ef_construction = 64, gamma = 1.0);
 SET brindle.ef_search = 64;
 
--- Phase 2: filter-aware (predicate pushed into traversal)
-SELECT id FROM docs
-WHERE tenant_id = 42 AND status = 'active'
+-- Works today: filter-aware, with the predicate pushed into the traversal.
+-- The filterable columns are key columns *after* the vector -- not INCLUDE, see
+-- FILTERING.md § 3 -- and carry a numeric or boolean type. A text label needs
+-- the dictionary encoding that is not built yet, and is refused at CREATE INDEX
+-- rather than silently ignored.
+--
+-- Note the operator class travels with the vector column and fixes the metric
+-- for the whole index: this one is cosine, so the ORDER BY must use `<=>`.
+CREATE TABLE listings (
+    id int, tenant_id int, price float8, embedding brindle_vector
+);
+CREATE INDEX ON listings
+    USING brindle (embedding brindle_vector_cosine_ops, tenant_id, price);
+SELECT id FROM listings
+WHERE tenant_id = 42 AND price < 50
 ORDER BY embedding <=> $1 LIMIT 10;
 
--- Phase 4: hybrid
+-- Not built: hybrid. `fusion.rs` implements the RRF half; this surface does not
+-- exist yet.
 SELECT * FROM brindle_hybrid(
   query_text => 'wireless headphones',
   query_vec  => $1,
