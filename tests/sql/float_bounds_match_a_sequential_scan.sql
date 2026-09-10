@@ -100,7 +100,9 @@ BEGIN
 
     SET LOCAL enable_seqscan = off;
     SET LOCAL enable_indexscan = on;
-    SET LOCAL brindle.ef_search = 2000;
+    -- No ef_search here on purpose: an ORDER BY-less scan takes the keyless
+    -- path, which enumerates every matching node and has no budget to run out
+    -- of. Setting one would imply a truncation risk this path does not have.
     SELECT count(*) INTO anti_idx FROM fz a
      WHERE NOT EXISTS (SELECT 1 FROM fz b WHERE b.id = a.id AND b.score >= 1);
 
@@ -115,61 +117,99 @@ END $$;
 -- A NaN *bound* is answerable now too, and used to be refused at the boundary.
 -- `score < 'NaN'` selects every non-NaN row; `score >= 'NaN'` selects the NaN
 -- rows alone.
+--
+-- These, and everything below, go through the **keyless** path -- a count with no
+-- ORDER BY, which enumerates every matching node instead of walking the graph.
+-- That is deliberate. `score >= 'NaN'` matches 2 rows of 402, and an ordered ANN
+-- scan asked for 2 needles among 402 nodes is measuring *recall*, not the
+-- comparison: whether it finds them depends on where they sit relative to the
+-- query, so the case would pass or fail on the fixture's geometry. An earlier
+-- draft of this file did exactly that and passed only because both NaN rows
+-- happened to be the two nearest the query point. The keyless path has no such
+-- variable, which is what makes it the honest place to pin semantics.
 DO $$
-DECLARE seq_lt bigint; idx_lt bigint; seq_ge bigint; idx_ge bigint;
+DECLARE
+    shape text; shapes text[] := ARRAY[
+        'score < ''NaN''::float8', 'score >= ''NaN''::float8', 'score = ''NaN''::float8'
+    ];
+    line text; plan text; via_index bigint; via_heap bigint;
 BEGIN
-    SET LOCAL enable_indexscan = off;
-    SET LOCAL enable_seqscan = on;
-    SELECT count(*) INTO seq_lt FROM fz WHERE score < 'NaN'::float8;
-    SELECT count(*) INTO seq_ge FROM fz WHERE score >= 'NaN'::float8;
+    FOREACH shape IN ARRAY shapes LOOP
+        SET LOCAL enable_seqscan = off;
+        SET LOCAL enable_indexscan = on;
 
-    SET LOCAL enable_seqscan = off;
-    SET LOCAL enable_indexscan = on;
-    SET LOCAL brindle.ef_search = 2000;
-    SELECT count(*) INTO idx_lt FROM (
-        SELECT id FROM fz WHERE score < 'NaN'::float8
-        ORDER BY embedding <-> ARRAY[10.0, 11.0]::real[] LIMIT 500) s;
-    SELECT count(*) INTO idx_ge FROM (
-        SELECT id FROM fz WHERE score >= 'NaN'::float8
-        ORDER BY embedding <-> ARRAY[10.0, 11.0]::real[] LIMIT 500) s;
+        plan := '';
+        FOR line IN EXECUTE 'EXPLAIN SELECT count(*) FROM fz WHERE ' || shape LOOP
+            plan := plan || line || E'\n';
+        END LOOP;
+        IF plan NOT LIKE '%Index Cond%' THEN
+            RAISE EXCEPTION
+                'the qual `%` did not reach the index, so comparing it against a '
+                'heap scan proves nothing:%', shape, E'\n' || plan;
+        END IF;
+        EXECUTE 'SELECT count(*) FROM fz WHERE ' || shape INTO via_index;
 
-    IF idx_lt <> seq_lt OR idx_ge <> seq_ge THEN
-        RAISE EXCEPTION
-            'NaN bound disagrees: `< NaN` index % vs seq %, `>= NaN` index % vs seq %',
-            idx_lt, seq_lt, idx_ge, seq_ge;
-    END IF;
+        SET LOCAL enable_indexscan = off;
+        SET LOCAL enable_seqscan = on;
+        EXECUTE 'SELECT count(*) FROM fz WHERE ' || shape INTO via_heap;
+
+        IF via_index <> via_heap THEN
+            RAISE EXCEPTION
+                'the qual `%` returns % rows through the index against % from a '
+                'heap scan', shape, via_index, via_heap;
+        END IF;
+    END LOOP;
 END $$;
 
 -- -0.0 = 0.0 in SQL. `f64::total_cmp` is the obvious way to write "NaN sorts
 -- above everything" and gets this wrong, so the case is here to keep anyone
 -- (including a future simplification) from reaching for it.
-CREATE TABLE zed (id int, score float8, embedding real[]);
+--
+-- float4 as well as float8: PostgreSQL compares them with a different function
+-- (`float4_cmp`), the datum is widened before it reaches the core, and the
+-- operator family declares cross-type members -- so `float4_col = 0.0`, where
+-- the literal resolves to float8, exercises a path float8 alone does not.
+CREATE TABLE zed (id int, s8 float8, s4 float4, embedding real[]);
 ALTER TABLE zed SET (autovacuum_enabled = off);
 INSERT INTO zed VALUES
-    (1, -0.0::float8, ARRAY[1.0, 1.0]::real[]),
-    (2,  0.0::float8, ARRAY[2.0, 2.0]::real[]),
-    (3,  1.0::float8, ARRAY[3.0, 3.0]::real[]);
+    (1, -0.0::float8, -0.0::float4, ARRAY[1.0, 1.0]::real[]),
+    (2,  0.0::float8,  0.0::float4, ARRAY[2.0, 2.0]::real[]),
+    (3,  1.0::float8,  1.0::float4, ARRAY[3.0, 3.0]::real[]);
 INSERT INTO zed
-SELECT i, (i % 7)::float8, ARRAY[i::real, i::real] FROM generate_series(10, 300) i;
-CREATE INDEX zed_idx ON zed USING brindle (embedding, score);
+SELECT i, (i % 7)::float8, (i % 7)::float4, ARRAY[i::real, i::real]
+FROM generate_series(10, 300) i;
+CREATE INDEX zed_idx ON zed USING brindle (embedding, s8, s4);
 
 DO $$
-DECLARE seq_eq bigint; idx_eq bigint;
+DECLARE
+    shape text; shapes text[] := ARRAY[
+        's8 = 0.0', 's8 >= 0.0', 's4 = 0.0', 's4 >= 0.0',
+        's4 = 0.0::float4', 's4 >= 1::float8'
+    ];
+    line text; plan text; via_index bigint; via_heap bigint;
 BEGIN
-    SET LOCAL enable_indexscan = off;
-    SET LOCAL enable_seqscan = on;
-    SELECT count(*) INTO seq_eq FROM zed WHERE score = 0.0;
+    FOREACH shape IN ARRAY shapes LOOP
+        SET LOCAL enable_seqscan = off;
+        SET LOCAL enable_indexscan = on;
 
-    SET LOCAL enable_seqscan = off;
-    SET LOCAL enable_indexscan = on;
-    SET LOCAL brindle.ef_search = 2000;
-    SELECT count(*) INTO idx_eq FROM (
-        SELECT id FROM zed WHERE score = 0.0
-        ORDER BY embedding <-> ARRAY[1.0, 1.0]::real[] LIMIT 500) s;
+        plan := '';
+        FOR line IN EXECUTE 'EXPLAIN SELECT count(*) FROM zed WHERE ' || shape LOOP
+            plan := plan || line || E'\n';
+        END LOOP;
+        IF plan NOT LIKE '%Index Cond%' THEN
+            RAISE EXCEPTION
+                'the qual `%` did not reach the index:%', shape, E'\n' || plan;
+        END IF;
+        EXECUTE 'SELECT count(*) FROM zed WHERE ' || shape INTO via_index;
 
-    IF idx_eq <> seq_eq THEN
-        RAISE EXCEPTION
-            '`score = 0.0` returned % rows through the index and % by sequential '
-            'scan -- -0.0 and 0.0 are equal in SQL', idx_eq, seq_eq;
-    END IF;
+        SET LOCAL enable_indexscan = off;
+        SET LOCAL enable_seqscan = on;
+        EXECUTE 'SELECT count(*) FROM zed WHERE ' || shape INTO via_heap;
+
+        IF via_index <> via_heap THEN
+            RAISE EXCEPTION
+                '`%` returns % rows through the index against % from a heap scan',
+                shape, via_index, via_heap;
+        END IF;
+    END LOOP;
 END $$;

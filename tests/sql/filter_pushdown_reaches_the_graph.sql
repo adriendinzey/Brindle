@@ -253,14 +253,17 @@ BEGIN
     END LOOP;
 END $$;
 
--- A NaN bound must not be pushed. The core orders floats by IEEE 754, where NaN
--- compares equal to nothing; PostgreSQL gives floats a total order in which
--- `'NaN' = 'NaN'` is true and NaN sorts above everything. Pushing such a bound
--- would answer a different question than the query asked, so the scan refuses it
--- and the executor -- which has the right semantics -- decides.
+-- A NaN bound must answer what PostgreSQL answers. The core orders floats the
+-- way PostgreSQL's btree does -- `'NaN' = 'NaN'` true, NaN above every other
+-- value -- so such a bound is pushed and evaluated in the index rather than
+-- refused at the boundary.
 --
--- The rows a *stored* NaN would add are a separate, filed gap; this asserts only
--- the query-side half, by comparing against a heap scan rather than a constant.
+-- It used to be refused, because the core followed IEEE 754 instead and pushing
+-- the bound would have answered a different question than the query asked. Both
+-- halves of that -- the refused bound and the stored NaN it did not cover -- are
+-- gone; see `float_bounds_match_a_sequential_scan.sql`, which owns the rule now.
+-- This case keeps asserting the property either mechanism has to deliver: the
+-- index agrees with a heap scan, compared against that rather than a constant.
 CREATE TABLE nan_t (id int, f8 float8, embedding real[]);
 ALTER TABLE nan_t SET (autovacuum_enabled = off);
 INSERT INTO nan_t
@@ -297,8 +300,8 @@ BEGIN
         IF via_index <> via_heap THEN
             RAISE EXCEPTION
                 'the qual `%` returns % rows through the index against % from a '
-                'heap scan -- a NaN bound was pushed with IEEE semantics instead '
-                'of being refused', shape, via_index, via_heap;
+                'heap scan -- the index does not order floats the way PostgreSQL '
+                'does', shape, via_index, via_heap;
         END IF;
     END LOOP;
 END $$;
