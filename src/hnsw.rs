@@ -172,6 +172,120 @@ impl PartialOrd for Cand {
     }
 }
 
+/// What one search spent.
+///
+/// Search under a predicate is bounded deliberately — it may walk through nodes
+/// it can never return, and something has to stop that — so the bounds are part
+/// of the contract, not an implementation detail. These are the counters they
+/// are stated in, so a test can assert the cost of a query and not only its
+/// answer.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct SearchCost {
+    /// Vector distances computed: the dominant per-node cost, and the one that
+    /// scales with dimensionality.
+    pub distances: usize,
+    /// Nodes popped from a frontier and expanded.
+    pub expansions: usize,
+    /// Non-matching nodes enqueued purely to route through them.
+    pub detours: usize,
+}
+
+/// The budgets one filtered search threads through its layers, and what it has
+/// spent so far.
+///
+/// The expansion allowance is a total for the whole search, and the detour
+/// allowance is one per phase — the descent gets one, the bottom layer another
+/// (see [`Traversal::refill_detours`]). Neither is *per layer*: a per-layer
+/// allowance would multiply by a layer count that grows with the graph. Both are
+/// sized from the caller's `ef_search`, so one knob still governs the
+/// recall/latency trade — but as separate multiples of it, because the width of
+/// the result beam and the distance a search must cover to *find* results
+/// answer different questions.
+/// Tying them together is what left a matching region a few dozen hops away
+/// unreachable at any sane `ef_search`.
+struct Traversal {
+    /// Remaining allowance for enqueueing non-matching nodes when a filtered
+    /// expansion turns up no matching neighbor at all. Bounds the fallback, so
+    /// a predicate nothing satisfies finishes promptly instead of sweeping the
+    /// graph.
+    detours: usize,
+    /// Remaining allowance for expanding nodes on the filtered path.
+    ///
+    /// The detour allowance alone does not bound the search: a node that
+    /// *matches* but is tombstoned never triggers a detour, yet can never fill
+    /// the result heap either, and a filtered search deliberately keeps going
+    /// while that heap is under-filled. A graph whose every match is deleted
+    /// would therefore be walked end to end. This is the bound that holds
+    /// whatever the predicate does.
+    ///
+    /// It bounds the predicate-aware layer searches, which is not the whole of a
+    /// query: the descent's navigation half runs unfiltered and is left exactly
+    /// as it was, and an unfiltered layer search has this same missing stop
+    /// condition when nothing is admissible. That is unreachable while any live
+    /// row exists — navigation admits every live node whatever the predicate
+    /// says — and shows up only with the whole table tombstoned, where plain
+    /// unfiltered search has always had it too.
+    expansions: usize,
+    cost: SearchCost,
+}
+
+impl Traversal {
+    /// Detour allowance, as a multiple of `ef`.
+    ///
+    /// Measured on a 10 000-node graph whose filter selects regions the query
+    /// is not in: 1× answers recall@10 of 0.93 at 5% selectivity and 0.67 at
+    /// 1%, 4× answers 1.00 and 0.90. It buys that for nothing on an
+    /// uncorrelated filter — recall and cost there are identical at 1× and 4×,
+    /// to the distance — because a detour is only ever charged where two hops
+    /// turn up no match at all, which there is almost nowhere. What it does
+    /// cost is ~3× on a predicate nothing satisfies (144 expansions per query
+    /// at 1×, 528 at 4×), a bill that stays flat in the size of the graph
+    /// either way.
+    const DETOURS_PER_EF: usize = 4;
+
+    /// Expansion allowance, as a multiple of `ef`.
+    ///
+    /// Loose enough to be slack in every case measured — a correlated 5% filter
+    /// expands ~335 nodes at the default `ef`, an uncorrelated one ~80 — and
+    /// tight enough to hold the one case the detour allowance cannot bound.
+    const EXPANSIONS_PER_EF: usize = 16;
+
+    fn for_ef(ef: usize) -> Self {
+        Self {
+            detours: ef.saturating_mul(Self::DETOURS_PER_EF),
+            expansions: ef.saturating_mul(Self::EXPANSIONS_PER_EF),
+            cost: SearchCost::default(),
+        }
+    }
+
+    /// State for a search that never filters: it draws on no allowance, so it
+    /// is given none.
+    fn unfiltered() -> Self {
+        Self {
+            detours: 0,
+            expansions: 0,
+            cost: SearchCost::default(),
+        }
+    }
+
+    /// Hand the bottom layer its own detour allowance, independent of whatever
+    /// the descent spent.
+    ///
+    /// The two spend detours on different jobs — finding a region that matches,
+    /// then searching inside it — and the descent's job is the one with no
+    /// natural limit, since a probe that finds nothing keeps looking. Sharing
+    /// one pot lets it arrive at layer 0 empty, which is exactly the query that
+    /// most needs a fallback there: measured on a 100 000-node graph with 18
+    /// matching rows, one pot returned no rows at all where two return some.
+    ///
+    /// Two allowances of the same size rather than one larger one, because it
+    /// is the *split* that matters, not the total — and the total stays two
+    /// fixed multiples of `ef`, so it is still flat in the size of the graph.
+    fn refill_detours(&mut self, ef: usize) {
+        self.detours = ef.saturating_mul(Self::DETOURS_PER_EF);
+    }
+}
+
 /// The mutable state of one layer's beam search: every node already considered,
 /// the frontier still to expand (nearest first), and the result set (farthest
 /// first, capped at `ef`).
@@ -179,26 +293,25 @@ impl PartialOrd for Cand {
 /// Frontier membership and result membership are deliberately separate: a
 /// tombstoned or non-matching node may route the search without ever being
 /// eligible to come back as an answer.
-struct Beam {
+///
+/// It also carries the [`Traversal`] the whole search shares, since every step
+/// that touches the beam also draws on an allowance or moves a counter.
+struct Beam<'t> {
     visited: HashSet<usize>,
     frontier: BinaryHeap<Reverse<Cand>>,
     results: BinaryHeap<Cand>,
     ef: usize,
-    /// Remaining allowance for routing *through* non-matching nodes when a
-    /// filtered expansion turns up no matching neighbor at all. Spending the
-    /// caller's own budget bounds that fallback, so a predicate nothing
-    /// satisfies still finishes promptly instead of sweeping the graph.
-    detours: usize,
+    tr: &'t mut Traversal,
 }
 
-impl Beam {
-    fn new(ef: usize) -> Self {
+impl<'t> Beam<'t> {
+    fn new(ef: usize, tr: &'t mut Traversal) -> Self {
         Self {
             visited: HashSet::with_capacity(ef.max(1) * 8),
             frontier: BinaryHeap::new(),
             results: BinaryHeap::new(),
             ef,
-            detours: ef,
+            tr,
         }
     }
 
@@ -583,6 +696,7 @@ impl Hnsw {
             return Ok(false);
         }
         let d = self.metric.distance(query, self.vector(id))?;
+        beam.tr.cost.distances += 1;
         if beam.results.len() < beam.ef || d < beam.farthest() {
             beam.push(Cand { dist: d, id }, self.admissible(id, predicate));
             return Ok(true);
@@ -611,7 +725,7 @@ impl Hnsw {
     /// Two hops is not always far enough — under a very selective predicate a
     /// node can have no match anywhere in its two-hop neighborhood. Rather than
     /// return nothing at all, such a node routes on through its non-matching
-    /// neighbors (which still can never be returned), limited by the beam's
+    /// neighbors (which still can never be returned), limited by the search's
     /// detour allowance.
     ///
     /// Bridging trades predicate evaluations for distance computations: a
@@ -682,11 +796,12 @@ impl Hnsw {
             // neighbor list — γ² work per unit, and the denser the graph the
             // worse the bill.
             for &n in neighbors {
-                if beam.detours == 0 {
+                if beam.tr.detours == 0 {
                     break;
                 }
                 if self.visit(query, n as usize, predicate, beam)? {
-                    beam.detours -= 1;
+                    beam.tr.detours -= 1;
+                    beam.tr.cost.detours += 1;
                 }
             }
         }
@@ -706,9 +821,10 @@ impl Hnsw {
         ef: usize,
         layer: usize,
         predicate: Option<&Predicate>,
+        tr: &mut Traversal,
     ) -> Result<Vec<Cand>, HnswError> {
         let filtered = Self::is_filtered(predicate);
-        let mut beam = Beam::new(ef);
+        let mut beam = Beam::new(ef, tr);
         // Scratch for `expand`'s bridge list, hoisted here so the filtered path
         // allocates once per layer search rather than once per expansion.
         let mut bridges: Vec<usize> = Vec::new();
@@ -716,6 +832,7 @@ impl Hnsw {
         for &ep in entry_points {
             if beam.visited.insert(ep) {
                 let d = self.metric.distance(query, self.vector(ep))?;
+                beam.tr.cost.distances += 1;
                 // A seed routes even when tombstoned or non-matching: it may be
                 // the only way into the region that does match.
                 beam.push(Cand { dist: d, id: ep }, self.admissible(ep, predicate));
@@ -730,6 +847,13 @@ impl Hnsw {
             if c.dist > beam.farthest() && (!filtered || beam.results.len() >= ef) {
                 break;
             }
+            if filtered {
+                if beam.tr.expansions == 0 {
+                    break;
+                }
+                beam.tr.expansions -= 1;
+            }
+            beam.tr.cost.expansions += 1;
             self.expand(query, c.id, layer, predicate, &mut beam, &mut bridges)?;
         }
 
@@ -836,11 +960,14 @@ impl Hnsw {
         let query = self.vector(id).to_vec();
         let max_layer = self.max_layer;
         let mut ep_ids = vec![entry];
+        // Build never filters, so no allowance is ever drawn on; the counters
+        // ride along because one layer search serves both paths.
+        let mut build = Traversal::unfiltered();
 
         // Greedy descent from the top down to just above the new node's level.
         if max_layer > level {
             for lc in ((level + 1)..=max_layer).rev() {
-                let w = self.search_layer(&query, &ep_ids, 1, lc, None)?;
+                let w = self.search_layer(&query, &ep_ids, 1, lc, None, &mut build)?;
                 if let Some(nearest) = w.first() {
                     ep_ids = vec![nearest.id];
                 }
@@ -850,7 +977,8 @@ impl Hnsw {
         // Connect at each layer from min(level, max_layer) down to 0.
         let start = level.min(max_layer);
         for lc in (0..=start).rev() {
-            let w = self.search_layer(&query, &ep_ids, self.ef_construction, lc, None)?;
+            let w =
+                self.search_layer(&query, &ep_ids, self.ef_construction, lc, None, &mut build)?;
             let max_deg = self.max_degree(lc);
             let selected = self.select_neighbors_heuristic(&w, max_deg)?;
 
@@ -899,7 +1027,7 @@ impl Hnsw {
         k: usize,
         ef_search: usize,
     ) -> Result<Vec<(f32, usize)>, HnswError> {
-        self.search_inner(query, k, ef_search, None)
+        Ok(self.search_inner(query, k, ef_search, None)?.0)
     }
 
     /// Approximate k-nearest-neighbor search restricted to nodes whose stored
@@ -911,9 +1039,16 @@ impl Hnsw {
     /// up where post-filtering — searching blind, then discarding — collapses.
     /// [`Predicate::All`] takes the unfiltered fast path.
     ///
-    /// Recall under a *very* selective predicate is what the graph's `gamma` is
-    /// for: bridging can reconnect a thinned graph, but building dense enough to
-    /// not need it is cheaper at query time.
+    /// Where the matching nodes are not near the query at all — a predicate
+    /// correlated with position — bridging is not enough on its own, because it
+    /// only reconnects a neighborhood the search has already reached. The
+    /// descent handles that: each layer above 0 is probed for a node that
+    /// matches, so the bottom layer starts inside the matching region. See
+    /// `docs/FILTERING.md` § 2.
+    ///
+    /// Recall under a *very* selective predicate is also what the graph's
+    /// `gamma` is for: bridging can reconnect a thinned graph, but building
+    /// dense enough to not need it is cheaper at query time.
     pub fn search_filtered(
         &self,
         query: &[f32],
@@ -921,6 +1056,25 @@ impl Hnsw {
         ef_search: usize,
         predicate: &Predicate,
     ) -> Result<Vec<(f32, usize)>, HnswError> {
+        Ok(self
+            .search_filtered_with_cost(query, k, ef_search, predicate)?
+            .0)
+    }
+
+    /// [`Hnsw::search_filtered`], reporting what the search spent alongside its
+    /// answer.
+    ///
+    /// Filtered traversal walks through nodes it can never return, so its cost
+    /// is bounded by allowances rather than by the result heap alone. Those
+    /// bounds are part of the contract — a selective predicate must not become
+    /// a full scan — and this is how they are observed.
+    pub fn search_filtered_with_cost(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef_search: usize,
+        predicate: &Predicate,
+    ) -> Result<(Vec<(f32, usize)>, SearchCost), HnswError> {
         self.search_inner(query, k, ef_search, Some(predicate))
     }
 
@@ -930,13 +1084,13 @@ impl Hnsw {
         k: usize,
         ef_search: usize,
         predicate: Option<&Predicate>,
-    ) -> Result<Vec<(f32, usize)>, HnswError> {
+    ) -> Result<(Vec<(f32, usize)>, SearchCost), HnswError> {
         let entry = match self.entry_point {
             Some(e) => e,
-            None => return Ok(Vec::new()),
+            None => return Ok((Vec::new(), SearchCost::default())),
         };
         if k == 0 {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), SearchCost::default()));
         }
         if query.len() != self.dim {
             return Err(HnswError::DimensionMismatch {
@@ -945,21 +1099,61 @@ impl Hnsw {
             });
         }
 
+        let filtered = Self::is_filtered(predicate);
+        let ef = ef_search.max(k);
+        let mut tr = if filtered {
+            Traversal::for_ef(ef)
+        } else {
+            Traversal::unfiltered()
+        };
         let mut ep_ids = vec![entry];
+        let mut seeds: Vec<usize> = Vec::new();
+        let mut probe: Vec<usize> = Vec::new();
+
         for lc in (1..=self.max_layer).rev() {
-            // The upper layers exist to navigate, not to answer: descend through
-            // the graph as built and apply the predicate only on layer 0, where
-            // results are actually collected.
-            let w = self.search_layer(query, &ep_ids, 1, lc, None)?;
+            // Navigation is the same walk with or without a predicate: greedy,
+            // unfiltered, one entry point down to the next layer. Filtering it
+            // would change where an unfiltered search lands, and the answer to
+            // "which node is nearest the query" does not depend on the filter.
+            let w = self.search_layer(query, &ep_ids, 1, lc, None, &mut tr)?;
             if let Some(nearest) = w.first() {
-                ep_ids = vec![nearest.id];
+                ep_ids.clear();
+                ep_ids.push(nearest.id);
+            }
+            if filtered {
+                // ...but *where to start looking* very much does. A predicate
+                // correlated with position leaves the query in a region where
+                // nothing matches, and layer 0 cannot cross that: one hop there
+                // covers one node's spacing, so reaching a region tens of nodes
+                // away costs a budget proportional to the area in between.
+                //
+                // The upper layers are built for exactly this — sparser, so a
+                // hop covers far more ground — which makes them the cheap place
+                // to look for a foothold in the matching set. Each layer probes
+                // from the node navigation just reached plus whatever the layer
+                // above found, and hands what it finds down; layer 0 starts
+                // inside the matching region rather than tens of hops from it.
+                //
+                // One foothold per layer: measured, carrying 2, 4 or 8 down
+                // changes recall on that fixture not at all and costs a little
+                // more, because what the probe has to get right is *which
+                // region*, and the layer below re-probes from wherever it lands.
+                probe.clear();
+                probe.extend_from_slice(&ep_ids);
+                probe.extend_from_slice(&seeds);
+                let found = self.search_layer(query, &probe, 1, lc, predicate, &mut tr)?;
+                seeds.clear();
+                seeds.extend(found.iter().map(|c| c.id));
             }
         }
+        ep_ids.extend_from_slice(&seeds);
+        if filtered {
+            tr.refill_detours(ef);
+        }
 
-        let ef = ef_search.max(k);
-        let mut w = self.search_layer(query, &ep_ids, ef, 0, predicate)?;
+        let mut w = self.search_layer(query, &ep_ids, ef, 0, predicate, &mut tr)?;
         w.truncate(k);
-        Ok(w.into_iter().map(|c| (c.dist, c.id)).collect())
+        Ok((w.into_iter().map(|c| (c.dist, c.id)).collect(), tr.cost))
     }
 
     /// Exact brute-force k-NN over all stored vectors. Used as the recall ceiling
@@ -2910,21 +3104,235 @@ mod tests {
         );
 
         // One row in ten: post-filtering is already losing a third of the answers.
-        // Observed: aware 0.995, post 0.625.
+        // Observed: aware 0.995, post 0.625 — unmoved by the reach work, which
+        // is the point of the bar sitting this close to it. An uncorrelated
+        // filter is the case that was already good, and it stays good only
+        // because a detour is charged where two hops find no match at all,
+        // which here is almost nowhere.
         let (aware, post) = filtered_recall(&h, &mut rng, &selectivity(10), ef);
-        assert!(aware >= 0.9, "recall@10 at 10% selectivity: {aware:.3}");
+        assert!(aware >= 0.99, "recall@10 at 10% selectivity: {aware:.3}");
         assert!(
             aware >= post + 0.25,
             "10% selectivity: aware {aware:.3} vs post-filter {post:.3} at ef={ef}"
         );
 
         // One row in a hundred: post-filtering has collapsed.
-        // Observed: aware 0.970, post 0.060.
+        // Observed: aware 0.985, post 0.060.
         let (aware, post) = filtered_recall(&h, &mut rng, &selectivity(1), ef);
         assert!(aware >= 0.9, "recall@10 at 1% selectivity: {aware:.3}");
         assert!(
             aware >= post + 0.5,
             "1% selectivity: aware {aware:.3} vs post-filter {post:.3} at ef={ef}"
+        );
+    }
+
+    // ---- reach: matching regions away from the query ----------------------
+
+    /// A grid whose filter selects whole *columns* of it, so the matching rows
+    /// sit in bands the query is not in. Node `i` is at `(i % 500, i / 500)`
+    /// and carries `Int(i % 100)`, so `col0 < 5` keeps 5% of the rows — 25 of
+    /// the 500 x-positions, the nearest of them 46 away from a query at x = 250,
+    /// with thousands of non-matching nodes in between.
+    ///
+    /// This is the shape an uncorrelated label cannot produce, and the reason a
+    /// suite full of uncorrelated ones passed on a search that could not reach
+    /// past its own neighbourhood: there the matches are spread through every
+    /// region, so looking only near the query still finds them.
+    fn build_correlated(n: usize, gamma: f32) -> Hnsw {
+        let mut h = Hnsw::new(HnswParams {
+            m: 16,
+            ef_construction: 64,
+            gamma,
+            metric: Metric::L2,
+            seed: 7,
+        });
+        for i in 0..n {
+            let v = vec![(i % 500) as f32, (i / 500) as f32];
+            h.insert_with_attrs(v, vec![AttrValue::Int((i % 100) as i64)])
+                .expect("insert");
+        }
+        h
+    }
+
+    /// The exact top-`k` among the nodes `pred` matches.
+    fn matching_truth(h: &Hnsw, q: &[f32], pred: &Predicate, k: usize) -> Vec<usize> {
+        h.brute_force(q, h.len())
+            .expect("brute force")
+            .into_iter()
+            .filter(|&(_, id)| pred.matches(h.attrs(id)))
+            .map(|(_, id)| id)
+            .take(k)
+            .collect()
+    }
+
+    #[test]
+    fn filtered_search_reaches_a_matching_region_away_from_the_query() {
+        let h = build_correlated(10_000, 1.0);
+        let pred = selectivity(5);
+        let q = [250.0f32, 10.0];
+
+        // Nothing within 46 units of the query matches, so this asks the search
+        // to cross a wide non-matching region rather than step over a few nodes.
+        // It used to come back empty — not short, empty — at every ef_search
+        // below 5000, while the same graph under an uncorrelated filter of the
+        // same selectivity answered perfectly.
+        let (res, _) = h
+            .search_filtered_with_cost(&q, 10, 64, &pred)
+            .expect("filtered search");
+        assert_eq!(
+            res.len(),
+            10,
+            "asked for 10 matching rows at 5% selectivity and got {}",
+            res.len()
+        );
+        assert!(
+            res.iter().all(|&(_, id)| pred.matches(h.attrs(id))),
+            "filtered search returned a node that fails the predicate"
+        );
+        let truth = matching_truth(&h, &q, &pred, 10);
+        let hits = res.iter().filter(|(_, id)| truth.contains(id)).count();
+        assert_eq!(
+            hits,
+            10,
+            "recall@10 on the far region: {}",
+            hits as f64 / 10.0
+        );
+    }
+
+    #[test]
+    fn filtered_recall_holds_when_the_filter_correlates_with_position() {
+        // One query is a fixture that could be lucky; these are spread across
+        // the grid, so every distance from a matching band is represented —
+        // including queries sitting between two of them.
+        let h = build_correlated(10_000, 1.0);
+        let pred = selectivity(5);
+        let (mut hits, mut total, mut short) = (0usize, 0usize, 0usize);
+        for qx in (10..500).step_by(37) {
+            for qy in [3.0f32, 10.0, 17.0] {
+                let q = [qx as f32, qy];
+                let truth = matching_truth(&h, &q, &pred, 10);
+                let (res, _) = h
+                    .search_filtered_with_cost(&q, 10, 64, &pred)
+                    .expect("filtered search");
+                assert!(
+                    res.iter().all(|&(_, id)| pred.matches(h.attrs(id))),
+                    "filtered search returned a node that fails the predicate"
+                );
+                if res.len() < 10 {
+                    short += 1;
+                }
+                hits += res.iter().filter(|(_, id)| truth.contains(id)).count();
+                total += truth.len();
+            }
+        }
+        let recall = hits as f64 / total as f64;
+        // Observed 1.000, and 0.381 with the descent probe removed (0.214 with
+        // the old, single, ef-sized detour allowance as well). The bar is the
+        // card's 0.85.
+        assert!(
+            recall >= 0.85,
+            "recall@10 over a correlated 5% filter: {recall:.3}"
+        );
+        assert_eq!(short, 0, "{short} queries came back under 10 rows");
+    }
+
+    // ---- what the filtered path is allowed to cost ------------------------
+
+    /// The allowances exist because a filtered search walks through nodes it can
+    /// never return: correctness alone would let it walk the whole graph. These
+    /// pin the cost of the two cases that have no natural stopping point, and
+    /// both are stated in absolute counts rather than ratios, so the bars fail
+    /// on a graph that got bigger as well as on a search that got greedier.
+    #[test]
+    fn a_predicate_nothing_satisfies_stays_cheap() {
+        // Every neighbour is a bridge and the result heap can never fill, so
+        // the detour allowance is the only thing that ends this search.
+        let never = Predicate::And(vec![Atom::Eq {
+            col: 0,
+            value: AttrValue::Int(4242),
+        }]);
+        for n in [2000usize, 20_000] {
+            let (h, mut rng) = build_labeled(n, 16, 1.0);
+            for _ in 0..5 {
+                let q: Vec<f32> = (0..16).map(|_| next_f64(&mut rng) as f32).collect();
+                let (res, cost) = h
+                    .search_filtered_with_cost(&q, 10, 64, &never)
+                    .expect("filtered search");
+                assert!(res.is_empty());
+                // Observed at most 616 distances and 528 expansions, at both
+                // sizes — flat in the graph, which is the property that matters.
+                // The bars also hold the allowance's *per-node* charge: charge
+                // it once per stranded expansion instead, letting one unit queue
+                // a whole neighbour list, and this measures 1744 and 1034.
+                assert!(
+                    cost.distances <= 1000,
+                    "n={n}: {} distances for a predicate nothing satisfies",
+                    cost.distances
+                );
+                assert!(
+                    cost.expansions <= 700,
+                    "n={n}: {} expansions for a predicate nothing satisfies",
+                    cost.expansions
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn filtered_cost_does_not_grow_with_the_graph() {
+        // A tombstoned *matching* node satisfies the predicate, so it never
+        // triggers a detour — and it can never fill the result heap either,
+        // which is exactly when a filtered search keeps going. With every match
+        // deleted, nothing about the predicate bounds the walk, and the search
+        // used to expand the graph end to end: 206 nodes at n = 2000 but 2007 at
+        // n = 20 000, i.e. Θ(n), and 156 ms at n = 100k.
+        //
+        // Only the matching rows are deleted here, which is the case the
+        // allowance actually bounds. Tombstone the *whole* table and the
+        // descent's unfiltered navigation has nothing admissible either, so it
+        // sweeps as a plain unfiltered search always has: 363 expansions at
+        // n = 2000 and 2353 at n = 20 000, against a 1024 allowance. Bounding
+        // that means changing where an unfiltered search stops.
+        let pred = selectivity(10);
+        let mut costs = Vec::new();
+        for n in [2000usize, 20_000] {
+            let (mut h, mut rng) = build_labeled(n, 16, 1.0);
+            for id in 0..h.len() {
+                if pred.matches(h.attrs(id)) {
+                    h.delete(id).expect("delete");
+                }
+            }
+            let mut worst = 0usize;
+            for _ in 0..5 {
+                let q: Vec<f32> = (0..16).map(|_| next_f64(&mut rng) as f32).collect();
+                let (res, cost) = h
+                    .search_filtered_with_cost(&q, 10, 64, &pred)
+                    .expect("filtered search");
+                assert!(res.is_empty(), "a deleted node was returned");
+                worst = worst.max(cost.expansions);
+            }
+            costs.push(worst);
+        }
+        // The expansion allowance is 16x ef, so a tenfold graph may cost at most
+        // the slack between the small case and that ceiling — never tenfold.
+        //
+        // The extra ef is what the descent's *navigation* spends: it runs
+        // unfiltered and so draws on no allowance. It stays small here because
+        // only the matching rows are deleted, leaving navigation plenty that is
+        // admissible; tombstone the whole table and that term is unbounded, as
+        // it is for a plain unfiltered search. Observed 1036 of 1088.
+        let ceiling = 16 * 64 + 64;
+        assert!(
+            costs[1] <= ceiling,
+            "n=20000 expanded {} nodes, over the {ceiling} the allowance permits",
+            costs[1]
+        );
+        assert!(
+            costs[1] < costs[0] * 6,
+            "cost grew {}x from n=2000 to n=20000 ({} -> {}), which is scaling with the graph",
+            costs[1] / costs[0].max(1),
+            costs[0],
+            costs[1]
         );
     }
 }

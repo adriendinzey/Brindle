@@ -84,6 +84,39 @@ versions may break).
 
 ### Changed
 
+- **A filter that correlates with vector position is now answered.** When the
+  matching rows sit *away* from the query — a tenant whose documents cluster, a
+  price band, a date range — the search previously could not reach them at all:
+  on a 10 000-row fixture whose filter selects regions 46 units from the query,
+  `WHERE price < 5 ORDER BY embedding <-> $1 LIMIT 10` returned **zero rows** at
+  every `brindle.ef_search` below 5000, while an uncorrelated filter of the same
+  5% selectivity returned all ten. Raising `gamma` did not help.
+
+  The layer descent now probes each layer above 0 for a node that matches the
+  predicate and hands one down, so the bottom layer starts inside the matching
+  region rather than tens of hops away. The same query returns 10 of 10 rows at
+  the default `ef_search`, at recall 1.00 against an exact scan (0.90 at 1%
+  selectivity). Navigation itself is unchanged, and an unfiltered search is
+  unaffected in both results and cost.
+
+  Uncorrelated filters — the case that already worked — are unchanged in recall
+  and cost roughly 10% more per query in vector distances. See
+  `docs/FILTERING.md` § 2(c).
+- **The filtered walk now has a cost ceiling that does not grow with the index.**
+  A tombstoned row still satisfies a predicate, so a graph whose matching rows
+  have all been deleted gave the traversal nothing to stop on and it walked the
+  whole index — 156 ms at 100 000 rows. Filtered traversal is now bounded by a
+  total expansion allowance (16 × `ef_search`) as well as by the existing detour
+  allowance, which holds that case flat: measured 206 → 2007 node expansions
+  from n = 2000 to n = 20 000 before, and 235 → 1036 (the ceiling) after.
+
+  The ceiling covers the predicate-aware part of a query and not the whole of it.
+  Unfiltered search has the same missing stop condition and still has it, and a
+  filtered query's layer descent navigates unfiltered — so a table with *every*
+  row tombstoned, rather than merely every matching one, still costs work
+  proportional to the index (2353 node expansions at n = 20 000 against a 1024
+  allowance). Closing that is a decision about plain HNSW recall rather than
+  about filtering.
 - **A transaction's inserts are written back to the index once, when it ends,
   rather than once per row.** Every write rewrites the whole stored image, so
   doing that per row made a bulk load quadratic in the table; `INSERT ... SELECT`
