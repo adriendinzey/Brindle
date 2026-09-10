@@ -142,15 +142,16 @@ END $$;
 -- away instead of 46; a real regression in uncorrelated filtering would have
 -- passed it.
 --
--- And the filter keeps 10%, not the 5% used above, because on this lattice a 5%
--- uncorrelated filter runs into a *different* limit: with ~32 neighbours per
--- node and one in twenty matching, the matching subgraph itself breaks into
--- components of a few nodes, and traversal spends no detour while any neighbour
--- matches -- so it explores one component and stops. Measured, that returns 4
--- rows of 10, unchanged by ef_search up to 1000, and identically so before this
--- change. That is worth fixing and is not what this case is about; pinning the
--- control at a selectivity where the matching subgraph is connected keeps this
--- file measuring reach.
+-- The filter keeps the same 5% as the correlated half, so the two differ in
+-- exactly one thing: whether the label correlates with position.
+--
+-- It was pinned at 10% for a while, because at 5% this lattice ran into a
+-- *different* limit -- the matching subgraph fragments into components of a few
+-- nodes, and a traversal that only bridges out of a node with no matching
+-- neighbour explores one component and stops, returning 4 rows of 10 whatever
+-- ef_search said. That is fixed now, and this control moves back to 5% because
+-- a control at a gentler selectivity than the case it controls for is only
+-- half a control.
 CREATE TABLE spread (id int, price int, embedding real[]);
 ALTER TABLE spread SET (autovacuum_enabled = off);
 INSERT INTO spread
@@ -161,7 +162,7 @@ CREATE INDEX spread_idx ON spread USING brindle (embedding, price);
 SET enable_indexscan = off;
 SET enable_seqscan = on;
 CREATE TABLE spread_truth AS
-SELECT id FROM spread WHERE price < 10
+SELECT id FROM spread WHERE price < 5
 ORDER BY embedding <-> ARRAY[250.0, 10.0]::real[] LIMIT 10;
 RESET enable_indexscan;
 RESET enable_seqscan;
@@ -176,8 +177,8 @@ BEGIN
     SET LOCAL enable_seqscan = on;
 
     SELECT count(DISTINCT embedding[1]), count(*) INTO columns_hit, matches
-    FROM spread WHERE price < 10;
-    IF columns_hit < 400 THEN
+    FROM spread WHERE price < 5;
+    IF columns_hit < 300 THEN
         RAISE EXCEPTION
             'the control is not uncorrelated: % matching rows fall in only % of '
             'the 500 x positions', matches, columns_hit;
@@ -189,7 +190,7 @@ BEGIN
     SET LOCAL enable_seqscan = off;
 
     CREATE TEMP TABLE spread_got AS
-    SELECT id FROM spread WHERE price < 10
+    SELECT id FROM spread WHERE price < 5
     ORDER BY embedding <-> ARRAY[250.0, 10.0]::real[] LIMIT 10;
 END $$;
 

@@ -135,6 +135,44 @@ One foothold per layer is enough; carrying 2, 4 or 8 down measured no better,
 because what the probe has to get right is *which region*, and the layer below
 re-probes from wherever it lands.
 
+### (d) a last resort when the matching subgraph fragments
+
+(a) through (c) all assume that once the search is *in* the right region it can
+move around inside it. A selective predicate can break that assumption without
+moving the matching rows anywhere: at one node in twenty matching and ~2m
+neighbours each, a matching node typically has one or two matching neighbours
+and they are frequently each other's. The matching subgraph stops being one
+graph and becomes a scatter of small components.
+
+The traversal above bridges only when an expansion finds **no** match within two
+hops. A node with even one matching neighbour therefore never bridges out, and
+the walk stays inside whichever component it entered. Worse than the recall loss
+is what it does to the knob: once that component is exhausted the frontier is
+empty, so **`ef_search` stops buying anything at all**. Measured on a 10 000-node
+grid with a hash-derived 1%-selective label, recall@10 went 0.356 → 0.455 →
+0.526 → 0.530 for `ef_search` 64 → 128 → 256 → 512, and at 2% it was flat from
+128 onward. A wider beam cannot help a search that has nothing left to expand.
+
+The fix is to remember the expansions that did *not* bridge, and to go back to
+them — nearest first — when the walk ends with the result heap unfilled:
+
+```
+walk the frontier as usual
+while the heap is unfilled and detours remain:
+    for each expansion that found a match and so never bridged:
+        bridge out of it
+    resume the walk
+```
+
+**Deliberately a last resort.** Loosening the rule up in the expansion instead —
+bridge whenever the heap is unfilled — also fixes the fragmentation, and is much
+worse: it pays on every selective query rather than only the stranded ones.
+Measured on 20 000 rows at 128 dimensions it costs 3.8× at 1% selectivity, and at
+10% it loses to simply raising `ef_search` at equal latency. The last-resort form
+costs nothing wherever the heap fills — 0.341 ms against 0.347 ms at `ef_search`
+64, where recall is identical to the digit — and turns the ceiling back into a
+curve: 0.915 → **0.998** at `ef_search` 256, 0.928 → **1.000** at 1024.
+
 ### What bounds all this
 
 A filtered search may walk through nodes it can never return, so the result heap
