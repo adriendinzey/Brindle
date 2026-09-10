@@ -209,8 +209,12 @@ as **key columns after the vector**; Brindle stores those attribute values
 **inside the index** next to each vector:
 
 ```sql
-CREATE INDEX ON docs USING brindle (embedding, tenant_id, status, price);
+CREATE INDEX ON docs USING brindle (embedding, tenant_id, in_stock, price);
 ```
+
+(`in_stock` rather than a `status` text label: string labels want the dictionary
+encoding described below and are refused at `CREATE INDEX` today, so an example
+using one would not run.)
 
 **Not `INCLUDE (...)`, and the distinction is the whole mechanism.** Postgres
 matches a `WHERE` clause to an index column only if that column is part of the

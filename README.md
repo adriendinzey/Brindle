@@ -2,32 +2,35 @@
 
 **Filter-aware, hybrid vector search for PostgreSQL — written in Rust & fully vibe-coded from scratch.**
 
+[![CI](https://github.com/adriendinzey/Brindle/actions/workflows/ci.yml/badge.svg)](https://github.com/adriendinzey/Brindle/actions/workflows/ci.yml)
+[![PostgreSQL 16 | 17](https://img.shields.io/badge/PostgreSQL-16%20%7C%2017-336791)](https://www.postgresql.org/)
+[![License: PostgreSQL](https://img.shields.io/badge/License-PostgreSQL-blue)](LICENSE)
+
 Brindle is a PostgreSQL extension for approximate nearest-neighbor (ANN) vector
 search whose design goal is the query production RAG and search systems actually
 issue:
 
 ```sql
--- "Find the 10 most semantically similar active products under $50 for this tenant"
+-- "Find the 10 most semantically similar products under $50 for this tenant"
 SELECT id, name
 FROM products
-WHERE tenant_id = 42 AND status = 'active' AND price < 50      -- structured predicate
-ORDER BY embedding <=> $1                                       -- vector similarity
+WHERE tenant_id = 42 AND price < 50      -- structured predicate
+ORDER BY embedding <-> $1                 -- vector similarity
 LIMIT 10;
 ```
 
 Plain HNSW indexes degrade badly on queries like this: filtering *after* the
 graph search throws away most of the candidates the index worked to find, while
 filtering *before* it means the index isn't used at all. Brindle pushes the
-predicate **into** the graph traversal so recall stays high even under selective
-filters — and adds first-class **hybrid** (vector + lexical) ranking via
-Reciprocal Rank Fusion.
+predicate **into** the graph traversal, so the search budget is spent on rows
+that can actually be answers and recall stays high under selective filters.
 
-> **Status: early development (Phase 0).** This is a learning-grade project built
-> in the open, and *not* production-ready. Nothing in it has been optimized yet:
-> the first measured baseline is in [docs/BENCHMARKS.md](docs/BENCHMARKS.md), and
-> it shows queries about two orders of magnitude slower than pgvector, almost
-> entirely because every scan still deserializes the whole index.
-> See [docs/ROADMAP.md](docs/ROADMAP.md) for what works today.
+> **Status: working, and not production-ready.** A learning-grade project built
+> in the open. Vector search and filtered vector search work end to end from
+> SQL; durable paged storage, hybrid ranking at the SQL level, and quantization
+> do not exist yet. [docs/ROADMAP.md](docs/ROADMAP.md) tracks what is built,
+> [docs/BENCHMARKS.md](docs/BENCHMARKS.md) has the measured numbers, and the
+> honest caveats are in **[Where it stands](#where-it-stands)** below.
 
 > ⚠️ **On Windows, build inside WSL2 on the Linux-native filesystem.** Clone to
 > `~/code/brindle` (ext4) and develop there — not under `/mnt/c` or `/mnt/d`.
@@ -52,7 +55,9 @@ competitive analysis.
 1. **Filter-aware traversal** — an [ACORN](https://arxiv.org/abs/2403.04871)-style
    HNSW that keeps the matching-node subgraph navigable under predicates.
    ([docs/FILTERING.md](docs/FILTERING.md))
-2. **Hybrid by default** — vector + PostgreSQL full-text, fused with RRF.
+2. **Hybrid ranking** — vector + PostgreSQL full-text, fused with Reciprocal
+   Rank Fusion. *The fusion core is implemented and tested; the SQL surface
+   (`brindle_hybrid()`) is not built yet.*
 3. **Honest engineering** — `Result`-based error handling, no `unwrap()` in hot
    paths, zero-allocation distance kernels, benchmark-driven claims.
 4. **Drop-in friendly** — its own `brindle_vector` type speaks pgvector's text
@@ -73,13 +78,101 @@ cargo pgrx init                      # downloads & builds dev Postgres versions
 cargo pgrx run pg17                  # builds + drops you into psql with brindle loaded
 ```
 
+Then, in the `psql` session it opens:
+
 ```sql
 CREATE EXTENSION brindle;
-SELECT brindle_l2_distance(ARRAY[1,2,3]::real[], ARRAY[4,5,6]::real[]);  -- 5.196...
+
+CREATE TABLE products (
+    id        bigserial PRIMARY KEY,
+    tenant_id int,
+    price     float8,
+    embedding real[]
+);
+
+INSERT INTO products (tenant_id, price, embedding)
+SELECT i % 10, (i % 100)::float8, ARRAY[(i % 500)::real, (i / 500)::real]
+FROM generate_series(1, 5000) i;
+
+-- The filterable columns are KEY columns after the vector, not INCLUDE columns.
+-- That distinction is the whole mechanism: PostgreSQL only matches a WHERE
+-- clause to an index column that is part of the search key, so a qual on an
+-- INCLUDE column never reaches the index and gets applied afterwards -- which is
+-- the post-filtering this design exists to avoid.
+CREATE INDEX products_embedding_idx
+    ON products USING brindle (embedding, tenant_id, price);
+
+SELECT id, price
+FROM products
+WHERE tenant_id = 7 AND price < 50
+ORDER BY embedding <-> ARRAY[250, 10]::real[]
+LIMIT 10;
 ```
+
+`EXPLAIN` on that query should show `Index Scan using products_embedding_idx`
+with an `Index Cond` — the predicate reaching the traversal. If it shows a
+`Filter` instead, the qual is being applied after the search rather than during
+it. (On a table this small PostgreSQL may prefer a sequential scan, which is the
+right call; `SET enable_seqscan = off` to see the index plan.)
+
+Filterable columns must have a brindle operator class, which ships for `bool`,
+`int2`, `int4`, `int8`, `float4` and `float8`. Text labels and timestamps are
+refused at `CREATE INDEX` rather than silently ignored — see
+[docs/FILTERING.md](docs/FILTERING.md) § 3 for the supported predicate shapes.
 
 Full setup notes (toolchain, the WSL2 native-filesystem loop, and parallel
 development) live in [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md).
+
+## Where it stands
+
+Measured on 100 000 rows × 128 dimensions, clustered, against pgvector 0.8.0 on
+the same rows, queries and ground truth at matched `m`/`ef_construction`
+([docs/BENCHMARKS.md](docs/BENCHMARKS.md) has the method and the caveats):
+
+| `ef_search` = 64 | Brindle | pgvector |
+|---|---|---|
+| query latency p50 | **0.34 ms** warm · **57.9 ms** cold | 0.60 ms |
+| recall@10 | 0.966 | 0.978 |
+| index size | 77 MB | 79 MB |
+| build (single-threaded both sides) | 106 s | 39 s |
+
+**Read the warm and cold figures together.** A backend decodes the whole index
+into memory on its first scan and answers later queries from that copy, so
+long-lived connections see the warm number and a freshly connected one pays the
+cold. pgvector has no such split — it works out of the shared buffer cache,
+warmed once for the whole server, which is why it has a single number here.
+
+That is also the asymmetry behind the warm win: Brindle is faster there partly
+by holding a private ~89 MB copy of the index **per backend**, memory pgvector
+does not spend. Paged storage ([docs/STORAGE.md](docs/STORAGE.md)) is what
+removes both the cold cost and the per-backend copy; it is designed and not yet
+built.
+
+### What works
+
+- `CREATE INDEX ... USING brindle` over `real[]` or `brindle_vector`, with L2,
+  cosine and inner-product operator classes.
+- Filtered search: a `WHERE` clause on an indexed attribute column is pushed
+  into the graph traversal (equality and ranges on the numeric types above,
+  combined with `AND`). A qual the index cannot express is rechecked by the
+  executor rather than dropped.
+- Incremental `INSERT`, `VACUUM` integration, and `ef_search` / `m` /
+  `ef_construction` / `gamma` as a GUC and index options.
+- Writes are WAL-logged, so the index survives a crash and reaches replicas.
+
+### What does not
+
+- **Storage is an interim whole-index blob**, not paged. Every write rewrites and
+  re-logs the whole image, so WAL volume is O(index) per write-back, and the
+  cold-path latency above is the same limitation seen from the read side.
+- **No hybrid SQL surface yet** — the RRF core is implemented and tested, but
+  `brindle_hybrid()` is not built.
+- **No quantization**, so vectors are stored at full `float4` width.
+- Recall is a property of the dataset as much as the index: on a *uniform*
+  128-dimensional fixture, recall@10 is 0.375 at `ef_search = 64` — and pgvector
+  scores the same on the same data, because distances concentrate and a greedy
+  graph walk has no gradient to follow. `docs/BENCHMARKS.md` measures this
+  directly rather than quietly picking a friendlier fixture.
 
 ## Development
 
