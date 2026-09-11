@@ -443,40 +443,40 @@ unnoticed for four tasks (`docs/FILTERING.md` § 2(d)).
 
 | selectivity | ef | brindle | pgv_iter | pgv_post | exact |
 |---|---|---|---|---|---|
-| 50% | 64 | **0.940** / 0.78 ms | 0.843 / 0.85 | 0.683 / **0.77** | 1.000 / 20.3 |
-| 50% | 256 | **0.963** / **0.98** | 0.853 / 1.30 | 0.750 / 1.27 | " |
-| 10% | 64 | **0.770** / 1.98 | 0.687 / 5.71 | 0.170 / **0.80** | 1.000 / 29.5 |
-| 10% | 256 | **0.877** / 6.70 | 0.700 / **5.62** | 0.203 / 1.60 | " |
-| 5% | 64 | **0.693** / 2.19 | 0.613 / 6.98 | 0.113 / **0.88** | 1.000 / 27.6 |
-| 5% | 256 | **0.840** / 7.24 | 0.627 / **6.81** | 0.140 / 1.67 | " |
-| 1% | 64 | **0.940** / 3.06 | 0.117 / 57.9 | 0.030 / **0.96** | 1.000 / 26.1 |
-| 1% | 256 | **0.957** / 10.6 | 0.120 / 55.1 | 0.033 / **1.77** | " |
+| 50% | 64 | **0.940** / **0.88 ms** | 0.810 / 0.95 | 0.660 / 0.97 | 1.000 / 40.1 |
+| 50% | 256 | **0.963** / **1.05** | 0.853 / 1.32 | 0.760 / 1.32 | " |
+| 10% | 64 | **0.770** / 2.26 | 0.687 / 5.85 | 0.193 / **0.99** | 1.000 / 28.9 |
+| 10% | 256 | **0.877** / 6.82 | 0.730 / **5.61** | 0.200 / 1.68 | " |
+| 5% | 64 | **0.693** / 2.31 | 0.607 / 6.10 | 0.120 / **0.96** | 1.000 / 27.3 |
+| 5% | 256 | **0.840** / 7.50 | 0.633 / **6.75** | 0.143 / 1.74 | " |
+| 1% | 64 | **0.940** / 3.20 | 0.117 / 60.0 | 0.030 / **1.01** | 1.000 / 25.9 |
+| 1% | 256 | **0.957** / 11.1 | 0.120 / 55.3 | 0.033 / **1.81** | " |
 
 `exact` is a sequential scan with the index disabled; it has no `ef_search`, so
 one figure covers both rows.
 
 **The result is recall nobody else reaches, at a fraction of the cost of the
 only other thing that reaches it.** At 1% selectivity Brindle answers at 0.940
-recall in 3.1 ms. pgvector's iterative scan reaches 0.117 in 58 ms. And the
-exact scan — the arm that is always correct — takes 26 ms, so **at the tight end
-a plain sequential scan beats pgvector's iterative scan on both axes at once**,
-and the real competition for Brindle is brute force, not the ANN index.
+recall in 3.2 ms. pgvector's iterative scan reaches 0.117 in 60 ms. And the exact
+scan — always correct — takes 25.9 ms, so **at the tight end a plain sequential
+scan beats pgvector's iterative scan on both axes at once**, and the real
+competition for Brindle is brute force rather than the ANN index.
 
-Brindle is 8.5× faster than that exact scan at 1% selectivity and 3.8× at 5% with
-a wide beam, at 0.94–0.84 of its recall. That is the trade this index offers: a
-small, stated recall loss for most of an order of magnitude in latency. Stating
-it against iterative scan alone would be picking the weaker opponent.
+Brindle is 8.1× faster than that exact scan at 1% selectivity and 3.6× at 5% with
+a wide beam, at 0.94 and 0.84 of its recall. That is the trade this index offers:
+a stated recall loss for most of an order of magnitude in latency. Measuring only
+against iterative scan would be picking the weaker opponent.
 
 **Post-filtering is the fastest column at every tight point and the least
 useful.** 0.033 recall means it found, on average, a third of one of the ten rows
 the query asked for. Speed on a wrong answer is not a trade-off.
 
 **Where Brindle costs more.** At `ef_search` 256 and 5–10% selectivity it is
-slower than iterative scan — 7.21 ms against 6.93 at 5% — for better recall. And
+slower than iterative scan — 7.50 ms against 6.75 at 5% — for better recall. And
 post-filtering is cheaper than Brindle at every *tight* point: if a filter keeps
 one row in ten and 0.17 recall is acceptable, the naive approach is the cheap
 answer. It is not cheaper everywhere — at 50% and `ef_search` 256 Brindle is the
-faster arm, 0.97 ms against 1.26.
+faster arm, 1.05 ms against 1.32.
 
 ### pgvector's figure is a range, not a number
 
@@ -502,21 +502,21 @@ itself (`=== what the pgvector scan budget buys ===`):
 
 | mode | `max_scan_tuples` | `scan_mem_multiplier` | recall | p50 |
 |---|---|---|---|---|
-| relaxed_order | 20 000 (default) | 1 (default) | 0.083 | 72.8 ms |
-| relaxed_order | 20 000 | 8 | 0.083 | 64.5 ms |
-| relaxed_order | 1 000 000 | 1 | 0.147 | 106.2 ms |
-| relaxed_order | 1 000 000 | 8 | **0.837** | 191.8 ms |
-| strict_order | 1 000 000 | 8 | 0.053 | 174.7 ms |
+| relaxed_order | 20 000 (default) | 1 (default) | 0.117 | 67.6 ms |
+| relaxed_order | 20 000 | 8 | 0.117 | 67.3 ms |
+| relaxed_order | 1 000 000 | 1 | 0.273 | 109.9 ms |
+| relaxed_order | 1 000 000 | 8 | **0.773** | 140.3 ms |
+| strict_order | 1 000 000 | 8 | 0.183 | 140.1 ms |
 
 **Raising `scan_mem_multiplier` alone changes nothing** — 0.083 either way —
-because `max_scan_tuples` binds first. Raising tuples alone gets to 0.147.
-Only both together reach 0.837. An earlier draft blamed the first setting and a
-later one blamed the second; the truth is that lifting either alone is wasted.
+because `max_scan_tuples` binds first. Raising tuples alone gets to 0.273. Only
+both together reach 0.773. An earlier draft blamed the first setting and a later
+one blamed the second; the truth is that lifting either alone is wasted.
 
-So the honest best case for pgvector at 1% correlated is **0.837 at 192 ms**
-against Brindle's **0.940 at 3.1 ms** — still behind on recall, and about **60×
-slower**. `relaxed_order` is much the better mode: `strict_order` at the same
-open budget manages 0.053.
+So the honest best case for pgvector at 1% correlated is **0.773 at 140 ms**
+against Brindle's **0.940 at 3.2 ms** — still behind on recall, and about **44×
+slower**. `relaxed_order` is the better mode; `strict_order` at the same open
+budget reaches 0.183 here, and has measured as low as 0.053 on other builds.
 
 This section is now emitted by the harness. It is the one part of this write-up
 the documented command did not regenerate, and it was wrong in two consecutive
@@ -526,14 +526,14 @@ drafts as a direct result.
 
 | selectivity | ef | brindle | pgv_iter | pgv_post | exact |
 |---|---|---|---|---|---|
-| 50% | 64 | **0.987** / 0.78 ms | 0.980 / 0.83 | 0.980 / 0.80 | 1.000 / 19.8 |
-| 50% | 256 | 0.993 / 0.99 | **0.997** / 1.28 | **0.997** / 1.27 | " |
-| 10% | 64 | **0.997** / 0.85 | 0.993 / 0.99 | 0.570 / **0.79** | 1.000 / 28.2 |
-| 10% | 256 | 0.997 / 1.32 | **1.000** / 1.45 | **1.000** / 1.42 | " |
-| 5% | 64 | 0.993 / 0.94 | **1.000** / 1.09 | 0.243 / **0.81** | 1.000 / 26.8 |
-| 5% | 256 | 0.993 / 1.71 | **1.000** / **1.42** | 0.957 / 1.44 | " |
-| 1% | 64 | 0.893 / 1.55 | **0.963** / 1.55 | 0.030 / **0.82** | 1.000 / 25.8 |
-| 1% | 256 | **0.973** / 4.05 | 0.963 / **3.24** | 0.220 / 1.51 | " |
+| 50% | 64 | **0.987** / **0.72 ms** | 0.953 / 0.89 | 0.953 / 1.12 | 1.000 / 39.3 |
+| 50% | 256 | 0.993 / **0.84** | **1.000** / 1.24 | **1.000** / 1.28 | " |
+| 10% | 64 | **0.997** / **0.66** | 0.960 / 1.16 | 0.560 / 0.95 | 1.000 / 27.8 |
+| 10% | 256 | 0.997 / **1.26** | **1.000** / 1.30 | **1.000** / 1.38 | " |
+| 5% | 64 | 0.993 / **0.83** | 0.973 / 1.47 | 0.240 / 0.98 | 1.000 / 26.5 |
+| 5% | 256 | 0.993 / 1.80 | **1.000** / **1.42** | 0.957 / 1.47 | " |
+| 1% | 64 | 0.893 / 1.93 | **0.953** / 3.54 | 0.033 / **1.01** | 1.000 / 25.7 |
+| 1% | 256 | **0.973** / 4.06 | 0.967 / **3.68** | 0.217 / 1.75 | " |
 
 When matching rows are spread through every neighbourhood, iterative scan is
 excellent, and **Brindle loses more of this table than it wins**: at 1%
@@ -582,8 +582,8 @@ and § 2(d).
   and built a degraded graph, which would have flattered Brindle. The harness now
   raises the setting and **fails** if the index still exceeds it.
 - `hnsw.iterative_scan = relaxed_order`, which is the better of pgvector's two
-  modes here — measured, `strict_order` reaches 0.053 against `relaxed_order`'s
-  0.837 at an open scan budget — with `hnsw.ef_search` 64, above pgvector's own
+  modes here — measured, `strict_order` reaches 0.183 against `relaxed_order`'s
+  0.773 at an open scan budget on this build — with `hnsw.ef_search` 64, above pgvector's own
   default of 40. Scan-budget settings are at their defaults in the tables above,
   and their effect is measured by the harness rather than asserted.
 - **`brindle.ef_search` and `hnsw.ef_search` do not budget the same thing.**
@@ -592,6 +592,13 @@ and § 2(d).
   columns should not be read as "same budget, different recall". The latency
   columns are what make the work comparable, which is why they are printed beside
   every recall figure rather than in a separate table.
+- **Warm, and that matters more here than in the unfiltered tables.** These are
+  warm figures, as everywhere in this document — but this section's headline is
+  that Brindle beats a 26 ms exact scan by 8x, and a *freshly connected* backend
+  pays about 58 ms to decode the index before its first query (see the cold
+  figures further up). For a connection that issues one filtered query and goes
+  away, scanning the table is the faster answer. The comparison above is a
+  long-lived connection's; paged storage is what would make it everyone's.
 - 30 query vectors per point, one connection, warm. Latency moves a few percent
   between runs; recall is deterministic on Brindle's side and moves on
   pgvector's, whose build is randomised (see the note further up).

@@ -26,9 +26,10 @@ ENGINES = [
     ("brindle", "#2b6cb0", "Brindle (predicate in traversal)"),
     ("pgv_iter", "#b7791f", "pgvector iterative scan"),
     ("pgv_post", "#c53030", "pgvector post-filter"),
+    ("exact", "#4a5568", "exact scan (the ceiling)"),
 ]
 
-W, H = 760, 560
+W, H = 760, 580
 PAD_L, PAD_R, PAD_T = 64, 18, 20
 PANEL_H, PANEL_GAP = 200, 76
 
@@ -144,11 +145,14 @@ def main():
     )
 
     lx, ly = PAD_L, H - 18
+    # four entries do not fit on one row at this width
     for key, colour, label in ENGINES:
         out.append(f'<line x1="{lx}" y1="{ly - 4}" x2="{lx + 22}" y2="{ly - 4}" stroke="{colour}" stroke-width="2.4"/>')
         out.append(f'<circle cx="{lx + 11}" cy="{ly - 4}" r="3.4" fill="{colour}"/>')
         out.append(f'<text x="{lx + 28}" y="{ly}" class="lg">{esc(label)}</text>')
-        lx += 28 + int(len(label) * 6.4) + 22
+        lx += 28 + int(len(label) * 6.4) + 18
+        if lx > W - 200:
+            lx, ly = PAD_L, ly + 16
 
     out.append("</svg>")
     with open(dst, "w") as fh:

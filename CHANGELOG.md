@@ -88,16 +88,16 @@ versions may break).
   in `docs/BENCHMARKS.md`, with the chart in the README.
 
   On 100 000 rows × 128 dimensions with a correlated filter at 1% selectivity,
-  Brindle answers at recall@10 of 0.940 in 3.1 ms. The exact sequential scan --
-  perfect by definition -- takes 26 ms, and pgvector's iterative scan reaches
-  0.117 in 58 ms, so at the tight end brute force beats the ANN index on both
+  Brindle answers at recall@10 of 0.940 in 3.2 ms. The exact sequential scan --
+  perfect by definition -- takes 25.9 ms, and pgvector's iterative scan reaches
+  0.117 in 60 ms, so at the tight end brute force beats the ANN index on both
   axes and Brindle's real competition is the scan. Given its best scan budget
-  pgvector reaches 0.837 at 192 ms.
+  pgvector reaches 0.773 at 140 ms.
 
   It does not win everywhere, and the write-up says where. With an *uncorrelated*
   filter Brindle loses more of the comparison than it wins: pgvector's iterative
-  scan is ahead at 1% and 5% selectivity and both pgvector arms match or beat it
-  at a wide beam. Post-filtering is the cheapest arm at every tight point while
+  scan is ahead on recall at 1%, and both pgvector arms reach 1.000 at a wide
+  beam where Brindle sits at 0.993-0.997. Post-filtering is the cheapest arm at every tight point while
   answering a different question at 0.030 recall. pgvector's build is randomised,
   so its figures are reported as a range across rebuilds rather than as a number.
 

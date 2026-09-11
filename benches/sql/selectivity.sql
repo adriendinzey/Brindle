@@ -323,6 +323,12 @@ BEGIN
             SET LOCAL enable_indexscan = off;
             SET LOCAL enable_bitmapscan = off;
             SET LOCAL enable_seqscan = on;
+            -- Serial, like every other arm. Left to the planner this goes
+            -- parallel once the predicate is loose enough to be worth it, which
+            -- made the 50% cell three processes' work in a table whose caveats
+            -- say one connection, and made the column non-monotonic: 50%
+            -- appeared faster than 10% despite five times the distance work.
+            SET LOCAL max_parallel_workers_per_gather = 0;
             started := clock_timestamp();
             EXECUTE format(
                 'SELECT array_agg(id) FROM (SELECT id FROM bench_vectors '
@@ -431,52 +437,6 @@ BEGIN
     END LOOP;
 END $$;
 
--- ------------------------------------ how far pgvector's figure moves per build
-
--- pgvector's build is randomised and Brindle's is not. This document already
--- records that quoting a single pgvector run as though it were "the value" is a
--- mistake it has made before, so the headline point gets rebuilt and remeasured
--- rather than sampled once. Brindle's recall is deterministic and needs no
--- equivalent.
-CREATE TABLE sel_rebuild (trial int, recall numeric, p50_ms numeric);
-
-DO $$
-DECLARE
-    k int := current_setting('bench.k')::int;
-    trial int; q record; found int[]; truth int[]; hits int; tot int; cnt int;
-    started timestamptz; ms double precision[]; 
-BEGIN
-    SET LOCAL enable_seqscan = off;
-    FOR trial IN 1..3 LOOP
-        IF trial > 1 THEN
-            DROP INDEX sel_pgv_idx;
-            SET LOCAL maintenance_work_mem = '2GB';
-            CREATE INDEX sel_pgv_idx ON pgv_vectors
-                USING hnsw (embedding vector_l2_ops) WITH (m = 16, ef_construction = 64);
-        END IF;
-        PERFORM set_config('hnsw.ef_search', '64', false);
-        PERFORM set_config('hnsw.iterative_scan', 'relaxed_order', false);
-        hits := 0; tot := 0; ms := '{}';
-        FOR q IN SELECT id, embedding::text::vector AS qv FROM bench_queries ORDER BY id LOOP
-            started := clock_timestamp();
-            SELECT array_agg(id) INTO found FROM (
-                SELECT id FROM pgv_vectors WHERE lbl_local <= 1
-                ORDER BY embedding <-> q.qv LIMIT k) s;
-            ms := ms || (extract(epoch FROM clock_timestamp() - started) * 1000);
-            SELECT t.ids INTO truth FROM sel_truth t
-             WHERE t.shape = 'local' AND t.sel = 1 AND t.query_id = q.id;
-            SELECT count(*) INTO cnt
-              FROM unnest(coalesce(found, '{}'::int[])) f WHERE f = ANY (truth);
-            hits := hits + cnt; tot := tot + k;
-        END LOOP;
-        INSERT INTO sel_rebuild
-        SELECT trial, round(hits::numeric / tot, 3),
-               round(percentile_cont(0.5) WITHIN GROUP (ORDER BY m)::numeric, 3)
-        FROM unnest(ms) m;
-        PERFORM set_config('hnsw.iterative_scan', 'off', false);
-    END LOOP;
-END $$;
-
 -- ----------------------------------- what pgvector's scan budget actually buys
 
 -- The one part of this file's write-up that the documented command did not
@@ -534,6 +494,52 @@ BEGIN
     RESET hnsw.scan_mem_multiplier;
 END $$;
 
+-- ------------------------------------ how far pgvector's figure moves per build
+
+-- pgvector's build is randomised and Brindle's is not. This document already
+-- records that quoting a single pgvector run as though it were "the value" is a
+-- mistake it has made before, so the headline point gets rebuilt and remeasured
+-- rather than sampled once. Brindle's recall is deterministic and needs no
+-- equivalent.
+CREATE TABLE sel_rebuild (trial int, recall numeric, p50_ms numeric);
+
+DO $$
+DECLARE
+    k int := current_setting('bench.k')::int;
+    trial int; q record; found int[]; truth int[]; hits int; tot int; cnt int;
+    started timestamptz; ms double precision[]; 
+BEGIN
+    SET LOCAL enable_seqscan = off;
+    FOR trial IN 1..3 LOOP
+        IF trial > 1 THEN
+            DROP INDEX sel_pgv_idx;
+            SET LOCAL maintenance_work_mem = '2GB';
+            CREATE INDEX sel_pgv_idx ON pgv_vectors
+                USING hnsw (embedding vector_l2_ops) WITH (m = 16, ef_construction = 64);
+        END IF;
+        PERFORM set_config('hnsw.ef_search', '64', false);
+        PERFORM set_config('hnsw.iterative_scan', 'relaxed_order', false);
+        hits := 0; tot := 0; ms := '{}';
+        FOR q IN SELECT id, embedding::text::vector AS qv FROM bench_queries ORDER BY id LOOP
+            started := clock_timestamp();
+            SELECT array_agg(id) INTO found FROM (
+                SELECT id FROM pgv_vectors WHERE lbl_local <= 1
+                ORDER BY embedding <-> q.qv LIMIT k) s;
+            ms := ms || (extract(epoch FROM clock_timestamp() - started) * 1000);
+            SELECT t.ids INTO truth FROM sel_truth t
+             WHERE t.shape = 'local' AND t.sel = 1 AND t.query_id = q.id;
+            SELECT count(*) INTO cnt
+              FROM unnest(coalesce(found, '{}'::int[])) f WHERE f = ANY (truth);
+            hits := hits + cnt; tot := tot + k;
+        END LOOP;
+        INSERT INTO sel_rebuild
+        SELECT trial, round(hits::numeric / tot, 3),
+               round(percentile_cont(0.5) WITHIN GROUP (ORDER BY m)::numeric, 3)
+        FROM unnest(ms) m;
+        PERFORM set_config('hnsw.iterative_scan', 'off', false);
+    END LOOP;
+END $$;
+
 -- ------------------------------------------------------------------ results
 
 \echo
@@ -557,7 +563,7 @@ GROUP BY r.sel, r.ef ORDER BY r.sel DESC, r.ef;
 -- Machine-readable, for the chart generator. Written only when the driver asks
 -- for it, so running this file by hand does not litter the working tree.
 \if :{?chart_csv}
-COPY (SELECT r.shape, r.sel, r.ef, r.engine, round(avg(r.hits)::numeric / (SELECT current_setting('bench.k')::int), 4) AS recall, round((SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY t.elapsed_ms) FROM sel_timings t WHERE t.shape = r.shape AND t.sel = r.sel AND t.ef = r.ef AND t.engine = r.engine)::numeric, 4) AS p50_ms FROM sel_recall r WHERE r.ef IS NOT NULL GROUP BY r.shape, r.sel, r.ef, r.engine ORDER BY r.shape, r.sel DESC, r.ef, r.engine) TO :'chart_csv' WITH (FORMAT csv, HEADER);
+COPY (SELECT r.shape, r.sel, r.ef, r.engine, round(avg(r.hits)::numeric / (SELECT current_setting('bench.k')::int), 4) AS recall, round((SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY t.elapsed_ms) FROM sel_timings t WHERE t.shape = r.shape AND t.sel = r.sel AND t.ef = r.ef AND t.engine = r.engine)::numeric, 4) AS p50_ms FROM sel_recall r WHERE r.ef IS NOT NULL GROUP BY r.shape, r.sel, r.ef, r.engine UNION ALL SELECT r.shape, r.sel, e.ef, r.engine, round(avg(r.hits)::numeric / (SELECT current_setting('bench.k')::int), 4), round((SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY t.elapsed_ms) FROM sel_timings t WHERE t.engine = 'exact' AND t.shape = r.shape AND t.sel = r.sel)::numeric, 4) FROM sel_recall r, (SELECT DISTINCT ef FROM sel_recall WHERE ef IS NOT NULL) e WHERE r.engine = 'exact' GROUP BY r.shape, r.sel, e.ef, r.engine ORDER BY 1, 2 DESC, 3, 4) TO :'chart_csv' WITH (FORMAT csv, HEADER);
 \endif
 
 \echo
