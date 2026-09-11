@@ -43,12 +43,6 @@
 \set ON_ERROR_STOP on
 \timing off
 
-DROP TABLE IF EXISTS sel_truth, sel_timings, sel_recall, sel_points, sel_ladder, sel_rebuild;
-
-SELECT set_config('bench.k', :'k', false);
-
--- ------------------------------------------------------------------ labels
-
 -- Refuse to run twice against the same fixture, rather than trusting the comment
 -- above to be read. The second run would silently measure a *different graph* --
 -- the UPDATE below rewrites every row, so `ambuild` scans a differently-ordered
@@ -67,6 +61,12 @@ BEGIN
             'scripts/bench_index.sh, which creates a fresh database per run.';
     END IF;
 END $$;
+
+DROP TABLE IF EXISTS sel_truth, sel_timings, sel_recall, sel_points, sel_ladder, sel_rebuild, sel_budget;
+
+SELECT set_config('bench.k', :'k', false);
+
+-- ------------------------------------------------------------------ labels
 
 -- Both graphs go before the labels land. The UPDATE below rewrites every row,
 -- and with the indexes live that is 100k tuple inserts into two HNSW graphs
@@ -317,6 +317,29 @@ BEGIN
              FROM bench_queries ORDER BY id LOOP
         FOR p IN SELECT shape, sel FROM sel_points LOOP
             col := 'lbl_' || p.shape;
+            -- exact: the recall ceiling, and a real competitor rather than a
+            -- reference line. A sequential scan is unaffected by ef_search, so
+            -- it is timed once per point.
+            SET LOCAL enable_indexscan = off;
+            SET LOCAL enable_bitmapscan = off;
+            SET LOCAL enable_seqscan = on;
+            started := clock_timestamp();
+            EXECUTE format(
+                'SELECT array_agg(id) FROM (SELECT id FROM bench_vectors '
+                'WHERE %I <= %s ORDER BY brindle_vector_l2_distance(embedding, $1) '
+                'LIMIT %s) s', col, p.sel, k) INTO found USING q.embedding;
+            INSERT INTO sel_timings VALUES ('exact', p.shape, p.sel, NULL,
+                extract(epoch FROM clock_timestamp() - started) * 1000, q.id);
+            INSERT INTO sel_recall
+            SELECT 'exact', p.shape, p.sel, NULL, q.id,
+                   (SELECT count(*) FROM unnest(coalesce(found, '{}'::int[])) f
+                     WHERE f = ANY (t.ids))
+            FROM sel_truth t
+            WHERE t.shape = p.shape AND t.sel = p.sel AND t.query_id = q.id;
+            SET LOCAL enable_indexscan = on;
+            SET LOCAL enable_bitmapscan = on;
+            SET LOCAL enable_seqscan = off;
+
             FOREACH ef IN ARRAY efs LOOP
 
                 -- brindle: predicate pushed into the traversal
@@ -454,6 +477,63 @@ BEGIN
     END LOOP;
 END $$;
 
+-- ----------------------------------- what pgvector's scan budget actually buys
+
+-- The one part of this file's write-up that the documented command did not
+-- regenerate was its caveat about pgvector's limits -- and it was wrong twice in
+-- a row as a result. It is measured here now.
+--
+-- Two settings bound iterative scan and they bind in sequence: `max_scan_tuples`
+-- caps how many rows it will look at, and `scan_mem_multiplier` caps the sort
+-- memory it can hold them in. Raising the second alone does nothing while the
+-- first still binds, which is exactly the trap both previous drafts fell into
+-- from opposite directions.
+CREATE TABLE sel_budget (mode text, max_scan_tuples text, scan_mem_multiplier int,
+                         recall numeric, p50_ms numeric);
+
+DO $$
+DECLARE
+    k int := current_setting('bench.k')::int;
+    cfg record; q record; found int[]; truth int[]; hits int; tot int; cnt int;
+    started timestamptz; ms double precision[];
+BEGIN
+    SET LOCAL enable_seqscan = off;
+    PERFORM set_config('hnsw.ef_search', '64', false);
+    FOR cfg IN
+        SELECT * FROM (VALUES
+            ('relaxed_order', '20000',   1),   -- pgvector's defaults
+            ('relaxed_order', '20000',   8),   -- memory alone
+            ('relaxed_order', '1000000', 1),   -- tuples alone
+            ('relaxed_order', '1000000', 8),   -- both
+            ('strict_order',  '1000000', 8)    -- the other mode, best budget
+        ) AS t(mode, mst, smm)
+    LOOP
+        PERFORM set_config('hnsw.iterative_scan', cfg.mode, false);
+        PERFORM set_config('hnsw.max_scan_tuples', cfg.mst, false);
+        PERFORM set_config('hnsw.scan_mem_multiplier', cfg.smm::text, false);
+        hits := 0; tot := 0; ms := '{}';
+        FOR q IN SELECT id, embedding::text::vector AS qv FROM bench_queries ORDER BY id LOOP
+            started := clock_timestamp();
+            SELECT array_agg(id) INTO found FROM (
+                SELECT id FROM pgv_vectors WHERE lbl_local <= 1
+                ORDER BY embedding <-> q.qv LIMIT k) s;
+            ms := ms || (extract(epoch FROM clock_timestamp() - started) * 1000);
+            SELECT t.ids INTO truth FROM sel_truth t
+             WHERE t.shape = 'local' AND t.sel = 1 AND t.query_id = q.id;
+            SELECT count(*) INTO cnt
+              FROM unnest(coalesce(found, '{}'::int[])) f WHERE f = ANY (truth);
+            hits := hits + cnt; tot := tot + k;
+        END LOOP;
+        INSERT INTO sel_budget
+        SELECT cfg.mode, cfg.mst, cfg.smm, round(hits::numeric / tot, 3),
+               round(percentile_cont(0.5) WITHIN GROUP (ORDER BY m)::numeric, 1)
+        FROM unnest(ms) m;
+    END LOOP;
+    PERFORM set_config('hnsw.iterative_scan', 'off', false);
+    RESET hnsw.max_scan_tuples;
+    RESET hnsw.scan_mem_multiplier;
+END $$;
+
 -- ------------------------------------------------------------------ results
 
 \echo
@@ -462,7 +542,7 @@ SELECT r.sel AS "sel %", r.ef AS ef,
        round(avg(CASE WHEN r.engine = 'brindle'  THEN r.hits END)::numeric / :k, 3) AS brindle,
        round(avg(CASE WHEN r.engine = 'pgv_post' THEN r.hits END)::numeric / :k, 3) AS pgv_post,
        round(avg(CASE WHEN r.engine = 'pgv_iter' THEN r.hits END)::numeric / :k, 3) AS pgv_iter
-FROM sel_recall r WHERE r.shape = 'spread'
+FROM sel_recall r WHERE r.shape = 'spread' AND r.ef IS NOT NULL
 GROUP BY r.sel, r.ef ORDER BY r.sel DESC, r.ef;
 
 \echo
@@ -471,14 +551,30 @@ SELECT r.sel AS "sel %", r.ef AS ef,
        round(avg(CASE WHEN r.engine = 'brindle'  THEN r.hits END)::numeric / :k, 3) AS brindle,
        round(avg(CASE WHEN r.engine = 'pgv_post' THEN r.hits END)::numeric / :k, 3) AS pgv_post,
        round(avg(CASE WHEN r.engine = 'pgv_iter' THEN r.hits END)::numeric / :k, 3) AS pgv_iter
-FROM sel_recall r WHERE r.shape = 'local'
+FROM sel_recall r WHERE r.shape = 'local' AND r.ef IS NOT NULL
 GROUP BY r.sel, r.ef ORDER BY r.sel DESC, r.ef;
 
 -- Machine-readable, for the chart generator. Written only when the driver asks
 -- for it, so running this file by hand does not litter the working tree.
 \if :{?chart_csv}
-COPY (SELECT r.shape, r.sel, r.ef, r.engine, round(avg(r.hits)::numeric / (SELECT current_setting('bench.k')::int), 4) AS recall, round((SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY t.elapsed_ms) FROM sel_timings t WHERE t.shape = r.shape AND t.sel = r.sel AND t.ef = r.ef AND t.engine = r.engine)::numeric, 4) AS p50_ms FROM sel_recall r GROUP BY r.shape, r.sel, r.ef, r.engine ORDER BY r.shape, r.sel DESC, r.ef, r.engine) TO :'chart_csv' WITH (FORMAT csv, HEADER);
+COPY (SELECT r.shape, r.sel, r.ef, r.engine, round(avg(r.hits)::numeric / (SELECT current_setting('bench.k')::int), 4) AS recall, round((SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY t.elapsed_ms) FROM sel_timings t WHERE t.shape = r.shape AND t.sel = r.sel AND t.ef = r.ef AND t.engine = r.engine)::numeric, 4) AS p50_ms FROM sel_recall r WHERE r.ef IS NOT NULL GROUP BY r.shape, r.sel, r.ef, r.engine ORDER BY r.shape, r.sel DESC, r.ef, r.engine) TO :'chart_csv' WITH (FORMAT csv, HEADER);
 \endif
+
+\echo
+\echo '=== the exact arm: the ceiling, and the cheapest thing that always works ==='
+SELECT t.shape, t.sel AS "sel %",
+       round(avg(r.hits)::numeric / :k, 3) AS recall,
+       round(percentile_cont(0.5) WITHIN GROUP (ORDER BY t.elapsed_ms)::numeric, 1) AS p50_ms
+FROM sel_timings t
+JOIN sel_recall r ON r.engine = 'exact' AND r.shape = t.shape
+                 AND r.sel = t.sel AND r.query_id = t.query_id
+WHERE t.engine = 'exact'
+GROUP BY t.shape, t.sel ORDER BY t.shape, t.sel DESC;
+
+\echo
+\echo '=== what the pgvector scan budget buys (1% correlated, ef_search 64) ==='
+SELECT mode, max_scan_tuples, scan_mem_multiplier, recall, p50_ms FROM sel_budget
+ORDER BY mode DESC, max_scan_tuples, scan_mem_multiplier;
 
 \echo
 \echo '=== does ef_search still buy recall? (brindle, correlated label) ==='
@@ -497,7 +593,10 @@ SELECT trial, recall, p50_ms FROM sel_rebuild ORDER BY trial;
 \echo
 \echo '=== build parameters (identical on both sides) ==='
 SELECT 16 AS m, 64 AS ef_construction,
-       (SELECT reloptions FROM pg_class WHERE relname = 'sel_brindle_idx') AS brindle_reloptions,
+       -- reloptions omits anything left unset, so gamma would silently vanish
+       -- from a table whose caption claims it cannot drift.
+       coalesce((SELECT (regexp_match(array_to_string(reloptions, ','), 'gamma=([0-9.]+)'))[1]
+                 FROM pg_class WHERE relname = 'sel_brindle_idx'), '1.0 (default)') AS brindle_gamma,
        current_setting('hnsw.iterative_scan') AS pgv_iterative_scan,
        current_setting('hnsw.max_scan_tuples') AS pgv_max_scan_tuples,
        current_setting('hnsw.scan_mem_multiplier') AS pgv_scan_mem_multiplier;
