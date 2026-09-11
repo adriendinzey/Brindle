@@ -301,6 +301,18 @@ struct Beam<'t> {
     frontier: BinaryHeap<Reverse<Cand>>,
     results: BinaryHeap<Cand>,
     ef: usize,
+    /// Nodes expanded without spending a detour, with their distance.
+    ///
+    /// An expansion that found a matching neighbour has no reason to bridge out
+    /// of its own neighbourhood — until the walk ends with the result heap
+    /// unfilled, which means the matching subgraph it was walking was a
+    /// fragment. These are where it can try again.
+    ///
+    /// Kept scored rather than as bare ids because the rescue spends a bounded
+    /// allowance and should spend it nearest the query first: frontier pops are
+    /// not monotonic once anything has bridged, so the order they arrive in is
+    /// not distance order.
+    deferred: Vec<Cand>,
     tr: &'t mut Traversal,
 }
 
@@ -311,6 +323,7 @@ impl<'t> Beam<'t> {
             frontier: BinaryHeap::new(),
             results: BinaryHeap::new(),
             ef,
+            deferred: Vec::new(),
             tr,
         }
     }
@@ -740,13 +753,13 @@ impl Hnsw {
         predicate: Option<&Predicate>,
         beam: &mut Beam,
         bridges: &mut Vec<usize>,
-    ) -> Result<(), HnswError> {
+    ) -> Result<bool, HnswError> {
         let neighbors = self.neighbors(id, layer);
         if !Self::is_filtered(predicate) {
             for &n in neighbors {
                 self.visit(query, n as usize, predicate, beam)?;
             }
-            return Ok(());
+            return Ok(false);
         }
 
         // Both bounds scale with the graph's own base degree, so bridging costs
@@ -786,26 +799,44 @@ impl Hnsw {
         }
 
         if matching == 0 {
-            // Stranded: nothing matches within two hops. Keep walking through
-            // the non-matching nodes themselves — greedily, so the walk still
-            // heads toward the query.
-            //
-            // The allowance is charged per node *enqueued*, not per stranded
-            // node: it is popping one of these that costs a two-hop scan, so
-            // charging once per expansion would let a single unit queue a whole
-            // neighbor list — γ² work per unit, and the denser the graph the
-            // worse the bill.
-            for &n in neighbors {
-                if beam.tr.detours == 0 {
-                    break;
-                }
-                if self.visit(query, n as usize, predicate, beam)? {
-                    beam.tr.detours -= 1;
-                    beam.tr.cost.detours += 1;
-                }
+            // Stranded: nothing matches within two hops. Walk on through the
+            // non-matching nodes themselves.
+            self.bridge_out(query, id, layer, predicate, beam)?;
+            return Ok(true);
+        }
+        // It found something, so it has no reason to leave its neighbourhood —
+        // unless the walk later ends short. The caller records it for that.
+        Ok(false)
+    }
+
+    /// Enqueue `id`'s neighbors regardless of the predicate, so the search can
+    /// walk *through* a region it can never return.
+    ///
+    /// The allowance is charged per node *enqueued*, not per call: it is popping
+    /// one of these that costs a two-hop scan, so charging once per call would
+    /// let a single unit queue a whole neighbor list — γ² work per unit, and the
+    /// denser the graph the worse the bill. Reports whether anything was
+    /// actually queued, which is how the caller knows it is making progress.
+    fn bridge_out(
+        &self,
+        query: &[f32],
+        id: usize,
+        layer: usize,
+        predicate: Option<&Predicate>,
+        beam: &mut Beam,
+    ) -> Result<bool, HnswError> {
+        let mut queued = false;
+        for &n in self.neighbors(id, layer) {
+            if beam.tr.detours == 0 {
+                break;
+            }
+            if self.visit(query, n as usize, predicate, beam)? {
+                beam.tr.detours -= 1;
+                beam.tr.cost.detours += 1;
+                queued = true;
             }
         }
-        Ok(())
+        Ok(queued)
     }
 
     /// Greedy beam search within one layer (HNSW SEARCH-LAYER). Returns up to `ef`
@@ -839,22 +870,78 @@ impl Hnsw {
             }
         }
 
-        while let Some(Reverse(c)) = beam.frontier.pop() {
-            // A filtered search admits only matching nodes, so a result set that
-            // is not yet full means the budget is still unspent and its farthest
-            // entry is no cutoff. Unfiltered, the original rule stands and
-            // existing graphs and query results reproduce exactly.
-            if c.dist > beam.farthest() && (!filtered || beam.results.len() >= ef) {
-                break;
-            }
-            if filtered {
-                if beam.tr.expansions == 0 {
+        loop {
+            while let Some(Reverse(c)) = beam.frontier.pop() {
+                // A filtered search admits only matching nodes, so a result set
+                // that is not yet full means the budget is still unspent and its
+                // farthest entry is no cutoff. Unfiltered, the original rule
+                // stands and existing graphs and query results reproduce
+                // exactly.
+                if c.dist > beam.farthest() && (!filtered || beam.results.len() >= ef) {
                     break;
                 }
-                beam.tr.expansions -= 1;
+                if filtered {
+                    if beam.tr.expansions == 0 {
+                        break;
+                    }
+                    beam.tr.expansions -= 1;
+                }
+                beam.tr.cost.expansions += 1;
+                let bridged =
+                    self.expand(query, c.id, layer, predicate, &mut beam, &mut bridges)?;
+                if filtered && !bridged {
+                    beam.deferred.push(c);
+                }
             }
-            beam.tr.cost.expansions += 1;
-            self.expand(query, c.id, layer, predicate, &mut beam, &mut bridges)?;
+
+            // The walk ended with the heap unfilled. Under a selective
+            // predicate that means the matching subgraph fragmented: with one
+            // node in twenty matching and ~2m neighbors each, a matching node
+            // often has one or two matching neighbors and they are each
+            // other's, so the search explored one small component and ran out
+            // of frontier. Nothing above notices, because every expansion found
+            // a match and so never bridged — and raising `ef_search` does not
+            // help, since the frontier empties long before the budget does.
+            //
+            // So go back to those expansions and bridge out of them, nearest
+            // first. This is deliberately a *last resort* rather than a looser
+            // rule up in `expand`: bridging whenever the heap is unfilled also
+            // works, and pays on every selective query instead of only the
+            // stranded ones — measured on 20 000 rows at 128 dimensions, 3.8-4.4x
+            // the latency at 1% selectivity. This form is free wherever the heap
+            // fills: the counters and recall there are identical to not having
+            // it at all.
+            //
+            // Layer 0 only. The layers above it are navigation and the descent's
+            // probe for a foothold, whose results are seeds rather than answers
+            // — one is enough, and an unfilled heap there means nothing. They
+            // also share a single detour allowance across the whole descent, so
+            // a rescue up there could drain the pot and leave the layers below
+            // unable to bridge at all, which is the starvation
+            // `Traversal::refill_detours` exists to prevent.
+            if layer != 0 || !filtered || beam.results.len() >= ef || beam.tr.detours == 0 {
+                break;
+            }
+            let mut deferred = core::mem::take(&mut beam.deferred);
+            if deferred.is_empty() {
+                break;
+            }
+            // Nearest the query first: the allowance is bounded and usually runs
+            // out inside one rescue round, so where it is spent decides what the
+            // round is worth.
+            deferred.sort_unstable();
+            let mut progressed = false;
+            for cand in deferred {
+                if beam.tr.detours == 0 {
+                    break;
+                }
+                progressed |= self.bridge_out(query, cand.id, layer, predicate, &mut beam)?;
+            }
+            // Each node is rescued at most once — `take` empties the list — and
+            // the allowance only falls, so this terminates.
+            if !progressed {
+                break;
+            }
         }
 
         let mut out = beam.results.into_vec();
@@ -3334,5 +3421,116 @@ mod tests {
             costs[0],
             costs[1]
         );
+    }
+    /// The same 500x20 grid as [`build_correlated`], but labelled by a *hash* of
+    /// the id, so the matching set is spread through every neighbourhood
+    /// instead of forming columns.
+    ///
+    /// This is the uncorrelated shape, and it is not the easy case it sounds
+    /// like. At one node in twenty matching and ~32 neighbours each, a matching
+    /// node has one or two matching neighbours and they are often each other's:
+    /// the matching subgraph breaks into small components, and a traversal that
+    /// only bridges when it finds *no* match explores one of them and stops.
+    fn build_hash_labeled(n: usize) -> Hnsw {
+        let mut h = Hnsw::new(HnswParams {
+            m: 16,
+            ef_construction: 64,
+            gamma: 1.0,
+            metric: Metric::L2,
+            seed: 7,
+        });
+        for i in 0..n {
+            // splitmix64, so the label does not correlate with position. An
+            // arithmetic label cannot do this job here: x is `i % 500` and 100
+            // divides 500, so any `(a*i + b) % 100` is a function of x and would
+            // reproduce the *correlated* fixture under another name.
+            let mut z = (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^= z >> 31;
+            h.insert_with_attrs(
+                vec![(i % 500) as f32, (i / 500) as f32],
+                vec![AttrValue::Int((z % 100) as i64)],
+            )
+            .expect("insert");
+        }
+        h
+    }
+
+    #[test]
+    fn selective_filter_escapes_a_fragmented_matching_subgraph() {
+        let h = build_hash_labeled(10_000);
+        let pred = selectivity(5);
+        let (mut hits, mut total, mut short) = (0usize, 0usize, 0usize);
+        for qx in (7..500).step_by(19) {
+            for qy in [3.0f32, 10.0, 16.0] {
+                let q = [qx as f32, qy];
+                let truth = matching_truth(&h, &q, &pred, 10);
+                let res = h
+                    .search_filtered(&q, 10, 64, &pred)
+                    .expect("filtered search");
+                assert!(
+                    res.iter().all(|&(_, id)| pred.matches(h.attrs(id))),
+                    "filtered search returned a node that fails the predicate"
+                );
+                if res.len() < 10 {
+                    short += 1;
+                }
+                hits += res.iter().filter(|(_, id)| truth.contains(id)).count();
+                total += truth.len();
+            }
+        }
+        let recall = hits as f64 / total as f64;
+        // Observed 0.996, and 0.751 when the walk could only bridge out of a
+        // node with no matching neighbour at all.
+        assert!(
+            recall >= 0.85,
+            "recall@10 over an uncorrelated 5% filter: {recall:.3}"
+        );
+        assert_eq!(short, 0, "{short} queries came back under 10 rows");
+    }
+
+    #[test]
+    fn a_wider_beam_still_buys_recall_under_a_selective_filter() {
+        // The defect here is subtler than a low number: raising `ef_search`
+        // stopped helping at all. Once the walk has explored its component the
+        // frontier is empty, and a bigger budget has nothing left to spend
+        // itself on — so recall flattened into a ceiling no setting could
+        // clear. Measured on this fixture at 1% selectivity, ef 64 → 512 used
+        // to move recall 0.356 → 0.530, and at 2% it was flat from ef 128
+        // onward (0.514 → 0.515).
+        //
+        // A bar on recall alone would not catch that coming back: 0.53 reads as
+        // ordinary ANN recall on a hard fixture. The property worth pinning is
+        // that the curve still *rises*.
+        let h = build_hash_labeled(10_000);
+        let pred = selectivity(1);
+        let recall_at = |ef: usize| {
+            let (mut hits, mut total) = (0usize, 0usize);
+            for qx in (7..500).step_by(19) {
+                for qy in [3.0f32, 10.0, 16.0] {
+                    let q = [qx as f32, qy];
+                    let truth = matching_truth(&h, &q, &pred, 10);
+                    let res = h.search_filtered(&q, 10, ef, &pred).expect("search");
+                    assert!(res.iter().all(|&(_, id)| pred.matches(h.attrs(id))));
+                    hits += res.iter().filter(|(_, id)| truth.contains(id)).count();
+                    total += truth.len();
+                }
+            }
+            hits as f64 / total as f64
+        };
+        let (narrow, wide) = (recall_at(64), recall_at(512));
+        // Observed 0.500 → 0.985, a gain of 0.485; the old ceiling gained 0.174.
+        //
+        // The `narrow` escape matters: a bar on the *gain* alone also pins the
+        // narrow end down, so a later change that lifts recall at ef 64 would
+        // turn this red for getting better. What must not come back is a wide
+        // beam buying nothing.
+        assert!(
+            wide - narrow >= 0.30 || narrow >= 0.90,
+            "an 8x wider beam moved recall only {narrow:.3} → {wide:.3}: \
+             ef_search has stopped buying recall under a selective filter"
+        );
+        assert!(wide >= 0.85, "recall@10 at ef_search 512: {wide:.3}");
     }
 }

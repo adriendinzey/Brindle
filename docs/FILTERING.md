@@ -135,6 +135,55 @@ One foothold per layer is enough; carrying 2, 4 or 8 down measured no better,
 because what the probe has to get right is *which region*, and the layer below
 re-probes from wherever it lands.
 
+### (d) a last resort when the matching subgraph fragments
+
+(a) through (c) all assume that once the search is *in* the right region it can
+move around inside it. A selective predicate can break that assumption without
+moving the matching rows anywhere: at one node in twenty matching and ~2m
+neighbours each, a matching node typically has one or two matching neighbours
+and they are frequently each other's. The matching subgraph stops being one
+graph and becomes a scatter of small components.
+
+The traversal above bridges only when an expansion finds **no** match within two
+hops. A node with even one matching neighbour therefore never bridges out, and
+the walk stays inside whichever component it entered. Worse than the recall loss
+is what it does to the knob: once that component is exhausted the frontier is
+empty, so **`ef_search` stops buying anything at all**. Measured on a 10 000-node
+grid with a hash-derived 1%-selective label, recall@10 went 0.356 → 0.455 →
+0.526 → 0.530 for `ef_search` 64 → 128 → 256 → 512, and at 2% it was flat from
+128 onward. A wider beam cannot help a search that has nothing left to expand.
+
+The fix is to remember the expansions that did *not* bridge, and to go back to
+them — nearest first — when the walk ends with the result heap unfilled:
+
+```
+walk the frontier as usual
+while the heap is unfilled and detours remain:
+    for each expansion that found a match and so never bridged:
+        bridge out of it
+    resume the walk
+```
+
+**Deliberately a last resort.** Loosening the rule up in the expansion instead —
+bridge whenever the heap is unfilled — also fixes the fragmentation, and pays on
+every selective query rather than only the stranded ones: measured on 20 000 rows
+at 128 dimensions, 3.8–4.4× the latency at 1% selectivity. The last-resort form
+costs nothing wherever the heap fills — at `ef_search` 64 its distance,
+expansion and detour counters and its recall are *identical* to not having it —
+and turns the ceiling back into a curve: 0.915 → **0.998** at `ef_search` 256,
+0.928 → **1.000** at 1024.
+
+**And it is not free where it does fire.** Whenever the matching set is smaller
+than `ef_search` the result heap can never fill, so the rescue runs on every such
+query and spends the layer-0 detour allowance in full. Measured on the same
+index at 1% selectivity — about 200 matching rows — `ef_search` 256 goes from 245
+to 1302 distances per query (0.79 → 5.73 ms) for recall 0.933 → 0.997, and
+`ef_search` 1024 from 245 to 4376 (0.77 → 20.87 ms) for 0.933 → 1.000. That is
+the trade on offer: recall that was previously unreachable at any setting, bought
+with work proportional to the allowance. It stays inside the bounds below, and
+the stopping rule is worth knowing — the rescue runs until the heap holds
+`ef_search` matches, not until it holds the `k` the query asked for.
+
 ### What bounds all this
 
 A filtered search may walk through nodes it can never return, so the result heap
@@ -148,7 +197,7 @@ dozen hops away unreachable at any sane `ef_search`.
 
 | Allowance | Default | Scope | What it bounds |
 |---|---|---|---|
-| detours | `4 × ef_search` non-matching nodes enqueued | one for the descent probe, one for layer 0 | the walk through a region with no matches within two hops |
+| detours | `4 × ef_search` non-matching nodes enqueued | one for the descent probe, one for layer 0 | both walks through non-matching ground: the two-hop-stranded case above, and the rescue in § 2(d), which is the larger consumer of layer 0's share |
 | expansions | `16 × ef_search` nodes popped and expanded | every predicate-aware layer search, together | the filtered walk, whatever the predicate does |
 
 The detour allowance is *per phase* rather than per search, because the descent

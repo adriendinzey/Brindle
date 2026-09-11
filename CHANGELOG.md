@@ -84,6 +84,34 @@ versions may break).
 
 ### Changed
 
+- **Fixed: a selective filter could strand the search in one fragment of the
+  matching rows — and `brindle.ef_search` stopped helping.** At around one row in
+  twenty matching, the matching rows stop forming one connected graph: a matching
+  row usually has one or two matching neighbours and they are often each other's.
+  Traversal only bridged out of a row with *no* matching neighbour, so it
+  explored one fragment and stopped, and because the frontier was empty rather
+  than the budget spent, raising `ef_search` bought nothing. Measured on 10 000
+  rows at 1% selectivity, recall@10 was 0.356 / 0.455 / 0.526 / 0.530 at
+  `ef_search` 64 / 128 / 256 / 512 — a ceiling, not a curve.
+
+  A search that ends with fewer than `ef_search` matching rows now goes back to
+  the rows it walked past and bridges out of them, nearest first. Recall@10 on
+  that fixture becomes 0.500 / 0.709 / 0.922 / 0.985, and on a 20 000-row
+  128-dimensional index at 1% selectivity the old ceiling of 0.928 becomes 1.000.
+
+  It costs nothing where it is not needed: a query whose result heap fills never
+  reaches it — its counters and recall are identical to not having it — and a
+  predicate nothing satisfies is unchanged. A filter *correlated* with vector
+  position benefits too, at 1% selectivity going 0.872 → 0.905.
+
+  Where it does fire it is not cheap, and the trade is the point. Whenever fewer
+  rows match than `brindle.ef_search`, the heap cannot fill and the query spends
+  its detour allowance in full: on 20 000 rows at 128 dimensions and 1%
+  selectivity, `ef_search` 256 goes from 0.79 ms to 5.73 ms per query for recall
+  0.933 → 0.997, and `ef_search` 1024 from 0.77 ms to 20.87 ms for 0.933 →
+  1.000. That is recall which was previously unreachable at any setting. Lower
+  `brindle.ef_search` if you would rather have the old cost than the extra
+  recall.
 - **Fixed: a float comparison could return the wrong rows.** The index ordered
   floats by IEEE 754, where `NaN` compares with nothing, while PostgreSQL gives
   floats a total order in which `'NaN' = 'NaN'` holds and `NaN` sorts above
