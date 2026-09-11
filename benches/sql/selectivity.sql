@@ -4,6 +4,14 @@
 -- has built `bench_vectors` and `bench_queries` and pgvector_compare.sql has
 -- copied them into `pgv_vectors`. Same rows, same query vectors, same k.
 --
+-- RUN IT ON A FRESH FIXTURE, which is what the driver does -- it creates the
+-- database per run. Running this file twice against the same database does not
+-- reproduce: the label UPDATE below rewrites every row, so the second run finds
+-- the heap in a different physical order, `ambuild` scans it in that order, and
+-- the graph it builds is a different one. Measured, Brindle's recall at 50%
+-- correlated moved 0.940 -> 0.803 between a clean run and an in-place re-run of
+-- the identical file. Neither number is wrong; they are different graphs.
+--
 -- This is the benchmark the project exists to produce. Three ways to answer
 -- "the k nearest rows that also satisfy a predicate":
 --
@@ -35,11 +43,21 @@
 \set ON_ERROR_STOP on
 \timing off
 
-DROP TABLE IF EXISTS sel_truth, sel_timings, sel_recall, sel_points;
+DROP TABLE IF EXISTS sel_truth, sel_timings, sel_recall, sel_points, sel_ladder, sel_rebuild;
 
 SELECT set_config('bench.k', :'k', false);
 
 -- ------------------------------------------------------------------ labels
+
+-- Both graphs go before the labels land. The UPDATE below rewrites every row,
+-- and with the indexes live that is 100k tuple inserts into two HNSW graphs
+-- that are about to be replaced anyway -- a third of the run's wall time.
+--
+-- `bench_idx` belongs to index_baseline.sql, which runs earlier in the same
+-- database; this file replaces it with one carrying the attribute columns. Do
+-- not expect the baseline's index to still exist after this file runs.
+DROP INDEX IF EXISTS bench_idx;
+DROP INDEX IF EXISTS pgv_idx;
 
 ALTER TABLE bench_vectors ADD COLUMN IF NOT EXISTS lbl_spread int;
 ALTER TABLE bench_vectors ADD COLUMN IF NOT EXISTS lbl_local int;
@@ -128,10 +146,6 @@ BEGIN
     END IF;
 END $$;
 
--- The baseline's own index would also match `ORDER BY embedding <-> q`, and the
--- planner may prefer it; drop it so the measured plan is unambiguous.
-DROP INDEX IF EXISTS bench_idx;
-
 -- ------------------------------------------------- ground truth (exact, once)
 
 CREATE TABLE sel_points (shape text, sel int);
@@ -204,26 +218,32 @@ CREATE TABLE sel_recall (engine text, shape text, sel int, ef int,
 -- Every measured plan must actually use the index it claims to. A planner that
 -- fell back to a sequential scan would turn this into a comparison of seq scans.
 DO $$
-DECLARE line text; ok bool; q brindle_vector; qv text;
+DECLARE line text; ok bool; q brindle_vector; qv text; col text;
 BEGIN
     SET LOCAL enable_seqscan = off;
     SELECT embedding INTO q FROM bench_queries ORDER BY id LIMIT 1;
     qv := q::text;
 
-    ok := false;
-    FOR line IN EXECUTE format(
-        'EXPLAIN (COSTS OFF) SELECT id FROM bench_vectors WHERE lbl_spread <= 5 '
-        'ORDER BY embedding <-> %L::brindle_vector LIMIT 10', qv)
-    LOOP
-        IF line LIKE '%sel_brindle_idx%' THEN ok := true; END IF;
-        IF line LIKE '%Filter: (lbl_spread%' THEN
-            RAISE EXCEPTION 'brindle is post-filtering: the qual did not reach the index:%',
-                E'\n' || line;
+    -- Both labels, not just one: `lbl_local` is the headline arm and a separate
+    -- key column, so a guard that only checks `lbl_spread` leaves the figure
+    -- everybody will quote unasserted.
+    FOREACH col IN ARRAY ARRAY['lbl_spread', 'lbl_local'] LOOP
+        ok := false;
+        FOR line IN EXECUTE format(
+            'EXPLAIN (COSTS OFF) SELECT id FROM bench_vectors WHERE %I <= 5 '
+            'ORDER BY embedding <-> %L::brindle_vector LIMIT 10', col, qv)
+        LOOP
+            IF line LIKE '%sel_brindle_idx%' THEN ok := true; END IF;
+            IF line LIKE ('%Filter: (' || col || '%') THEN
+                RAISE EXCEPTION
+                    'brindle is post-filtering on %: the qual did not reach the index:%',
+                    col, E'\n' || line;
+            END IF;
+        END LOOP;
+        IF NOT ok THEN
+            RAISE EXCEPTION 'the brindle arm does not use sel_brindle_idx for %', col;
         END IF;
     END LOOP;
-    IF NOT ok THEN
-        RAISE EXCEPTION 'the brindle arm does not use sel_brindle_idx';
-    END IF;
 
     ok := false;
     FOR line IN EXECUTE format(
@@ -257,18 +277,25 @@ BEGIN
     -- entirely on whichever point is measured first.
     PERFORM set_config('brindle.ef_search', '64', false);
     PERFORM set_config('hnsw.ef_search', '64', false);
-    FOR q IN SELECT id, embedding FROM bench_queries ORDER BY id LIMIT 3 LOOP
+    FOR q IN SELECT id, embedding, embedding::text::vector AS qv
+             FROM bench_queries ORDER BY id LIMIT 3 LOOP
         SELECT count(*) INTO warm FROM (
             SELECT id FROM bench_vectors WHERE lbl_spread <= 5
             ORDER BY embedding <-> q.embedding LIMIT k) s;
         SELECT count(*) INTO warm FROM (
             SELECT id FROM pgv_vectors WHERE lbl_spread <= 5
-            ORDER BY embedding <-> q.embedding::text::vector LIMIT k) s;
+            ORDER BY embedding <-> q.qv LIMIT k) s;
     END LOOP;
 
     -- Query outermost so every engine and every point shares cache state; a
     -- block sweep would hand the first block a colder cache than the last.
-    FOR q IN SELECT id, embedding FROM bench_queries ORDER BY id LOOP
+    -- `qv` is the pgvector-typed copy of the same query vector, cast ONCE here.
+    -- Casting inside the timed EXECUTE would charge pgvector for a conversion
+    -- Brindle is not charged for: measured at 0.027 ms p50, which is ~3% of the
+    -- sub-millisecond points and enough to move an ordering. pgvector_compare.sql
+    -- hoists the identical cast for the same reason.
+    FOR q IN SELECT id, embedding, embedding::text::vector AS qv
+             FROM bench_queries ORDER BY id LOOP
         FOR p IN SELECT shape, sel FROM sel_points LOOP
             col := 'lbl_' || p.shape;
             FOREACH ef IN ARRAY efs LOOP
@@ -295,7 +322,7 @@ BEGIN
                 EXECUTE format(
                     'SELECT array_agg(id) FROM (SELECT id FROM pgv_vectors '
                     'WHERE %I <= %s ORDER BY embedding <-> $1 LIMIT %s) s',
-                    col, p.sel, k) INTO found USING q.embedding::text::vector;
+                    col, p.sel, k) INTO found USING q.qv;
                 INSERT INTO sel_timings VALUES ('pgv_post', p.shape, p.sel, ef,
                     extract(epoch FROM clock_timestamp() - started) * 1000, q.id);
                 INSERT INTO sel_recall
@@ -310,7 +337,7 @@ BEGIN
                 EXECUTE format(
                     'SELECT array_agg(id) FROM (SELECT id FROM pgv_vectors '
                     'WHERE %I <= %s ORDER BY embedding <-> $1 LIMIT %s) s',
-                    col, p.sel, k) INTO found USING q.embedding::text::vector;
+                    col, p.sel, k) INTO found USING q.qv;
                 INSERT INTO sel_timings VALUES ('pgv_iter', p.shape, p.sel, ef,
                     extract(epoch FROM clock_timestamp() - started) * 1000, q.id);
                 INSERT INTO sel_recall
@@ -322,6 +349,89 @@ BEGIN
                 PERFORM set_config('hnsw.iterative_scan', 'off', false);
             END LOOP;
         END LOOP;
+    END LOOP;
+END $$;
+
+-- --------------------------------------------- how recall answers to budget
+
+-- Brindle only, and deliberately so: this answers "does ef_search still convert
+-- into recall under a correlated filter", which is a property of this index and
+-- not a comparison. It is cheap because it is one engine, and it lives in the
+-- harness rather than in an ad-hoc script because the table it produces defends
+-- the most awkward shape in the results -- a recall dip at moderate selectivity
+-- -- and a number that defends a result has to be regenerable by the documented
+-- command like every other number here.
+CREATE TABLE sel_ladder (sel int, ef int, recall numeric);
+
+DO $$
+DECLARE
+    k int := current_setting('bench.k')::int;
+    ef int; v_sel int; q record; found int[]; truth int[]; hits int; tot int; cnt int;
+BEGIN
+    SET LOCAL enable_seqscan = off;
+    FOREACH v_sel IN ARRAY ARRAY[10, 5, 1] LOOP
+        FOREACH ef IN ARRAY ARRAY[64, 256, 1024, 4096] LOOP
+            PERFORM set_config('brindle.ef_search', ef::text, false);
+            hits := 0; tot := 0;
+            FOR q IN SELECT id, embedding FROM bench_queries ORDER BY id LOOP
+                EXECUTE format(
+                    'SELECT array_agg(id) FROM (SELECT id FROM bench_vectors '
+                    'WHERE lbl_local <= %s ORDER BY embedding <-> $1 LIMIT %s) s',
+                    v_sel, k) INTO found USING q.embedding;
+                SELECT t.ids INTO truth FROM sel_truth t
+                 WHERE t.shape = 'local' AND t.sel = v_sel AND t.query_id = q.id;
+                SELECT count(*) INTO cnt
+                  FROM unnest(coalesce(found, '{}'::int[])) f WHERE f = ANY (truth);
+                hits := hits + cnt; tot := tot + k;
+            END LOOP;
+            INSERT INTO sel_ladder VALUES (v_sel, ef, round(hits::numeric / tot, 3));
+        END LOOP;
+    END LOOP;
+END $$;
+
+-- ------------------------------------ how far pgvector's figure moves per build
+
+-- pgvector's build is randomised and Brindle's is not. This document already
+-- records that quoting a single pgvector run as though it were "the value" is a
+-- mistake it has made before, so the headline point gets rebuilt and remeasured
+-- rather than sampled once. Brindle's recall is deterministic and needs no
+-- equivalent.
+CREATE TABLE sel_rebuild (trial int, recall numeric, p50_ms numeric);
+
+DO $$
+DECLARE
+    k int := current_setting('bench.k')::int;
+    trial int; q record; found int[]; truth int[]; hits int; tot int; cnt int;
+    started timestamptz; ms double precision[]; 
+BEGIN
+    SET LOCAL enable_seqscan = off;
+    FOR trial IN 1..3 LOOP
+        IF trial > 1 THEN
+            DROP INDEX sel_pgv_idx;
+            SET LOCAL maintenance_work_mem = '2GB';
+            CREATE INDEX sel_pgv_idx ON pgv_vectors
+                USING hnsw (embedding vector_l2_ops) WITH (m = 16, ef_construction = 64);
+        END IF;
+        PERFORM set_config('hnsw.ef_search', '64', false);
+        PERFORM set_config('hnsw.iterative_scan', 'relaxed_order', false);
+        hits := 0; tot := 0; ms := '{}';
+        FOR q IN SELECT id, embedding::text::vector AS qv FROM bench_queries ORDER BY id LOOP
+            started := clock_timestamp();
+            SELECT array_agg(id) INTO found FROM (
+                SELECT id FROM pgv_vectors WHERE lbl_local <= 1
+                ORDER BY embedding <-> q.qv LIMIT k) s;
+            ms := ms || (extract(epoch FROM clock_timestamp() - started) * 1000);
+            SELECT t.ids INTO truth FROM sel_truth t
+             WHERE t.shape = 'local' AND t.sel = 1 AND t.query_id = q.id;
+            SELECT count(*) INTO cnt
+              FROM unnest(coalesce(found, '{}'::int[])) f WHERE f = ANY (truth);
+            hits := hits + cnt; tot := tot + k;
+        END LOOP;
+        INSERT INTO sel_rebuild
+        SELECT trial, round(hits::numeric / tot, 3),
+               round(percentile_cont(0.5) WITHIN GROUP (ORDER BY m)::numeric, 3)
+        FROM unnest(ms) m;
+        PERFORM set_config('hnsw.iterative_scan', 'off', false);
     END LOOP;
 END $$;
 
@@ -350,6 +460,28 @@ GROUP BY r.sel, r.ef ORDER BY r.sel DESC, r.ef;
 \if :{?chart_csv}
 COPY (SELECT r.shape, r.sel, r.ef, r.engine, round(avg(r.hits)::numeric / (SELECT current_setting('bench.k')::int), 4) AS recall, round((SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY t.elapsed_ms) FROM sel_timings t WHERE t.shape = r.shape AND t.sel = r.sel AND t.ef = r.ef AND t.engine = r.engine)::numeric, 4) AS p50_ms FROM sel_recall r GROUP BY r.shape, r.sel, r.ef, r.engine ORDER BY r.shape, r.sel DESC, r.ef, r.engine) TO :'chart_csv' WITH (FORMAT csv, HEADER);
 \endif
+
+\echo
+\echo '=== does ef_search still buy recall? (brindle, correlated label) ==='
+SELECT sel AS "sel %",
+       max(recall) FILTER (WHERE ef = 64)   AS "ef 64",
+       max(recall) FILTER (WHERE ef = 256)  AS "ef 256",
+       max(recall) FILTER (WHERE ef = 1024) AS "ef 1024",
+       max(recall) FILTER (WHERE ef = 4096) AS "ef 4096"
+FROM sel_ladder GROUP BY sel ORDER BY sel DESC;
+
+\echo
+\echo '=== pgvector iterative scan across rebuilds (1% correlated, ef 64) ==='
+\echo '    brindle is deterministic here; the pgvector build is not'
+SELECT trial, recall, p50_ms FROM sel_rebuild ORDER BY trial;
+
+\echo
+\echo '=== build parameters (identical on both sides) ==='
+SELECT 16 AS m, 64 AS ef_construction,
+       (SELECT reloptions FROM pg_class WHERE relname = 'sel_brindle_idx') AS brindle_reloptions,
+       current_setting('hnsw.iterative_scan') AS pgv_iterative_scan,
+       current_setting('hnsw.max_scan_tuples') AS pgv_max_scan_tuples,
+       current_setting('hnsw.scan_mem_multiplier') AS pgv_scan_mem_multiplier;
 
 \echo
 \echo '=== median latency, ms (and QPS at one connection) ==='

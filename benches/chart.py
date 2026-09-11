@@ -110,6 +110,9 @@ def main():
         print("chart: no correlated-label rows in the results", file=sys.stderr)
         return 1
     sels = sorted({r["sel"] for r in data}, reverse=True)
+    if len(sels) < 2:
+        print("chart: need at least two selectivity points", file=sys.stderr)
+        return 1
 
     out = [
         f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {W} {H}" width="{W}" height="{H}" font-family="system-ui, -apple-system, Segoe UI, sans-serif">',
