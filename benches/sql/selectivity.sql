@@ -49,6 +49,25 @@ SELECT set_config('bench.k', :'k', false);
 
 -- ------------------------------------------------------------------ labels
 
+-- Refuse to run twice against the same fixture, rather than trusting the comment
+-- above to be read. The second run would silently measure a *different graph* --
+-- the UPDATE below rewrites every row, so `ambuild` scans a differently-ordered
+-- heap -- and produce numbers that look entirely plausible. Measured, 0.940
+-- against 0.803 at 50% correlated. That is the worst kind of failure for a
+-- benchmark: no error, just a different answer.
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM information_schema.columns
+                WHERE table_name = 'bench_vectors' AND column_name = 'lbl_spread')
+    THEN
+        RAISE EXCEPTION
+            'this database has already been swept: bench_vectors.lbl_spread exists. '
+            'Re-running in place rewrites every row and rebuilds a different graph, '
+            'so the numbers would not be comparable to a clean run. Use '
+            'scripts/bench_index.sh, which creates a fresh database per run.';
+    END IF;
+END $$;
+
 -- Both graphs go before the labels land. The UPDATE below rewrites every row,
 -- and with the indexes live that is 100k tuple inserts into two HNSW graphs
 -- that are about to be replaced anyway -- a third of the run's wall time.
@@ -59,8 +78,8 @@ SELECT set_config('bench.k', :'k', false);
 DROP INDEX IF EXISTS bench_idx;
 DROP INDEX IF EXISTS pgv_idx;
 
-ALTER TABLE bench_vectors ADD COLUMN IF NOT EXISTS lbl_spread int;
-ALTER TABLE bench_vectors ADD COLUMN IF NOT EXISTS lbl_local int;
+ALTER TABLE bench_vectors ADD COLUMN lbl_spread int;
+ALTER TABLE bench_vectors ADD COLUMN lbl_local int;
 
 -- A fixed reference point for the correlated label: the first query vector, so
 -- the matching regions sit somewhere the queries actually are.
@@ -97,8 +116,8 @@ BEGIN
     END IF;
 END $$;
 
-ALTER TABLE pgv_vectors ADD COLUMN IF NOT EXISTS lbl_spread int;
-ALTER TABLE pgv_vectors ADD COLUMN IF NOT EXISTS lbl_local int;
+ALTER TABLE pgv_vectors ADD COLUMN lbl_spread int;
+ALTER TABLE pgv_vectors ADD COLUMN lbl_local int;
 UPDATE pgv_vectors p
 SET lbl_spread = v.lbl_spread, lbl_local = v.lbl_local
 FROM bench_vectors v WHERE v.id = p.id;

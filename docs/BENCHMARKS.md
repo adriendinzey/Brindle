@@ -441,18 +441,18 @@ unnoticed for four tasks (`docs/FILTERING.md` § 2(d)).
 
 | selectivity | ef | brindle | pgv_iter | pgv_post |
 |---|---|---|---|---|
-| 50% | 64 | **0.940** / 0.79 ms | 0.833 / 0.90 | 0.697 / **0.76** |
-| 50% | 256 | **0.963** / **1.06** | 0.860 / 1.34 | 0.760 / 1.31 |
-| 10% | 64 | **0.770** / 2.05 | 0.657 / 5.52 | 0.170 / **0.83** |
-| 10% | 256 | **0.877** / 6.82 | 0.680 / **5.47** | 0.197 / 1.70 |
-| 5% | 64 | **0.693** / 2.28 | 0.633 / 5.78 | 0.113 / **0.92** |
-| 5% | 256 | **0.840** / 7.66 | 0.683 / **6.59** | 0.140 / 1.72 |
-| 1% | 64 | **0.940** / 3.20 | 0.093 / 61.3 | 0.030 / **0.95** |
-| 1% | 256 | **0.957** / 11.1 | 0.093 / 56.0 | 0.030 / **1.83** |
+| 50% | 64 | **0.940** / 0.77 ms | 0.827 / 0.83 | 0.683 / **0.77** |
+| 50% | 256 | **0.963** / **0.97** | 0.833 / 1.29 | 0.747 / 1.26 |
+| 10% | 64 | **0.770** / 1.97 | 0.667 / 5.79 | 0.170 / **0.80** |
+| 10% | 256 | **0.877** / 6.66 | 0.713 / **5.68** | 0.197 / 1.58 |
+| 5% | 64 | **0.693** / 2.18 | 0.640 / 7.23 | 0.113 / **0.87** |
+| 5% | 256 | **0.840** / 7.21 | 0.663 / **6.93** | 0.140 / 1.66 |
+| 1% | 64 | **0.940** / 3.05 | 0.077 / 58.3 | 0.033 / **0.96** |
+| 1% | 256 | **0.957** / 10.6 | 0.077 / 55.4 | 0.033 / **1.76** |
 
 **The result is recall nobody else reaches, at a throughput that makes it
-usable.** At 1% selectivity Brindle answers at 0.940 recall in 3.2 ms; pgvector's
-iterative scan reaches 0.093 in 61 ms. Post-filtering and iterative scan fail
+usable.** At 1% selectivity Brindle answers at 0.940 recall in 3.0 ms; pgvector's
+iterative scan reaches 0.077 in 58 ms. Post-filtering and iterative scan fail
 this case for the same underlying reason: neither can steer the walk toward rows
 that match, so one gives up early and the other pays to enumerate.
 
@@ -461,7 +461,7 @@ useful.** 0.030 recall means it found, on average, a third of one of the ten row
 the query asked for. Speed on a wrong answer is not a trade-off.
 
 **Where Brindle costs more.** At `ef_search` 256 and 5–10% selectivity it is
-slower than iterative scan — 7.66 ms against 6.59 at 5% — for better recall. And
+slower than iterative scan — 7.21 ms against 6.93 at 5% — for better recall. And
 post-filtering is faster than everything, everywhere: if a filter keeps half the
 table and 0.70 recall is acceptable, the naive approach is the cheap answer.
 
@@ -472,8 +472,8 @@ at length above, and which an earlier draft of *this* section then ignored by
 quoting one run as though it were the value.
 
 The harness now rebuilds pgvector's index three times at the headline point and
-reports each. Across five builds observed in total: iterative-scan recall at 1%
-correlated ranges **0.057 – 0.163**, median latency 56–67 ms. Brindle's 0.940 is
+reports each. Across eight builds observed in total: iterative-scan recall at 1% correlated
+ranges **0.057 – 0.163**, median latency 55–71 ms. Brindle's 0.940 is
 identical in every run.
 
 The recall ratio is therefore somewhere between 6x and 16x depending on which
@@ -503,18 +503,18 @@ The tables above use pgvector's defaults, which is what an untuned user gets.
 
 | selectivity | ef | brindle | pgv_iter | pgv_post |
 |---|---|---|---|---|
-| 50% | 64 | **0.987** | 0.913 | 0.913 |
-| 10% | 64 | **0.997** | 0.940 | 0.530 |
-| 5% | 64 | **0.993** | 0.980 | 0.220 |
-| 1% | 64 | 0.893 | **0.967** | 0.023 |
-| 1% | 256 | **0.973** | 0.970 | 0.203 |
+| 50% | 64 | **0.987** | 0.950 | 0.950 |
+| 10% | 64 | **0.997** | 0.960 | 0.543 |
+| 5% | 64 | **0.993** | 0.967 | 0.233 |
+| 1% | 64 | 0.893 | **0.930** | 0.023 |
+| 1% | 256 | **0.973** | 0.947 | 0.217 |
 
 When matching rows are spread through every neighbourhood, iterative scan is
 excellent, and **at 1% selectivity and the default `ef_search` it beats Brindle,
-0.967 against 0.893.** It should: with matches everywhere, pulling more
+0.930 against 0.893.** It should: with matches everywhere, pulling more
 candidates finds them, and there is nothing for predicate-aware traversal to be
 clever about. Brindle recovers the point at `ef_search` 256 (0.973 against
-0.970), but at the default it loses, and that is the honest reading.
+0.947), but at the default it loses, and that is the honest reading.
 
 Brindle's advantage is about *reaching* matching rows that are somewhere else.
 Where they are not somewhere else, it has none to offer.

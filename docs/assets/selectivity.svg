@@ -23,46 +23,46 @@
 <circle cx="342.9" cy="131.3" r="3.4" fill="#2b6cb0"/>
 <circle cx="463.1" cy="145.9" r="3.4" fill="#2b6cb0"/>
 <circle cx="742.0" cy="99.0" r="3.4" fill="#2b6cb0"/>
-<polyline points="64.0,119.3 342.9,152.9 463.1,157.4 742.0,260.2" fill="none" stroke="#b7791f" stroke-width="2.4"/>
-<circle cx="64.0" cy="119.3" r="3.4" fill="#b7791f"/>
-<circle cx="342.9" cy="152.9" r="3.4" fill="#b7791f"/>
-<circle cx="463.1" cy="157.4" r="3.4" fill="#b7791f"/>
-<circle cx="742.0" cy="260.2" r="3.4" fill="#b7791f"/>
-<polyline points="64.0,145.3 342.9,245.6 463.1,256.4 742.0,272.3" fill="none" stroke="#c53030" stroke-width="2.4"/>
-<circle cx="64.0" cy="145.3" r="3.4" fill="#c53030"/>
+<polyline points="64.0,120.5 342.9,151.0 463.1,156.1 742.0,263.4" fill="none" stroke="#b7791f" stroke-width="2.4"/>
+<circle cx="64.0" cy="120.5" r="3.4" fill="#b7791f"/>
+<circle cx="342.9" cy="151.0" r="3.4" fill="#b7791f"/>
+<circle cx="463.1" cy="156.1" r="3.4" fill="#b7791f"/>
+<circle cx="742.0" cy="263.4" r="3.4" fill="#b7791f"/>
+<polyline points="64.0,147.8 342.9,245.6 463.1,256.4 742.0,271.7" fill="none" stroke="#c53030" stroke-width="2.4"/>
+<circle cx="64.0" cy="147.8" r="3.4" fill="#c53030"/>
 <circle cx="342.9" cy="245.6" r="3.4" fill="#c53030"/>
 <circle cx="463.1" cy="256.4" r="3.4" fill="#c53030"/>
-<circle cx="742.0" cy="272.3" r="3.4" fill="#c53030"/>
+<circle cx="742.0" cy="271.7" r="3.4" fill="#c53030"/>
 <text x="64" y="346" class="ttl">median latency, ms (log scale)</text>
 <line x1="64" y1="554.0" x2="742" y2="554.0" class="grid"/>
 <text x="56" y="558.0" class="ax ar">0.61</text>
 <line x1="64" y1="504.0" x2="742" y2="504.0" class="grid"/>
-<text x="56" y="508.0" class="ax ar">2.00</text>
+<text x="56" y="508.0" class="ax ar">1.99</text>
 <line x1="64" y1="454.0" x2="742" y2="454.0" class="grid"/>
-<text x="56" y="458.0" class="ax ar">6.57</text>
+<text x="56" y="458.0" class="ax ar">6.42</text>
 <line x1="64" y1="404.0" x2="742" y2="404.0" class="grid"/>
-<text x="56" y="408.0" class="ax ar">21.52</text>
+<text x="56" y="408.0" class="ax ar">20.74</text>
 <line x1="64" y1="354.0" x2="742" y2="354.0" class="grid"/>
-<text x="56" y="358.0" class="ax ar">70.52</text>
+<text x="56" y="358.0" class="ax ar">67.04</text>
 <text x="64.0" y="572" class="ax mid">50%</text>
 <text x="342.9" y="572" class="ax mid">10%</text>
 <text x="463.1" y="572" class="ax mid">5%</text>
 <text x="742.0" y="572" class="ax mid">1%</text>
-<polyline points="64.0,543.1 342.9,503.0 463.1,498.5 742.0,484.3" fill="none" stroke="#2b6cb0" stroke-width="2.4"/>
-<circle cx="64.0" cy="543.1" r="3.4" fill="#2b6cb0"/>
-<circle cx="342.9" cy="503.0" r="3.4" fill="#2b6cb0"/>
-<circle cx="463.1" cy="498.5" r="3.4" fill="#2b6cb0"/>
-<circle cx="742.0" cy="484.3" r="3.4" fill="#2b6cb0"/>
-<polyline points="64.0,537.9 342.9,461.3 463.1,459.4 742.0,359.9" fill="none" stroke="#b7791f" stroke-width="2.4"/>
-<circle cx="64.0" cy="537.9" r="3.4" fill="#b7791f"/>
-<circle cx="342.9" cy="461.3" r="3.4" fill="#b7791f"/>
-<circle cx="463.1" cy="459.4" r="3.4" fill="#b7791f"/>
-<circle cx="742.0" cy="359.9" r="3.4" fill="#b7791f"/>
-<polyline points="64.0,544.6 342.9,541.0 463.1,536.7 742.0,535.5" fill="none" stroke="#c53030" stroke-width="2.4"/>
-<circle cx="64.0" cy="544.6" r="3.4" fill="#c53030"/>
-<circle cx="342.9" cy="541.0" r="3.4" fill="#c53030"/>
-<circle cx="463.1" cy="536.7" r="3.4" fill="#c53030"/>
-<circle cx="742.0" cy="535.5" r="3.4" fill="#c53030"/>
+<polyline points="64.0,544.3 342.9,504.3 463.1,500.0 742.0,485.8" fill="none" stroke="#2b6cb0" stroke-width="2.4"/>
+<circle cx="64.0" cy="544.3" r="3.4" fill="#2b6cb0"/>
+<circle cx="342.9" cy="504.3" r="3.4" fill="#2b6cb0"/>
+<circle cx="463.1" cy="500.0" r="3.4" fill="#2b6cb0"/>
+<circle cx="742.0" cy="485.8" r="3.4" fill="#2b6cb0"/>
+<polyline points="64.0,541.0 342.9,458.4 463.1,448.9 742.0,360.0" fill="none" stroke="#b7791f" stroke-width="2.4"/>
+<circle cx="64.0" cy="541.0" r="3.4" fill="#b7791f"/>
+<circle cx="342.9" cy="458.4" r="3.4" fill="#b7791f"/>
+<circle cx="463.1" cy="448.9" r="3.4" fill="#b7791f"/>
+<circle cx="742.0" cy="360.0" r="3.4" fill="#b7791f"/>
+<polyline points="64.0,544.5 342.9,543.0 463.1,539.1 742.0,534.8" fill="none" stroke="#c53030" stroke-width="2.4"/>
+<circle cx="64.0" cy="544.5" r="3.4" fill="#c53030"/>
+<circle cx="342.9" cy="543.0" r="3.4" fill="#c53030"/>
+<circle cx="463.1" cy="539.1" r="3.4" fill="#c53030"/>
+<circle cx="742.0" cy="534.8" r="3.4" fill="#c53030"/>
 <text x="403" y="594" class="ax mid">share of rows matching the predicate</text>
 <line x1="64" y1="538" x2="86" y2="538" stroke="#2b6cb0" stroke-width="2.4"/>
 <circle cx="75" cy="538" r="3.4" fill="#2b6cb0"/>

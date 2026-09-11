@@ -134,22 +134,22 @@ same rows and same ground truth on every side:
 
 | rows matching the filter | Brindle | pgvector iterative scan | pgvector post-filter |
 |---|---|---|---|
-| 50% | **0.940** / 0.79 ms | 0.833 / 0.90 ms | 0.697 / 0.76 ms |
-| 10% | **0.770** / 2.05 ms | 0.657 / 5.52 ms | 0.170 / 0.83 ms |
-| 5% | **0.693** / 2.28 ms | 0.633 / 5.78 ms | 0.113 / 0.92 ms |
-| 1% | **0.940** / 3.20 ms | 0.093 / 61.3 ms | 0.030 / 0.95 ms |
+| 50% | **0.940** / 0.77 ms | 0.827 / 0.83 ms | 0.683 / 0.77 ms |
+| 10% | **0.770** / 1.97 ms | 0.667 / 5.79 ms | 0.170 / 0.80 ms |
+| 5% | **0.693** / 2.18 ms | 0.640 / 7.23 ms | 0.113 / 0.87 ms |
+| 1% | **0.940** / 3.05 ms | 0.077 / 58.3 ms | 0.033 / 0.96 ms |
 
 *recall@10 / median latency.* At 1% selectivity Brindle answers at 0.940 recall
-in 3.2 ms where pgvector's iterative scan reaches 0.093 in 61 ms. Give pgvector
+in 3.0 ms where pgvector's iterative scan reaches 0.077 in 58 ms. Give pgvector
 its best configuration — both scan-budget settings opened up — and it reaches
 0.780 at about 160 ms, still behind on recall and roughly 50× slower.
 
 **Where it does not win.** With an *uncorrelated* filter — matching rows
 sprinkled through every neighbourhood — iterative scan is excellent, and at 1%
-selectivity it beats Brindle 0.967 to 0.893 at the default `ef_search`. It
+selectivity it beats Brindle 0.930 to 0.893 at the default `ef_search`. It
 should: with matches everywhere there is nothing for predicate-aware traversal to
 be clever about. Post-filtering is also faster than everything, everywhere; it is
-simply answering a different, wrong question at 0.030 recall. And pgvector's
+simply answering a different, wrong question at 0.033 recall. And pgvector's
 build is randomised, so its column moves between builds while Brindle's does not.
 
 The method, the full sweep at two `ef_search` points, the build-to-build range,

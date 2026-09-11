@@ -88,13 +88,13 @@ versions may break).
   in `docs/BENCHMARKS.md`, with the chart in the README.
 
   On 100 000 rows × 128 dimensions with a correlated filter at 1% selectivity,
-  Brindle answers at recall@10 of 0.940 in 3.2 ms where pgvector's iterative scan
-  reaches 0.093 in 61 ms and post-filtering 0.030. Opening up pgvector's two
+  Brindle answers at recall@10 of 0.940 in 3.0 ms where pgvector's iterative scan
+  reaches 0.077 in 58 ms and post-filtering 0.033. Opening up pgvector's two
   scan-budget settings takes it to 0.780 at about 160 ms — still behind on recall
   and roughly 50× slower.
 
   It does not win everywhere, and the write-up says so: with an *uncorrelated*
-  filter at 1% selectivity pgvector's iterative scan beats Brindle 0.967 to 0.893
+  filter at 1% selectivity pgvector's iterative scan beats Brindle 0.930 to 0.893
   at the default `ef_search`, and post-filtering is the fastest option at every
   point while answering a different question. pgvector's build is randomised, so
   its figures are reported as a range across rebuilds rather than as a number.
