@@ -82,6 +82,19 @@ versions may break).
 - Repository hygiene: PR/issue templates, Dependabot (cargo + GitHub Actions),
   contributor guide.
 
+### Added
+
+- **A filtered-search benchmark against pgvector**, sweeping predicate
+  selectivity for both an uncorrelated and a correlated label:
+  `SELECTIVITY=1 PGVECTOR=1 scripts/bench_index.sh`. Results, method and caveats
+  in `docs/BENCHMARKS.md`, with the chart in the README.
+
+  On 100 000 rows × 128 dimensions with a correlated filter at 1% selectivity,
+  Brindle returns recall@10 of 0.940 at 340 QPS where pgvector's iterative scan
+  returns 0.100 at 18 QPS and post-filtering returns 0.030. With an
+  *uncorrelated* filter the picture changes and pgvector's iterative scan wins at
+  1% selectivity, 0.963 to 0.893 — that is in the write-up too.
+
 ### Changed
 
 - **Fixed: a selective filter could strand the search in one fragment of the

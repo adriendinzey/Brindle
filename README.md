@@ -123,6 +123,35 @@ refused at `CREATE INDEX` rather than silently ignored — see
 Full setup notes (toolchain, the WSL2 native-filesystem loop, and parallel
 development) live in [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md).
 
+## Does it actually work?
+
+The point of the design is recall under a filter that correlates with the
+embedding — a category that tracks content, a price band that tracks product
+type, a tenant that tracks topic. On 100 000 rows × 128 dimensions, at the
+default `ef_search`, against the same rows and the same ground truth:
+
+![recall and latency against predicate selectivity](docs/assets/selectivity.svg)
+
+| rows matching the filter | Brindle | pgvector iterative scan | pgvector post-filter |
+|---|---|---|---|
+| 50% | **0.940** @ 1295 QPS | 0.837 @ 1155 | 0.683 @ 1223 |
+| 10% | **0.770** @ 520 | 0.653 @ 174 | 0.170 @ 1212 |
+| 5% | **0.693** @ 459 | 0.617 @ 148 | 0.113 @ 1078 |
+| 1% | **0.940** @ 340 QPS | 0.100 @ 18 QPS | 0.030 @ 1027 |
+
+*recall@10 @ queries/second.* At 1% selectivity Brindle returns 0.940 of the
+exact answer at 340 QPS where pgvector's best mode returns 0.100 at 18 QPS.
+
+**And where it does not win:** when the filter is *uncorrelated* with the
+embedding — matching rows sprinkled through every neighbourhood — pgvector's
+iterative scan is excellent, and at 1% selectivity it beats Brindle 0.963 to
+0.893. It should: with matches everywhere, pulling more candidates finds them,
+and there is nothing for predicate-aware traversal to be clever about. Only
+naive post-filtering loses on both shapes.
+
+The method, the full sweep, the honest caveats, and the one command that
+regenerates all of it are in [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
+
 ## Where it stands
 
 Measured on 100 000 rows × 128 dimensions, clustered, against pgvector 0.8.0 on

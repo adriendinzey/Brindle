@@ -14,6 +14,9 @@
 # scripts/worktree.sh). Holds absolute paths, so it must never be committed.
 .cargo/
 
+# Python bytecode from benches/chart.py
+__pycache__/
+
 # Editors / OS
 .idea/
 .vscode/
