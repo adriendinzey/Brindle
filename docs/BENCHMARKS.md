@@ -474,7 +474,7 @@ the query asked for. Speed on a wrong answer is not a trade-off.
 **Where Brindle costs more.** At `ef_search` 256 and 5–10% selectivity it is
 slower than iterative scan — 7.50 ms against 6.75 at 5% — for better recall. And
 post-filtering is cheaper than Brindle at every *tight* point: if a filter keeps
-one row in ten and 0.17 recall is acceptable, the naive approach is the cheap
+one row in ten and 0.19 recall is acceptable, the naive approach is the cheap
 answer. It is not cheaper everywhere — at 50% and `ef_search` 256 Brindle is the
 faster arm, 1.05 ms against 1.32.
 
@@ -540,7 +540,7 @@ excellent, and **Brindle loses more of this table than it wins**: at 1%
 selectivity and the default `ef_search` iterative scan is ahead 0.963 to 0.893;
 at 5% it is ahead at both beam widths; at 10% and 50% with a wide beam both
 pgvector arms reach 1.000 or 0.997 where Brindle sits at 0.997 and 0.993. And at
-1% with a wide beam Brindle is the *slower* arm, 4.05 ms against 3.24.
+1% with a wide beam Brindle is the *slower* arm, 4.06 ms against 3.68.
 
 It should lose here. With matches everywhere, pulling more candidates finds them,
 and there is nothing for predicate-aware traversal to be clever about — the

@@ -124,6 +124,15 @@ if [[ "${SELECTIVITY:-0}" == "1" ]]; then
     echo "==> chart written to docs/assets/selectivity.svg"
   fi
   echo "    raw numbers: $chart_csv"
+
+  # Check the committed write-up against the run that just happened. Stale
+  # figures have survived three review rounds of this benchmark by looking
+  # entirely plausible next to the tables they contradict.
+  log_copy="$(mktemp -t brindle-selectivity-XXXXXX.log)"
+  if python3 benches/verify_writeup.py "$log_copy" 2>/dev/null; then :; fi
+  echo "    to check the write-up against this run:"
+  echo "      <this command> 2>&1 | tee run.log && python3 benches/verify_writeup.py run.log"
+  rm -f "$log_copy"
 fi
 
 echo

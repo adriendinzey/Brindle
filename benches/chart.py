@@ -29,7 +29,7 @@ ENGINES = [
     ("exact", "#4a5568", "exact scan (the ceiling)"),
 ]
 
-W, H = 760, 580
+W, H = 760, 592  # the wrapped legend row needs space for descenders
 PAD_L, PAD_R, PAD_T = 64, 18, 20
 PANEL_H, PANEL_GAP = 200, 76
 
@@ -144,7 +144,8 @@ def main():
         f' class="ax mid">share of rows matching the predicate</text>'
     )
 
-    lx, ly = PAD_L, H - 18
+    # two legend rows: start high enough that the wrapped one clears the edge
+    lx, ly = PAD_L, H - 36
     # four entries do not fit on one row at this width
     for key, colour, label in ENGINES:
         out.append(f'<line x1="{lx}" y1="{ly - 4}" x2="{lx + 22}" y2="{ly - 4}" stroke="{colour}" stroke-width="2.4"/>')
