@@ -887,7 +887,9 @@ impl Hnsw {
                     beam.tr.expansions -= 1;
                 }
                 beam.tr.cost.expansions += 1;
-                if !self.expand(query, c.id, layer, predicate, &mut beam, &mut bridges)? {
+                let bridged =
+                    self.expand(query, c.id, layer, predicate, &mut beam, &mut bridges)?;
+                if filtered && !bridged {
                     beam.deferred.push(c);
                 }
             }
@@ -904,11 +906,11 @@ impl Hnsw {
             // So go back to those expansions and bridge out of them, nearest
             // first. This is deliberately a *last resort* rather than a looser
             // rule up in `expand`: bridging whenever the heap is unfilled also
-            // works and is much worse, because it pays on every selective query
-            // instead of only the stranded ones. Measured on 20 000 rows at 128
-            // dimensions, the eager form costs 3.8x at 1% selectivity and loses
-            // to plain `ef_search` at equal latency at 10%, while this one is
-            // free wherever the heap fills.
+            // works, and pays on every selective query instead of only the
+            // stranded ones — measured on 20 000 rows at 128 dimensions, 3.8-4.4x
+            // the latency at 1% selectivity. This form is free wherever the heap
+            // fills: the counters and recall there are identical to not having
+            // it at all.
             //
             // Layer 0 only. The layers above it are navigation and the descent's
             // probe for a foothold, whose results are seeds rather than answers
@@ -3519,8 +3521,13 @@ mod tests {
         };
         let (narrow, wide) = (recall_at(64), recall_at(512));
         // Observed 0.500 → 0.985, a gain of 0.485; the old ceiling gained 0.174.
+        //
+        // The `narrow` escape matters: a bar on the *gain* alone also pins the
+        // narrow end down, so a later change that lifts recall at ef 64 would
+        // turn this red for getting better. What must not come back is a wide
+        // beam buying nothing.
         assert!(
-            wide - narrow >= 0.30,
+            wide - narrow >= 0.30 || narrow >= 0.90,
             "an 8x wider beam moved recall only {narrow:.3} → {wide:.3}: \
              ef_search has stopped buying recall under a selective filter"
         );

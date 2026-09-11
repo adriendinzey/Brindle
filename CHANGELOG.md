@@ -100,11 +100,18 @@ versions may break).
   128-dimensional index at 1% selectivity the old ceiling of 0.928 becomes 1.000.
 
   It costs nothing where it is not needed: a query whose result heap fills never
-  reaches it (measured 0.341 ms against 0.347 ms, at identical recall), and a
-  predicate nothing satisfies is unchanged. Queries that were coming up short do
-  more work, which is the point — `ef_search` now converts into recall where it
-  previously saturated. A filter *correlated* with vector position benefits too,
-  at 1% selectivity going 0.872 → 0.905.
+  reaches it — its counters and recall are identical to not having it — and a
+  predicate nothing satisfies is unchanged. A filter *correlated* with vector
+  position benefits too, at 1% selectivity going 0.872 → 0.905.
+
+  Where it does fire it is not cheap, and the trade is the point. Whenever fewer
+  rows match than `brindle.ef_search`, the heap cannot fill and the query spends
+  its detour allowance in full: on 20 000 rows at 128 dimensions and 1%
+  selectivity, `ef_search` 256 goes from 0.79 ms to 5.73 ms per query for recall
+  0.933 → 0.997, and `ef_search` 1024 from 0.77 ms to 20.87 ms for 0.933 →
+  1.000. That is recall which was previously unreachable at any setting. Lower
+  `brindle.ef_search` if you would rather have the old cost than the extra
+  recall.
 - **Fixed: a float comparison could return the wrong rows.** The index ordered
   floats by IEEE 754, where `NaN` compares with nothing, while PostgreSQL gives
   floats a total order in which `'NaN' = 'NaN'` holds and `NaN` sorts above
