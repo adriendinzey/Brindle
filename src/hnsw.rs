@@ -1381,6 +1381,57 @@ const ATTR_TAG_NULL: u8 = 0;
 const ATTR_TAG_INT: u8 = 1;
 const ATTR_TAG_FLOAT: u8 = 2;
 
+/// Append one attribute row, length-prefixed.
+///
+/// Shared with the index layer, which keeps a side table of rows that have
+/// attributes but no vector (see `index_am::storage`). Two copies of this would
+/// let the graph's encoding and the side table's drift apart, and they are read
+/// back by the same decoder.
+pub(crate) fn write_attr_row(out: &mut Vec<u8>, row: &[AttrValue]) {
+    out.extend_from_slice(&(row.len() as u64).to_le_bytes());
+    for value in row {
+        match value {
+            AttrValue::Null => out.push(ATTR_TAG_NULL),
+            AttrValue::Int(v) => {
+                out.push(ATTR_TAG_INT);
+                out.extend_from_slice(&v.to_le_bytes());
+            }
+            AttrValue::Float(v) => {
+                out.push(ATTR_TAG_FLOAT);
+                out.extend_from_slice(&v.to_bits().to_le_bytes());
+            }
+        }
+    }
+}
+
+/// Read one length-prefixed attribute row written by [`write_attr_row`].
+pub(crate) fn read_attr_row<S: GraphBytes + ?Sized>(
+    r: &mut S,
+) -> Result<Vec<AttrValue>, HnswDecodeError> {
+    let count = r.read_len()?;
+    // Every value costs at least a tag byte, so a count exceeding what is left
+    // is corrupt -- checked before reserving, like every other count in this
+    // format.
+    if count > r.remaining() {
+        return Err(HnswDecodeError::Truncated);
+    }
+    // The reservation is clamped separately, because that check alone is weaker
+    // here than for the fixed-width counts: an all-`Null` row is 1 byte per
+    // value but 16 bytes per value in memory, so the count on its own would let
+    // a crafted blob reserve 16x the bytes it supplies. A `Null`-heavy row
+    // simply grows the vector instead.
+    let mut row = Vec::with_capacity(count.min(r.remaining() / 9));
+    for _ in 0..count {
+        row.push(match r.u8()? {
+            ATTR_TAG_NULL => AttrValue::Null,
+            ATTR_TAG_INT => AttrValue::Int(r.u64()? as i64),
+            ATTR_TAG_FLOAT => AttrValue::Float(f64::from_bits(r.u64()?)),
+            _ => return Err(HnswDecodeError::Invalid("bad attribute tag")),
+        });
+    }
+    Ok(row)
+}
+
 /// Bounds-checked little-endian reader over untrusted bytes. Every accessor
 /// errors (never panics) past the end of the buffer.
 struct ByteReader<'a> {
@@ -1548,20 +1599,7 @@ impl Hnsw {
                     out.extend_from_slice(&(neighbor as u64).to_le_bytes());
                 }
             }
-            out.extend_from_slice(&(self.attrs[id].len() as u64).to_le_bytes());
-            for value in &self.attrs[id] {
-                match value {
-                    AttrValue::Null => out.push(ATTR_TAG_NULL),
-                    AttrValue::Int(v) => {
-                        out.push(ATTR_TAG_INT);
-                        out.extend_from_slice(&v.to_le_bytes());
-                    }
-                    AttrValue::Float(v) => {
-                        out.push(ATTR_TAG_FLOAT);
-                        out.extend_from_slice(&v.to_bits().to_le_bytes());
-                    }
-                }
-            }
+            write_attr_row(out, &self.attrs[id]);
         }
     }
 
@@ -1769,27 +1807,7 @@ impl Hnsw {
                 link_counts.push(count as u32);
             }
 
-            let attr_count = r.read_len()?;
-            // Every value costs at least a tag byte, so a count exceeding what
-            // is left is corrupt — checked before reserving, like the counts above.
-            if attr_count > r.remaining() {
-                return Err(HnswDecodeError::Truncated);
-            }
-            // The reservation is clamped separately, because that check alone is
-            // weaker here than for the fixed-width counts: an all-`Null` row is
-            // 1 byte per value but 16 bytes per value in memory, so the count on
-            // its own would let a crafted blob reserve 16x the bytes it supplies.
-            // A `Null`-heavy row simply grows the vector instead.
-            let mut row = Vec::with_capacity(attr_count.min(r.remaining() / 9));
-            for _ in 0..attr_count {
-                row.push(match r.u8()? {
-                    ATTR_TAG_NULL => AttrValue::Null,
-                    ATTR_TAG_INT => AttrValue::Int(r.u64()? as i64),
-                    ATTR_TAG_FLOAT => AttrValue::Float(f64::from_bits(r.u64()?)),
-                    _ => return Err(HnswDecodeError::Invalid("bad attribute tag")),
-                });
-            }
-            attrs.push(row);
+            attrs.push(read_attr_row(r)?);
         }
         if !r.done() {
             return Err(HnswDecodeError::Invalid("trailing bytes"));

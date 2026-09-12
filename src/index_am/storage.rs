@@ -8,7 +8,9 @@
 //! ordinary initialized pages.
 //!
 //! The blob itself is [`encode_index`] framing: the serialized graph
-//! (see `Hnsw::to_bytes`) followed by the node-id → heap-TID table.
+//! (see `Hnsw::to_bytes`), the node-id → heap-TID table, then the table of rows
+//! that have attributes but no vector (see [`UnrankableRow`]). Each section
+//! declares its own length, so the reader knows where the next one starts.
 //!
 //! TODO: replace this rebuild-everything blob with durable page-structured
 //! storage — per-node pages read through the buffer manager on demand,
@@ -47,11 +49,22 @@ impl std::error::Error for PayloadError {}
 /// and unit-testable without a server.
 pub type TidPair = (u32, u16);
 
+/// A heap row that has filterable attributes but no vector to rank.
+///
+/// `NULL` embeddings cannot enter the graph -- there is nothing to place or to
+/// order -- but the index is not registered as partial, so PostgreSQL believes
+/// it covers every row in the table. Skipping them silently made an unordered
+/// index scan return fewer rows than a sequential scan of the same query, which
+/// is a wrong answer rather than a recall trade. They are carried here instead,
+/// out of the graph and out of every ranked result, and consulted only by the
+/// scan that promises *every* matching row.
+pub type UnrankableRow = (TidPair, Vec<AttrValue>);
+
 /// Frame a graph and its node-id → TID table into one blob, serializing the
 /// graph directly into the payload buffer so the build never holds a second
 /// full copy of it. `tids[i]` is the heap address of graph node `i` (ids are
 /// dense, in insertion order).
-pub fn encode_index(hnsw: &Hnsw, tids: &[TidPair]) -> Vec<u8> {
+pub fn encode_index(hnsw: &Hnsw, tids: &[TidPair], unrankable: &[UnrankableRow]) -> Vec<u8> {
     let mut out = Vec::with_capacity(16 + hnsw.serialized_len_hint() + tids.len() * 6);
     let len_pos = out.len();
     out.extend_from_slice(&0u64.to_le_bytes()); // graph-length placeholder
@@ -60,6 +73,7 @@ pub fn encode_index(hnsw: &Hnsw, tids: &[TidPair]) -> Vec<u8> {
     let graph_len = (out.len() - graph_start) as u64;
     out[len_pos..len_pos + 8].copy_from_slice(&graph_len.to_le_bytes());
     append_tid_table(&mut out, tids);
+    append_unrankable(&mut out, unrankable);
     out
 }
 
@@ -67,11 +81,16 @@ pub fn encode_index(hnsw: &Hnsw, tids: &[TidPair]) -> Vec<u8> {
 /// byte-based counterpart to [`encode_index`], kept for round-trip tests that
 /// exercise the framing without building a real graph.
 #[cfg(test)]
-pub fn encode_index_payload(graph: &[u8], tids: &[TidPair]) -> Vec<u8> {
+pub fn encode_index_payload(
+    graph: &[u8],
+    tids: &[TidPair],
+    unrankable: &[UnrankableRow],
+) -> Vec<u8> {
     let mut out = Vec::with_capacity(16 + graph.len() + tids.len() * 6);
     out.extend_from_slice(&(graph.len() as u64).to_le_bytes());
     out.extend_from_slice(graph);
     append_tid_table(&mut out, tids);
+    append_unrankable(&mut out, unrankable);
     out
 }
 
@@ -83,9 +102,48 @@ fn append_tid_table(out: &mut Vec<u8>, tids: &[TidPair]) {
     }
 }
 
-/// Split a blob produced by [`encode_index`] back into the serialized graph
-/// and the node-id → TID table.
-pub fn decode_index_payload(blob: &[u8]) -> Result<(&[u8], Vec<TidPair>), PayloadError> {
+fn append_unrankable(out: &mut Vec<u8>, rows: &[UnrankableRow]) {
+    out.extend_from_slice(&(rows.len() as u64).to_le_bytes());
+    for ((block, offset), attrs) in rows {
+        out.extend_from_slice(&block.to_le_bytes());
+        out.extend_from_slice(&offset.to_le_bytes());
+        crate::hnsw::write_attr_row(out, attrs);
+    }
+}
+
+/// Read the table of rows that have attributes but no vector.
+///
+/// Like [`read_tid_table`], the reservation is bounded by what the source can
+/// still supply rather than by the declared count, so a corrupt length cannot
+/// turn into a large allocation. Each entry is at least 14 bytes: six of TID and
+/// eight of attribute-row length.
+fn read_unrankable<S: GraphBytes + ?Sized>(
+    src: &mut S,
+) -> Result<Vec<UnrankableRow>, PayloadError> {
+    let count = src.read_len().map_err(|_| PayloadError::Truncated)?;
+    if src.remaining() / 14 < count {
+        return Err(PayloadError::Truncated);
+    }
+    let mut rows = Vec::with_capacity(count);
+    let mut tid = [0u8; 6];
+    for _ in 0..count {
+        src.read_exact(&mut tid)
+            .map_err(|_| PayloadError::Truncated)?;
+        let block = u32::from_le_bytes([tid[0], tid[1], tid[2], tid[3]]);
+        let offset = u16::from_le_bytes([tid[4], tid[5]]);
+        let attrs = crate::hnsw::read_attr_row(src).map_err(|_| PayloadError::Truncated)?;
+        rows.push(((block, offset), attrs));
+    }
+    Ok(rows)
+}
+
+/// What [`decode_index_payload`] hands back: the graph's bytes, the node-id →
+/// TID table, and the rows that have attributes but no vector.
+type DecodedIndex<'a> = (&'a [u8], Vec<TidPair>, Vec<UnrankableRow>);
+
+/// Split a blob produced by [`encode_index`] back into the serialized graph,
+/// the node-id → TID table, and the rows that have no vector.
+pub fn decode_index_payload(blob: &[u8]) -> Result<DecodedIndex<'_>, PayloadError> {
     let mut src: &[u8] = blob;
     let graph_len = read_graph_len(&mut src)?;
     let prefix = blob.len() - src.len();
@@ -94,7 +152,11 @@ pub fn decode_index_payload(blob: &[u8]) -> Result<(&[u8], Vec<TidPair>), Payloa
         &blob[prefix + graph_len..],
     );
     let tids = read_tid_table(&mut rest)?;
-    Ok((graph, tids))
+    let unrankable = read_unrankable(&mut rest)?;
+    if rest.remaining() != 0 {
+        return Err(PayloadError::TrailingBytes);
+    }
+    Ok((graph, tids, unrankable))
 }
 
 /// Read the graph's declared byte length and check the source can supply it.
@@ -132,9 +194,6 @@ fn read_tid_table<S: GraphBytes + ?Sized>(src: &mut S) -> Result<Vec<TidPair>, P
         let offset = u16::from_le_bytes([entry[4], entry[5]]);
         tids.push((block, offset));
     }
-    if src.remaining() != 0 {
-        return Err(PayloadError::TrailingBytes);
-    }
     Ok(tids)
 }
 
@@ -144,7 +203,13 @@ const META_MAGIC: u32 = 0x4252_4E44; // "BRND"
 /// Bumped to 2 when the generation counter was added; a version-1 metapage has
 /// no room for it, so an index written by an older build is refused rather than
 /// read with a garbage generation.
-const STORAGE_VERSION: u32 = 2;
+///
+/// Bumped to 3 for the table of rows that have attributes but no vector. A
+/// version-2 image has no such section, and reading one as if it were complete
+/// is exactly the wrong answer this section exists to prevent — so the version
+/// moves rather than the section becoming optional, and an older image gets the
+/// REINDEX message.
+const STORAGE_VERSION: u32 = 3;
 
 /// Metapage payload at block 0: magic, version, blob length, generation —
 /// little-endian, like every other layer of the blob format.
@@ -579,9 +644,9 @@ pub const IMAGE_LOCK_BLOCK: pg_sys::BlockNumber = 0;
 ///
 /// # Safety
 /// `index` must be an open brindle index relation locked at least AccessShare.
-pub unsafe fn load_index(index: pg_sys::Relation) -> (Hnsw, Vec<TidPair>) {
-    let (hnsw, tids, _) = load_index_with_generation(index);
-    (hnsw, tids)
+pub unsafe fn load_index(index: pg_sys::Relation) -> (Hnsw, Vec<TidPair>, Vec<UnrankableRow>) {
+    let (hnsw, tids, unrankable, _) = load_index_with_generation(index);
+    (hnsw, tids, unrankable)
 }
 
 /// As [`load_index`], also returning the generation the image carried when it
@@ -589,7 +654,9 @@ pub unsafe fn load_index(index: pg_sys::Relation) -> (Hnsw, Vec<TidPair>) {
 ///
 /// # Safety
 /// `index` must be an open brindle index relation locked at least AccessShare.
-pub unsafe fn load_index_with_generation(index: pg_sys::Relation) -> (Hnsw, Vec<TidPair>, u64) {
+pub unsafe fn load_index_with_generation(
+    index: pg_sys::Relation,
+) -> (Hnsw, Vec<TidPair>, Vec<UnrankableRow>, u64) {
     // A writer already holding the exclusive lock re-enters here freely: the
     // lock manager never conflicts a request with the requester's own locks.
     pg_sys::LockPage(index, IMAGE_LOCK_BLOCK, pg_sys::ShareLock as i32);
@@ -611,6 +678,13 @@ pub unsafe fn load_index_with_generation(index: pg_sys::Relation) -> (Hnsw, Vec<
     src.limit(after_graph);
 
     let tids = read_tid_table(&mut src).unwrap_or_else(|e| error!("brindle: {e}"));
+    let unrankable = read_unrankable(&mut src).unwrap_or_else(|e| error!("brindle: {e}"));
+    // Same end-of-blob check the slice path makes. Every section declares its
+    // own length, so bytes left over mean the metapage's blob length and the
+    // sections disagree -- the image is not what this build wrote.
+    if src.remaining() != 0 {
+        error!("brindle: {}", PayloadError::TrailingBytes);
+    }
     pg_sys::UnlockPage(index, IMAGE_LOCK_BLOCK, pg_sys::ShareLock as i32);
     if hnsw.len() != tids.len() {
         error!(
@@ -619,7 +693,7 @@ pub unsafe fn load_index_with_generation(index: pg_sys::Relation) -> (Hnsw, Vec<
             tids.len()
         );
     }
-    (hnsw, tids, generation)
+    (hnsw, tids, unrankable, generation)
 }
 
 /// A decoded index kept for the backend that decoded it.
@@ -637,6 +711,7 @@ pub struct CachedIndex {
     bytes: usize,
     hnsw: Hnsw,
     tids: Vec<TidPair>,
+    unrankable: Vec<UnrankableRow>,
 }
 
 /// Reference-counted because a scan borrows the cache for its whole life while
@@ -775,7 +850,7 @@ pub enum IndexHandle {
     Cached(CacheRef),
     /// Boxed so the handle stays small: a graph inline would make every handle,
     /// cached or not, as large as an uncached one.
-    Fresh(Box<(Hnsw, Vec<TidPair>)>),
+    Fresh(Box<(Hnsw, Vec<TidPair>, Vec<UnrankableRow>)>),
 }
 
 impl IndexHandle {
@@ -783,6 +858,18 @@ impl IndexHandle {
         match self {
             IndexHandle::Cached(c) => &c.hnsw,
             IndexHandle::Fresh(owned) => &owned.0,
+        }
+    }
+
+    /// The rows that have attributes but no vector.
+    ///
+    /// Only the unordered scan consults these: they have no distance, so they
+    /// cannot appear in a ranked result, but they are part of what the index
+    /// claims to cover and an unordered scan promises every matching row.
+    pub fn unrankable(&self) -> &[UnrankableRow] {
+        match self {
+            IndexHandle::Cached(entry) => &entry.unrankable,
+            IndexHandle::Fresh(owned) => &owned.2,
         }
     }
 
@@ -795,10 +882,20 @@ impl IndexHandle {
 }
 
 /// Rough resident size of a decoded graph, for comparison against the ceiling.
-fn cached_bytes(hnsw: &Hnsw, tids: &Vec<TidPair>) -> usize {
+fn cached_bytes(hnsw: &Hnsw, tids: &Vec<TidPair>, unrankable: &[UnrankableRow]) -> usize {
     // Capacity rather than length, matching `resident_bytes`: an under-estimate
     // would let the cache sit over its ceiling.
-    hnsw.resident_bytes() + tids.capacity() * core::mem::size_of::<TidPair>()
+    // The side table is counted the same way the graph's attribute rows are:
+    // by capacity, since an under-estimate would let the cache exceed its
+    // ceiling.
+    let unrankable_bytes: usize = unrankable
+        .iter()
+        .map(|(_, attrs)| {
+            core::mem::size_of::<UnrankableRow>()
+                + attrs.capacity() * core::mem::size_of::<AttrValue>()
+        })
+        .sum();
+    hnsw.resident_bytes() + tids.capacity() * core::mem::size_of::<TidPair>() + unrankable_bytes
 }
 
 /// # Safety
@@ -868,10 +965,10 @@ pub unsafe fn cached_index(index: pg_sys::Relation) -> IndexHandle {
         return IndexHandle::Cached(entry);
     }
 
-    let (hnsw, tids) = load_index(index);
-    let bytes = cached_bytes(&hnsw, &tids);
+    let (hnsw, tids, unrankable) = load_index(index);
+    let bytes = cached_bytes(&hnsw, &tids, &unrankable);
     if ceiling == 0 || bytes > ceiling {
-        return IndexHandle::Fresh(Box::new((hnsw, tids)));
+        return IndexHandle::Fresh(Box::new((hnsw, tids, unrankable)));
     }
 
     let entry: CacheRef = std::rc::Rc::new(CachedIndex {
@@ -879,6 +976,7 @@ pub unsafe fn cached_index(index: pg_sys::Relation) -> IndexHandle {
         bytes,
         hnsw,
         tids,
+        unrankable,
     });
     CACHE.with(|c| {
         let mut cache = c.borrow_mut();
@@ -924,6 +1022,12 @@ struct PendingWrite {
     base_generation: u64,
     hnsw: Hnsw,
     tids: Vec<TidPair>,
+    /// Rows staged by this transaction that have attributes but no vector,
+    /// appended to whatever the loaded image already held.
+    unrankable: Vec<UnrankableRow>,
+    /// How many vectorless rows the loaded image had, so a rewind can tell this
+    /// transaction's additions from the ones it inherited.
+    base_unrankable: usize,
     /// How many nodes the loaded image had. Ids are dense insertion order, so
     /// everything from here up is what this transaction staged — which is what
     /// a replay needs, read back out of the graph rather than kept beside it.
@@ -941,14 +1045,19 @@ struct PendingWrite {
     /// Shorter than the subtransaction depth whenever one opened with nothing
     /// staged: no `PendingWrite` existed to record it. The `unwrap_or` in the
     /// abort arm is what covers that.
-    marks: Vec<usize>,
+    /// Per open subtransaction: how many graph rows *and* how many vectorless
+    /// rows were staged when it began. A pair rather than a count because a
+    /// transaction stages both kinds and `ROLLBACK TO` has to leave exactly the
+    /// rows of both kinds that predate its savepoint — one number cannot say
+    /// where that line falls in two sequences.
+    marks: Vec<(usize, usize)>,
     /// Set by a subtransaction abort: staged rows past this many are rolled back
     /// and must not reach the index. Also a count, for the reason above.
     ///
     /// Recorded rather than acted on, because the abort callback is not a place
     /// where anything may fail. [`settle_pending`] carries it out later, at a
     /// point where an error is an ordinary error.
-    rewind_to: Option<usize>,
+    rewind_to: Option<(usize, usize)>,
 }
 
 thread_local! {
@@ -974,9 +1083,14 @@ thread_local! {
 ///
 /// # Safety
 /// `index` must be an open brindle index relation this backend may write.
+/// Stage one row for write-back at the end of the transaction.
+///
+/// `vector` is `None` for a row whose indexed column is NULL: it cannot enter
+/// the graph, but the index is not partial and still claims to cover it, so it
+/// is staged into the side table instead of dropped.
 pub unsafe fn pending_insert(
     index: pg_sys::Relation,
-    vector: Vec<f32>,
+    vector: Option<Vec<f32>>,
     attrs: Vec<AttrValue>,
     tid: TidPair,
 ) {
@@ -1013,18 +1127,24 @@ pub unsafe fn pending_insert(
             // invalidated by this transaction's own write. Handing the finished
             // graph *to* the cache at flush time would be worth having, and is a
             // different change from this one.
-            let (hnsw, tids, generation) = load_index_with_generation(index);
+            let (hnsw, tids, unrankable, generation) = load_index_with_generation(index);
             *pending = Some(PendingWrite {
                 index_oid: oid,
                 base_generation: generation,
                 base_n: hnsw.len(),
+                base_unrankable: unrankable.len(),
                 hnsw,
                 tids,
+                unrankable,
                 marks: Vec::new(),
                 rewind_to: None,
             });
         }
         let write = pending.as_mut().expect("just populated");
+        let Some(vector) = vector else {
+            write.unrankable.push((tid, attrs));
+            return;
+        };
         // The vector and its attributes move straight into the graph. Nothing
         // else keeps a copy: a replay reads the staged rows back out of it.
         apply_one(&mut write.hnsw, write.tids.len(), vector, attrs);
@@ -1194,20 +1314,25 @@ fn flush_locked(write: Option<PendingWrite>) {
         // rows itself. Anything still staged by the time this runs therefore
         // belongs on whatever image is here now.
         let blob = if current == write.base_generation {
-            encode_index(&write.hnsw, &write.tids)
+            encode_index(&write.hnsw, &write.tids, &write.unrankable)
         } else {
             // Somebody else wrote while this transaction was open. Their image
             // is the one to build on: writing ours would drop their rows. The
             // lock was deliberately not held across the transaction, so this is
             // the expected outcome of that choice rather than a surprise.
-            let (mut hnsw, mut tids) = load_index(rel);
+            let (mut hnsw, mut tids, mut unrankable) = load_index(rel);
             for id in write.base_n..write.hnsw.len() {
                 let vector = write.hnsw.vector(id).to_vec();
                 let attrs = write.hnsw.attrs(id).to_vec();
                 apply_one(&mut hnsw, tids.len(), vector, attrs);
                 tids.push(write.tids[id]);
             }
-            encode_index(&hnsw, &tids)
+            // The vectorless rows this transaction staged replay the same way:
+            // whatever is already on the other backend's image stays, and ours
+            // is appended. They carry their own TIDs, so no id remapping is
+            // needed the way the graph's are.
+            unrankable.extend(write.unrankable.iter().cloned());
+            encode_index(&hnsw, &tids, &unrankable)
         };
         rewrite_index_blob(rel, &blob);
 
@@ -1426,16 +1551,20 @@ unsafe extern "C" fn subxact_callback(
 
 /// Move one write's savepoint bookkeeping across a subtransaction boundary.
 fn apply_mark_event(write: &mut PendingWrite, event: pg_sys::SubXactEvent::Type) {
-    let staged = write.tids.len() - write.base_n;
+    let staged = (
+        write.tids.len() - write.base_n,
+        write.unrankable.len() - write.base_unrankable,
+    );
     match event {
         pg_sys::SubXactEvent::SUBXACT_EVENT_START_SUB => {
             // Clamped by any rewind not yet carried out: between an abort and
             // the settle, `tids` still holds rows that are already rolled back,
             // and `ROLLBACK TO` opens a fresh subtransaction of the same name
             // immediately after aborting the old one.
+            let pending = write.rewind_to.unwrap_or(staged);
             write
                 .marks
-                .push(write.rewind_to.unwrap_or(staged).min(staged));
+                .push((pending.0.min(staged.0), pending.1.min(staged.1)));
         }
         // The subtransaction's rows belong to its parent now.
         pg_sys::SubXactEvent::SUBXACT_EVENT_COMMIT_SUB => {
@@ -1444,13 +1573,14 @@ fn apply_mark_event(write: &mut PendingWrite, event: pg_sys::SubXactEvent::Type)
         pg_sys::SubXactEvent::SUBXACT_EVENT_ABORT_SUB => {
             // No mark means staging began inside the subtransaction being rolled
             // back, so none of it survives.
-            let mark = write.marks.pop().unwrap_or(0);
+            let mark = write.marks.pop().unwrap_or((0, 0));
             // Only when it actually rolls something back. A mark equal to what
             // is staged — which is every mark on a write that has been sitting
             // in the stash, since nothing is added to it there — would otherwise
             // schedule a reload and replay that changes nothing.
-            if mark < staged {
-                write.rewind_to = Some(write.rewind_to.unwrap_or(mark).min(mark));
+            if mark.0 < staged.0 || mark.1 < staged.1 {
+                let prior = write.rewind_to.unwrap_or(mark);
+                write.rewind_to = Some((prior.0.min(mark.0), prior.1.min(mark.1)));
             }
         }
         _ => {}
@@ -1479,11 +1609,11 @@ fn settle_pending() {
     let Some(write) = write else { return };
     // Nothing staged survives: dropping the whole thing is the rollback, and no
     // reload is needed to do it.
-    if mark == 0 {
+    if mark == (0, 0) {
         return;
     }
 
-    let survivors: Vec<(Vec<f32>, Vec<AttrValue>, TidPair)> = (write.base_n..write.base_n + mark)
+    let survivors: Vec<(Vec<f32>, Vec<AttrValue>, TidPair)> = (write.base_n..write.base_n + mark.0)
         .map(|id| {
             (
                 write.hnsw.vector(id).to_vec(),
@@ -1491,6 +1621,14 @@ fn settle_pending() {
                 write.tids[id],
             )
         })
+        .collect();
+    // The vectorless rows staged before the savepoint survive with the rest.
+    let surviving_unrankable: Vec<UnrankableRow> = write
+        .unrankable
+        .iter()
+        .skip(write.base_unrankable)
+        .take(mark.1)
+        .cloned()
         .collect();
     let (index_oid, marks) = (write.index_oid, write.marks.clone());
     drop(write);
@@ -1504,12 +1642,14 @@ fn settle_pending() {
             // taking them above already achieved.
             return;
         }
-        let (mut hnsw, mut tids, generation) = load_index_with_generation(rel);
+        let (mut hnsw, mut tids, mut unrankable, generation) = load_index_with_generation(rel);
         let base_n = hnsw.len();
+        let base_unrankable = unrankable.len();
         for (vector, attrs, tid) in survivors {
             apply_one(&mut hnsw, tids.len(), vector, attrs);
             tids.push(tid);
         }
+        unrankable.extend(surviving_unrankable);
         pg_sys::relation_close(rel, pg_sys::RowExclusiveLock as i32);
 
         PENDING.with(|p| {
@@ -1519,6 +1659,8 @@ fn settle_pending() {
                 base_n,
                 hnsw,
                 tids,
+                unrankable,
+                base_unrankable,
                 marks,
                 rewind_to: None,
             });
@@ -1550,8 +1692,8 @@ mod tests {
         let tids: Vec<TidPair> = (0..50)
             .map(|i| (i as u32 * 3, (i % 7) as u16 + 1))
             .collect();
-        let blob = encode_index_payload(&graph, &tids);
-        let (graph2, tids2) = decode_index_payload(&blob).expect("decode");
+        let blob = encode_index_payload(&graph, &tids, &[]);
+        let (graph2, tids2, _) = decode_index_payload(&blob).expect("decode");
         assert_eq!(graph2, &graph[..]);
         assert_eq!(tids2, tids);
     }
@@ -1575,11 +1717,11 @@ mod tests {
         }
         let tids: Vec<TidPair> = (0..hnsw.len()).map(|i| (i as u32, i as u16 + 1)).collect();
 
-        let streamed = encode_index(&hnsw, &tids);
-        let framed = encode_index_payload(&hnsw.to_bytes(), &tids);
+        let streamed = encode_index(&hnsw, &tids, &[]);
+        let framed = encode_index_payload(&hnsw.to_bytes(), &tids, &[]);
         assert_eq!(streamed, framed);
 
-        let (graph_bytes, tids2) = decode_index_payload(&streamed).expect("decode");
+        let (graph_bytes, tids2, _) = decode_index_payload(&streamed).expect("decode");
         assert_eq!(Hnsw::from_bytes(graph_bytes).unwrap().len(), hnsw.len());
         assert_eq!(tids2, tids);
     }
@@ -1589,23 +1731,23 @@ mod tests {
         use crate::hnsw::{Hnsw, HnswParams};
 
         let hnsw = Hnsw::new(HnswParams::default());
-        let blob = encode_index(&hnsw, &[]);
-        let (graph_bytes, tids) = decode_index_payload(&blob).expect("decode");
+        let blob = encode_index(&hnsw, &[], &[]);
+        let (graph_bytes, tids, _) = decode_index_payload(&blob).expect("decode");
         assert!(tids.is_empty());
         assert!(Hnsw::from_bytes(graph_bytes).unwrap().is_empty());
     }
 
     #[test]
     fn payload_round_trip_empty() {
-        let blob = encode_index_payload(&[], &[]);
-        let (graph, tids) = decode_index_payload(&blob).expect("decode");
+        let blob = encode_index_payload(&[], &[], &[]);
+        let (graph, tids, _) = decode_index_payload(&blob).expect("decode");
         assert!(graph.is_empty());
         assert!(tids.is_empty());
     }
 
     #[test]
     fn payload_rejects_any_truncation() {
-        let blob = encode_index_payload(&[1, 2, 3], &[(9, 1), (10, 2)]);
+        let blob = encode_index_payload(&[1, 2, 3], &[(9, 1), (10, 2)], &[]);
         for cut in 0..blob.len() {
             assert!(
                 decode_index_payload(&blob[..cut]).is_err(),
@@ -1616,11 +1758,59 @@ mod tests {
 
     #[test]
     fn payload_rejects_trailing_bytes() {
-        let mut blob = encode_index_payload(&[1, 2, 3], &[(9, 1)]);
+        let mut blob = encode_index_payload(&[1, 2, 3], &[(9, 1)], &[]);
         blob.push(0);
         assert_eq!(
             decode_index_payload(&blob),
             Err(PayloadError::TrailingBytes)
         );
+    }
+    #[test]
+    fn round_trip_preserves_rows_that_have_no_vector() {
+        use crate::hnsw::{Hnsw, HnswParams};
+
+        let hnsw = Hnsw::new(HnswParams::default());
+        let rows: Vec<UnrankableRow> = vec![
+            ((7, 1), vec![AttrValue::Int(42), AttrValue::Null]),
+            ((7, 2), vec![AttrValue::Float(1.5)]),
+            ((9, 3), Vec::new()),
+        ];
+        let blob = encode_index(&hnsw, &[], &rows);
+        let (_, tids, back) = decode_index_payload(&blob).expect("decode");
+        assert!(tids.is_empty());
+        assert_eq!(back, rows, "the side table did not survive a round trip");
+    }
+
+    #[test]
+    fn a_truncated_side_table_errors_rather_than_panicking() {
+        use crate::hnsw::{Hnsw, HnswParams};
+
+        // The count is attacker-controlled on the decode path, like every other
+        // length in this format: it must be bounded by what the payload can
+        // actually supply rather than trusted.
+        let hnsw = Hnsw::new(HnswParams::default());
+        let rows: Vec<UnrankableRow> = vec![((1, 1), vec![AttrValue::Int(1)])];
+        let blob = encode_index(&hnsw, &[], &rows);
+        for cut in 0..blob.len() {
+            assert!(
+                decode_index_payload(&blob[..cut]).is_err(),
+                "a {cut}-byte prefix decoded instead of erroring"
+            );
+        }
+    }
+
+    #[test]
+    fn a_huge_side_table_count_does_not_reserve_from_it() {
+        use crate::hnsw::{Hnsw, HnswParams};
+
+        // 8 bytes of count claiming a billion rows, with nothing behind it.
+        let hnsw = Hnsw::new(HnswParams::default());
+        let mut blob = encode_index(&hnsw, &[], &[]);
+        let tail = blob.len() - 8;
+        blob[tail..].copy_from_slice(&1_000_000_000u64.to_le_bytes());
+        assert!(matches!(
+            decode_index_payload(&blob),
+            Err(PayloadError::Truncated)
+        ));
     }
 }

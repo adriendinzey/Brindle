@@ -196,6 +196,10 @@ built.
   executor rather than dropped.
 - Incremental `INSERT`, `VACUUM` integration, and `ef_search` / `m` /
   `ef_construction` / `gamma` as a GUC and index options.
+- A scan that returns *every* row matching a qual agrees with a sequential scan
+  of the same query, including for rows whose vector is `NULL` — those cannot be
+  ranked, so they are stored beside the graph rather than in it. A *ranked* scan
+  omits them, and returns at most `brindle.ef_search` rows in any case.
 - Writes are WAL-logged, so the index survives a crash and reaches replicas.
 
 ### What does not
