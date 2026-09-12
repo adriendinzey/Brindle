@@ -125,14 +125,13 @@ if [[ "${SELECTIVITY:-0}" == "1" ]]; then
   fi
   echo "    raw numbers: $chart_csv"
 
-  # Check the committed write-up against the run that just happened. Stale
-  # figures have survived three review rounds of this benchmark by looking
-  # entirely plausible next to the tables they contradict.
-  log_copy="$(mktemp -t brindle-selectivity-XXXXXX.log)"
-  if python3 benches/verify_writeup.py "$log_copy" 2>/dev/null; then :; fi
+  # The committed write-up can be checked against this run, but only if the run
+  # was captured -- this script prints to stdout rather than to a file, so the
+  # check belongs to whoever redirected it. Stale figures have survived several
+  # review rounds of this benchmark by looking plausible beside the tables they
+  # contradict, so it is worth doing.
   echo "    to check the write-up against this run:"
   echo "      <this command> 2>&1 | tee run.log && python3 benches/verify_writeup.py run.log"
-  rm -f "$log_copy"
 fi
 
 echo

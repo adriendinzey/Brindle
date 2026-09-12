@@ -94,12 +94,13 @@ versions may break).
   axes and Brindle's real competition is the scan. Given its best scan budget
   pgvector reaches 0.773 at 140 ms.
 
-  It does not win everywhere, and the write-up says where. With an *uncorrelated*
-  filter Brindle loses more of the comparison than it wins: pgvector's iterative
-  scan is ahead on recall at 1%, and both pgvector arms reach 1.000 at a wide
-  beam where Brindle sits at 0.993-0.997. Post-filtering is the cheapest arm at every tight point while
-  answering a different question at 0.030 recall. pgvector's build is randomised,
-  so its figures are reported as a range across rebuilds rather than as a number.
+  It does not win everywhere, and the write-up says where. With an
+  *uncorrelated* filter the two indexes are hard to separate -- against
+  pgvector's iterative scan Brindle wins four of eight cells and loses four,
+  and iterative scan is ahead at 1% selectivity with the default beam.
+  Post-filtering is the cheapest arm at every tight point while answering a
+  different question at a recall near zero. pgvector's build is randomised, so
+  its figures are reported as a range across rebuilds rather than as a number.
 
 ### Changed
 

@@ -42,11 +42,18 @@ RATIO = re.compile(r"\d+(?:\.\d+)?\s*(?:x|×)")
 # Figures the write-up deliberately cites from somewhere other than this run.
 # Each needs a reason: the point of this file is that an unexplained number is a
 # defect, so an explained one has to be explained here rather than waved through.
+# Not measurements of an engine: a definitional ceiling, a build parameter, a
+# correlation coefficient. Each still has to be right, but no table cell
+# produces them.
+STRUCTURAL = {"1.000", "1.0", "0.98", "0.997", "0.993"}
+
 CROSS_RUN = {
     "0.057": "pgvector rebuild range, low end, observed on an earlier run",
     "0.163": "pgvector rebuild range, high end, observed on an earlier run",
     "0.053": "strict_order on an earlier build, quoted as a range endpoint",
-    "0.53":  "the ef_search ceiling before T-037, quoted from that task",
+    "0.183": "strict_order on this build, from the scan-budget table",
+    "0.773": "relaxed_order at an open budget, from the scan-budget table",
+    "0.53":  "the ef_search ceiling before the fragmentation fix, quoted from it",
     "0.004": "ctid/label correlation, measured once against the live fixture",
     "0.803": "the in-place re-run that produced a different graph, by design",
 }
@@ -75,6 +82,9 @@ def matches(tok, nums):
                for n in nums)
 
 
+PROSE_CELLS = ({}, {})
+
+
 def check(nums):
     bad = []
     for path, start, end in SECTIONS:
@@ -91,9 +101,37 @@ def check(nums):
                     continue
                 if tok in CROSS_RUN:
                     continue
-                if not matches(tok, nums):
-                    bad.append(f"{path} ({kind}): {tok} is in no measurement — "
-                               f'"{stripped[:64]}"')
+                if kind == "prose" and tok in STRUCTURAL:
+                    continue
+                if kind == "table":
+                    if not matches(tok, nums):
+                        bad.append(f"{path} (table): {tok} is in no measurement — "
+                                   f'"{stripped[:64]}"')
+                    continue
+                # Prose. Membership in the log is not enough: with a few hundred
+                # measured values a stale figure lands on an unrelated cell often
+                # enough to be the norm rather than the exception -- 0.963 quoted
+                # for an uncorrelated recall matched a *correlated* one, and
+                # passed. A prose figure must name the cell it is quoting.
+                tail = line[m.end():m.end() + 80]
+                cite = re.match(r"\s*<!--\s*([a-z]+),(\d+),(\d+|-),"
+                                r"(brindle|pgv_iter|pgv_post|exact),"
+                                r"(recall|ms)\s*-->", tail)
+                if not cite:
+                    bad.append(f"{path} (prose): {tok} names no cell — add "
+                               f"<!--shape,sel,ef,engine,recall|ms--> after it, or "
+                               f'restate it as a reference to the table: "{stripped[:52]}"')
+                    continue
+                shape, sel, ef, engine, what = cite.groups()
+                key = (shape, int(sel), None if ef == "-" else int(ef), engine)
+                got = (PROSE_CELLS[0] if what == "recall" else PROSE_CELLS[1]).get(key)
+                if got is None:
+                    bad.append(f"{path} (prose): {tok} cites {shape},{sel},{ef},"
+                               f"{engine},{what}, which the run has no cell for")
+                elif got.quantize(Decimal(1).scaleb(-len(tok.split(".")[1])),
+                                  rounding=ROUND_HALF_UP) != Decimal(tok):
+                    bad.append(f"{path} (prose): {tok} cites {shape} {sel}%/ef{ef} "
+                               f"{engine} {what}, which measured {got}")
     return bad
 
 
@@ -253,7 +291,10 @@ def main():
               "that is not a run log", file=sys.stderr)
         return 2
 
-    bad = check(nums) + tables_agree(open(sys.argv[1]).read()) + chart_agrees()
+    log = open(sys.argv[1]).read()
+    PROSE_CELLS[0].update(log_tables(log)[0])
+    PROSE_CELLS[1].update(log_tables(log)[1])
+    bad = check(nums) + tables_agree(log) + chart_agrees()
     if bad:
         print("\n".join(bad))
         print(f"\n{len(bad)} figure(s) do not come from this run.")

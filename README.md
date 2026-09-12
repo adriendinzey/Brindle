@@ -142,17 +142,17 @@ same rows and same ground truth on every side:
 *recall@10 / median latency.* The honest comparison at the tight end is against
 the **exact scan**, not the ANN index: at 1% selectivity a plain sequential scan
 is both perfect and more than twice as fast as pgvector's iterative scan.
-Brindle is 8.1× faster than that exact scan at 0.940 of its recall — a stated
+Brindle is about eight times faster than that exact scan at 0.940<!--local,1,64,brindle,recall--> of its recall — a stated
 recall loss for most of an order of magnitude in latency. Given its best
 configuration, pgvector's iterative scan reaches 0.773 at 140 ms.
 
 **Where it does not win.** With an *uncorrelated* filter — matching rows
-sprinkled through every neighbourhood — Brindle loses more comparisons than it
-wins: iterative scan is ahead on recall at 1%, and both pgvector arms reach 1.000
-at a wide beam where Brindle sits at 0.993–0.997. It should lose there; with
+sprinkled through every neighbourhood — Brindle is hard to separate from pgvector: against iterative scan it wins four of the eight cells and loses four.
+Iterative scan is ahead at 1% with the default beam, and both pgvector arms reach
+a perfect score at the wide beam where Brindle sits a hair below. It should lose there; with
 matches everywhere there is nothing for predicate-aware traversal to be clever
 about. Post-filtering is the cheapest arm at every tight point while answering a
-different, wrong question at 0.030 recall. And these are **warm** figures: a
+different, wrong question at 0.030<!--local,1,64,pgv_post,recall--> recall. And these are **warm** figures: a
 freshly connected backend pays about 58 ms to decode the index before its first
 query, which is worse than simply scanning the table. pgvector's build is
 randomised, so its columns move between builds while Brindle's do not.

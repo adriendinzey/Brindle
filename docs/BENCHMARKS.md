@@ -456,27 +456,29 @@ unnoticed for four tasks (`docs/FILTERING.md` § 2(d)).
 one figure covers both rows.
 
 **The result is recall nobody else reaches, at a fraction of the cost of the
-only other thing that reaches it.** At 1% selectivity Brindle answers at 0.940
-recall in 3.2 ms. pgvector's iterative scan reaches 0.117 in 60 ms. And the exact
-scan — always correct — takes 25.9 ms, so **at the tight end a plain sequential
-scan beats pgvector's iterative scan on both axes at once**, and the real
-competition for Brindle is brute force rather than the ANN index.
+only other thing that reaches it.** At 1% selectivity Brindle answers at 0.940<!--local,1,64,brindle,recall-->
+recall in 3.20<!--local,1,64,brindle,ms--> ms. pgvector's iterative scan reaches 0.117<!--local,1,64,pgv_iter,recall--> in
+60.0<!--local,1,64,pgv_iter,ms--> ms. And the exact scan — always correct — takes 25.9<!--local,1,-,exact,ms--> ms, so
+**at the tight end a plain sequential scan beats pgvector's iterative scan on
+both axes at once**, and the real competition for Brindle is brute force rather
+than the ANN index.
 
-Brindle is 8.1× faster than that exact scan at 1% selectivity and 3.6× at 5% with
-a wide beam, at 0.94 and 0.84 of its recall. That is the trade this index offers:
-a stated recall loss for most of an order of magnitude in latency. Measuring only
-against iterative scan would be picking the weaker opponent.
+Brindle is about eight times faster than that exact scan at 1% selectivity and
+about three and a half times at 5% with a wide beam, at 0.940<!--local,1,64,brindle,recall--> and
+0.840<!--local,5,256,brindle,recall--> of its recall. That is the trade this index offers: a stated recall
+loss for most of an order of magnitude in latency. Measuring only against
+iterative scan would be picking the weaker opponent.
 
 **Post-filtering is the fastest column at every tight point and the least
-useful.** 0.033 recall means it found, on average, a third of one of the ten rows
+useful.** 0.033<!--local,1,256,pgv_post,recall--> recall means it found, on average, a third of one of the ten rows
 the query asked for. Speed on a wrong answer is not a trade-off.
 
 **Where Brindle costs more.** At `ef_search` 256 and 5–10% selectivity it is
-slower than iterative scan — 7.50 ms against 6.75 at 5% — for better recall. And
+slower than iterative scan — 7.50<!--local,5,256,brindle,ms--> ms against 6.75<!--local,5,256,pgv_iter,ms--> at 5% — for better recall. And
 post-filtering is cheaper than Brindle at every *tight* point: if a filter keeps
-one row in ten and 0.19 recall is acceptable, the naive approach is the cheap
+one row in ten and 0.193<!--local,10,64,pgv_post,recall--> recall is acceptable, the naive approach is the cheap
 answer. It is not cheaper everywhere — at 50% and `ef_search` 256 Brindle is the
-faster arm, 1.05 ms against 1.32.
+faster arm, 1.05<!--local,50,256,brindle,ms--> ms against 1.32<!--local,50,256,pgv_iter,ms-->.
 
 ### pgvector's figure is a range, not a number
 
@@ -486,8 +488,8 @@ quoting one run as though it were the value.
 
 The harness now rebuilds pgvector's index three times at the headline point and
 reports each. Across eight builds observed in total: iterative-scan recall at 1% correlated
-ranges **0.057 – 0.163**, median latency 55–71 ms. Brindle's 0.940 is
-identical in every run.
+ranges **0.057 – 0.163**, median latency 55–71 ms. Brindle's figure at that
+point is identical in every run.
 
 The recall ratio is therefore somewhere between 6x and 16x depending on which
 pgvector build you draw, which is exactly why the ratio is the wrong number to
@@ -508,15 +510,17 @@ itself (`=== what the pgvector scan budget buys ===`):
 | relaxed_order | 1 000 000 | 8 | **0.773** | 140.3 ms |
 | strict_order | 1 000 000 | 8 | 0.183 | 140.1 ms |
 
-**Raising `scan_mem_multiplier` alone changes nothing** — 0.083 either way —
-because `max_scan_tuples` binds first. Raising tuples alone gets to 0.273. Only
-both together reach 0.773. An earlier draft blamed the first setting and a later
-one blamed the second; the truth is that lifting either alone is wasted.
+**Raising `scan_mem_multiplier` alone changes nothing** — the first two rows of
+that table are identical — because `max_scan_tuples` binds first. Raising tuples
+alone helps a little; only both together get pgvector near its ceiling. An
+earlier draft of this section blamed the first setting and a later one blamed the
+second. Lifting either alone is wasted.
 
-So the honest best case for pgvector at 1% correlated is **0.773 at 140 ms**
-against Brindle's **0.940 at 3.2 ms** — still behind on recall, and about **44×
-slower**. `relaxed_order` is the better mode; `strict_order` at the same open
-budget reaches 0.183 here, and has measured as low as 0.053 on other builds.
+So pgvector's best case at 1% correlated is the fourth row above, against
+Brindle's 0.940<!--local,1,64,brindle,recall--> at 3.20<!--local,1,64,brindle,ms--> ms — still behind on recall, and more than
+forty times slower. `relaxed_order` is the better mode; `strict_order` at the
+same open budget is the last row, and has measured as low as 0.053 on other
+builds.
 
 This section is now emitted by the harness. It is the one part of this write-up
 the documented command did not regenerate, and it was wrong in two consecutive
@@ -536,25 +540,28 @@ drafts as a direct result.
 | 1% | 256 | **0.973** / 4.06 | 0.967 / **3.68** | 0.217 / 1.75 | " |
 
 When matching rows are spread through every neighbourhood, iterative scan is
-excellent, and **Brindle loses more of this table than it wins**: at 1%
-selectivity and the default `ef_search` iterative scan is ahead 0.963 to 0.893;
-at 5% it is ahead at both beam widths; at 10% and 50% with a wide beam both
-pgvector arms reach 1.000 or 0.997 where Brindle sits at 0.997 and 0.993. And at
-1% with a wide beam Brindle is the *slower* arm, 4.06 ms against 3.68.
+excellent and the two indexes are hard to separate: against it Brindle wins four
+of the eight cells above and loses four. It is ahead at the default `ef_search`
+at 10%, 5% and 50%; iterative scan is ahead at 1% with the default beam
+(0.953<!--spread,1,64,pgv_iter,recall--> against 0.893<!--spread,1,64,brindle,recall-->) and reaches 1.000 at the wide beam where Brindle
+sits a hair below. Brindle is also the slower arm at 1% with a wide beam,
+4.06<!--spread,1,256,brindle,ms--> ms against 3.68<!--spread,1,256,pgv_iter,ms-->, and at 5% with a wide beam.
 
-It should lose here. With matches everywhere, pulling more candidates finds them,
-and there is nothing for predicate-aware traversal to be clever about — the
-differences above are small in both directions and mostly say the two indexes are
-equally good at an easy problem.
+An earlier draft of this paragraph said Brindle "loses more of this table than it
+wins". That was true of an earlier run and was left behind when the table was
+refreshed; on these numbers it is even. The differences are small in both
+directions and mostly say the two indexes are equally good at an easy problem.
 
-Brindle's advantage is about *reaching* matching rows that are somewhere else.
-Where they are not somewhere else, it has none to offer, and this table is what
+It should be even here. With matches everywhere, pulling more candidates finds
+them, and there is nothing for predicate-aware traversal to be clever about.
+Brindle's advantage is about *reaching* matching rows that are somewhere else;
+where they are not somewhere else, it has none to offer, and this table is what
 that looks like.
 
 ### Recall is not flat in selectivity, and the shape is not a defect
 
-Brindle's correlated recall goes 0.940 → 0.770 → 0.693 → 0.940 across 50% → 10%
-→ 5% → 1% at `ef_search` 64. The dip in the middle is a **budget** effect, not a
+Brindle's correlated recall in the table above is not monotonic in selectivity:
+it dips in the middle and recovers at the tight end. The dip in the middle is a **budget** effect, not a
 regime where something breaks — more budget converts into recall at every point:
 
 | correlated | ef 64 | 256 | 1024 | 4096 |
@@ -581,6 +588,9 @@ and § 2(d).
   and warns when it does not fit; the first run of this sweep left the default
   and built a degraded graph, which would have flattered Brindle. The harness now
   raises the setting and **fails** if the index still exceeds it.
+- The "build parameters" row the harness prints shows `hnsw.iterative_scan` as
+  `off`: the scan-budget and rebuild blocks reset it before the report runs. The
+  measured `pgv_iter` arm ran at `relaxed_order`, as below.
 - `hnsw.iterative_scan = relaxed_order`, which is the better of pgvector's two
   modes here — measured, `strict_order` reaches 0.183 against `relaxed_order`'s
   0.773 at an open scan budget on this build — with `hnsw.ef_search` 64, above pgvector's own
@@ -605,10 +615,10 @@ and § 2(d).
 - The same `-march=native` and per-backend-memory asymmetries described in the
   unfiltered comparison apply here unchanged.
 - **Both sides build at `m = 16`, `ef_construction = 64`, and Brindle at
-  `gamma = 1.0`** — the harness prints all four so it cannot drift. `gamma` needs
-  reading out of the index rather than out of `reloptions`, which omits options
-  left unset; an earlier draft of this line claimed a print that was not
-  happening. `gamma` is
+  `gamma = 1.0`** — the harness prints all four so it cannot drift. `gamma` is read from
+  `reloptions` with a fallback, because `reloptions` omits options left unset and
+  would otherwise drop it silently from a row whose whole purpose is that it
+  cannot drift. `gamma` is
   the edge-density knob that exists for exactly this problem, and it is at its
   *off* value: none of the result above is bought with a denser graph.
 - **The uncorrelated label is not a neutral control, though it is a fair one.**
@@ -625,7 +635,7 @@ and § 2(d).
 - Re-running `selectivity.sql` against a database it has already swept does not
   reproduce: its label `UPDATE` rewrites every row, so a second run finds a
   different physical order, `ambuild` scans it in that order, and the graph is
-  different. Measured, 0.940 against 0.803 at 50% correlated. The driver creates
+  different. Measured, the 50%-correlated recall moved from its published value to 0.803 on the re-run. The driver creates
   a fresh database per run; do not shortcut it.
 
 ## What this baseline does not show
