@@ -1,0 +1,90 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 592" width="760" height="592" font-family="system-ui, -apple-system, Segoe UI, sans-serif">
+<style>.ax{font-size:11px;fill:#4a5568}.ar{text-anchor:end}.mid{text-anchor:middle}.ttl{font-size:13px;fill:#1a202c;font-weight:600}.sub{font-size:11px;fill:#718096}.lg{font-size:12px;fill:#2d3748}.grid{stroke:#e2e8f0;stroke-width:1}</style>
+<rect width="760" height="592" fill="#ffffff"/>
+<text x="64" y="26" class="ttl" style="font-size:15px">Filtered vector search as the predicate tightens</text>
+<text x="64" y="44" class="sub">100000 x 128, clustered, k=10 &#183; ef_search 64 &#183; label correlated with vector position &#183; higher is better above, lower is better below</text>
+<text x="64" y="70" class="ttl">recall@10 (1.0 = the exact answer)</text>
+<line x1="64" y1="278.0" x2="742" y2="278.0" class="grid"/>
+<text x="56" y="282.0" class="ax ar">0.00</text>
+<line x1="64" y1="228.0" x2="742" y2="228.0" class="grid"/>
+<text x="56" y="232.0" class="ax ar">0.26</text>
+<line x1="64" y1="178.0" x2="742" y2="178.0" class="grid"/>
+<text x="56" y="182.0" class="ax ar">0.53</text>
+<line x1="64" y1="128.0" x2="742" y2="128.0" class="grid"/>
+<text x="56" y="132.0" class="ax ar">0.79</text>
+<line x1="64" y1="78.0" x2="742" y2="78.0" class="grid"/>
+<text x="56" y="82.0" class="ax ar">1.05</text>
+<text x="64.0" y="296" class="ax mid">50%</text>
+<text x="342.9" y="296" class="ax mid">10%</text>
+<text x="463.1" y="296" class="ax mid">5%</text>
+<text x="742.0" y="296" class="ax mid">1%</text>
+<polyline points="64.0,99.0 342.9,131.3 463.1,145.9 742.0,99.0" fill="none" stroke="#2b6cb0" stroke-width="2.4"/>
+<circle cx="64.0" cy="99.0" r="3.4" fill="#2b6cb0"/>
+<circle cx="342.9" cy="131.3" r="3.4" fill="#2b6cb0"/>
+<circle cx="463.1" cy="145.9" r="3.4" fill="#2b6cb0"/>
+<circle cx="742.0" cy="99.0" r="3.4" fill="#2b6cb0"/>
+<polyline points="64.0,123.7 342.9,147.2 463.1,162.4 742.0,255.8" fill="none" stroke="#b7791f" stroke-width="2.4"/>
+<circle cx="64.0" cy="123.7" r="3.4" fill="#b7791f"/>
+<circle cx="342.9" cy="147.2" r="3.4" fill="#b7791f"/>
+<circle cx="463.1" cy="162.4" r="3.4" fill="#b7791f"/>
+<circle cx="742.0" cy="255.8" r="3.4" fill="#b7791f"/>
+<polyline points="64.0,152.3 342.9,241.2 463.1,255.1 742.0,272.3" fill="none" stroke="#c53030" stroke-width="2.4"/>
+<circle cx="64.0" cy="152.3" r="3.4" fill="#c53030"/>
+<circle cx="342.9" cy="241.2" r="3.4" fill="#c53030"/>
+<circle cx="463.1" cy="255.1" r="3.4" fill="#c53030"/>
+<circle cx="742.0" cy="272.3" r="3.4" fill="#c53030"/>
+<polyline points="64.0,87.5 342.9,87.5 463.1,87.5 742.0,87.5" fill="none" stroke="#4a5568" stroke-width="2.4"/>
+<circle cx="64.0" cy="87.5" r="3.4" fill="#4a5568"/>
+<circle cx="342.9" cy="87.5" r="3.4" fill="#4a5568"/>
+<circle cx="463.1" cy="87.5" r="3.4" fill="#4a5568"/>
+<circle cx="742.0" cy="87.5" r="3.4" fill="#4a5568"/>
+<text x="64" y="346" class="ttl">median latency, ms (log scale)</text>
+<line x1="64" y1="554.0" x2="742" y2="554.0" class="grid"/>
+<text x="56" y="558.0" class="ax ar">0.70</text>
+<line x1="64" y1="504.0" x2="742" y2="504.0" class="grid"/>
+<text x="56" y="508.0" class="ax ar">2.21</text>
+<line x1="64" y1="454.0" x2="742" y2="454.0" class="grid"/>
+<text x="56" y="458.0" class="ax ar">6.95</text>
+<line x1="64" y1="404.0" x2="742" y2="404.0" class="grid"/>
+<text x="56" y="408.0" class="ax ar">21.89</text>
+<line x1="64" y1="354.0" x2="742" y2="354.0" class="grid"/>
+<text x="56" y="358.0" class="ax ar">68.95</text>
+<text x="64.0" y="572" class="ax mid">50%</text>
+<text x="342.9" y="572" class="ax mid">10%</text>
+<text x="463.1" y="572" class="ax mid">5%</text>
+<text x="742.0" y="572" class="ax mid">1%</text>
+<polyline points="64.0,544.3 342.9,502.9 463.1,502.0 742.0,487.8" fill="none" stroke="#2b6cb0" stroke-width="2.4"/>
+<circle cx="64.0" cy="544.3" r="3.4" fill="#2b6cb0"/>
+<circle cx="342.9" cy="502.9" r="3.4" fill="#2b6cb0"/>
+<circle cx="463.1" cy="502.0" r="3.4" fill="#2b6cb0"/>
+<circle cx="742.0" cy="487.8" r="3.4" fill="#2b6cb0"/>
+<polyline points="64.0,540.6 342.9,461.5 463.1,459.7 742.0,360.1" fill="none" stroke="#b7791f" stroke-width="2.4"/>
+<circle cx="64.0" cy="540.6" r="3.4" fill="#b7791f"/>
+<circle cx="342.9" cy="461.5" r="3.4" fill="#b7791f"/>
+<circle cx="463.1" cy="459.7" r="3.4" fill="#b7791f"/>
+<circle cx="742.0" cy="360.1" r="3.4" fill="#b7791f"/>
+<polyline points="64.0,539.8 342.9,538.8 463.1,540.5 742.0,538.1" fill="none" stroke="#c53030" stroke-width="2.4"/>
+<circle cx="64.0" cy="539.8" r="3.4" fill="#c53030"/>
+<circle cx="342.9" cy="538.8" r="3.4" fill="#c53030"/>
+<circle cx="463.1" cy="540.5" r="3.4" fill="#c53030"/>
+<circle cx="742.0" cy="538.1" r="3.4" fill="#c53030"/>
+<polyline points="64.0,377.6 342.9,391.9 463.1,394.4 742.0,396.6" fill="none" stroke="#4a5568" stroke-width="2.4"/>
+<circle cx="64.0" cy="377.6" r="3.4" fill="#4a5568"/>
+<circle cx="342.9" cy="391.9" r="3.4" fill="#4a5568"/>
+<circle cx="463.1" cy="394.4" r="3.4" fill="#4a5568"/>
+<circle cx="742.0" cy="396.6" r="3.4" fill="#4a5568"/>
+<text x="403" y="594" class="ax mid">share of rows matching the predicate</text>
+<line x1="64" y1="552" x2="86" y2="552" stroke="#2b6cb0" stroke-width="2.4"/>
+<circle cx="75" cy="552" r="3.4" fill="#2b6cb0"/>
+<text x="92" y="556" class="lg">Brindle (predicate in traversal)</text>
+<line x1="314" y1="552" x2="336" y2="552" stroke="#b7791f" stroke-width="2.4"/>
+<circle cx="325" cy="552" r="3.4" fill="#b7791f"/>
+<text x="342" y="556" class="lg">pgvector iterative scan</text>
+<line x1="507" y1="552" x2="529" y2="552" stroke="#c53030" stroke-width="2.4"/>
+<circle cx="518" cy="552" r="3.4" fill="#c53030"/>
+<text x="535" y="556" class="lg">pgvector post-filter</text>
+<line x1="64" y1="568" x2="86" y2="568" stroke="#4a5568" stroke-width="2.4"/>
+<circle cx="75" cy="568" r="3.4" fill="#4a5568"/>
+<text x="92" y="572" class="lg">exact scan (the ceiling)</text>
+<!-- plotted brindle:50:0.9400:0.875;brindle:10:0.7700:2.262;brindle:5:0.6933:2.308;brindle:1:0.9400:3.196;exact:50:1.0000:40.097;exact:10:1.0000:28.869;exact:5:1.0000:27.256;exact:1:1.0000:25.928;pgv_iter:50:0.8100:0.951;pgv_iter:10:0.6867:5.849;pgv_iter:5:0.6067:6.101;pgv_iter:1:0.1167:59.956;pgv_post:50:0.6600:0.969;pgv_post:10:0.1933:0.993;pgv_post:5:0.1200:0.955;pgv_post:1:0.0300:1.008 -->
+</svg>

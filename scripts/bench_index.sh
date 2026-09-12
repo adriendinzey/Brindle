@@ -20,6 +20,10 @@
 #            vector extension installed into the same Postgres)
 #   INSERTS  set to 1 to also measure insert cost against index size, after the
 #            query sweep — a different question, and a slow one, so it is opt-in
+#   SELECTIVITY  set to 1 to also run the filtered-search sweep (brindle vs
+#            pgvector post-filter vs pgvector iterative scan) across predicate
+#            selectivity, for both an uncorrelated and a correlated label.
+#            Requires PGVECTOR=1, since the comparison is the point.
 #   SHAPE    set to "clustered" for 100 gaussian-ish clusters; unset means
 #            uniform random, which in high dimensions is the worst case a graph
 #            index can face and says more about the fixture than the index
@@ -98,6 +102,36 @@ if [[ "${PGVECTOR:-0}" == "1" ]]; then
   "$bindir/psql" --host "$host" --port "$port" --dbname "$db" --quiet --no-psqlrc \
     --set=ON_ERROR_STOP=1 --set=k="$K" \
     --file benches/sql/pgvector_compare.sql
+fi
+
+if [[ "${SELECTIVITY:-0}" == "1" ]]; then
+  if [[ "${PGVECTOR:-0}" != "1" ]]; then
+    echo "error: SELECTIVITY=1 needs PGVECTOR=1 — the comparison is the benchmark" >&2
+    exit 1
+  fi
+  echo
+  echo "==> filtered search across selectivity (brindle vs pgvector post-filter vs iterative)"
+  chart_csv="$(mktemp -t brindle-selectivity-XXXXXX.csv)"
+  "$bindir/psql" --host "$host" --port "$port" --dbname "$db" --quiet --no-psqlrc \
+    --set=ON_ERROR_STOP=1 --set=k="$K" --set=chart_csv="$chart_csv" \
+    --file benches/sql/selectivity.sql
+
+  # The chart is generated from the numbers just measured, with the Python
+  # standard library only: this repo has no plotting dependency and adding one
+  # for a single figure would make "one command regenerates everything" false.
+  if python3 benches/chart.py "$chart_csv" docs/assets/selectivity.svg \
+       "$ROWS x $DIMS, ${SHAPE:-uniform}, k=$K"; then
+    echo "==> chart written to docs/assets/selectivity.svg"
+  fi
+  echo "    raw numbers: $chart_csv"
+
+  # The committed write-up can be checked against this run, but only if the run
+  # was captured -- this script prints to stdout rather than to a file, so the
+  # check belongs to whoever redirected it. Stale figures have survived several
+  # review rounds of this benchmark by looking plausible beside the tables they
+  # contradict, so it is worth doing.
+  echo "    to check the write-up against this run:"
+  echo "      <this command> 2>&1 | tee run.log && python3 benches/verify_writeup.py run.log"
 fi
 
 echo

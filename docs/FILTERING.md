@@ -341,8 +341,9 @@ own, so raising it widens the beam and the reach together.
 ## 5. How we'll prove it works
 
 The claim "Brindle keeps recall under filters" is meaningless without numbers, so
-Phase 5 includes a harness that sweeps **predicate selectivity** (100% → 0.1%) and
-plots **recall@10** and **QPS** for:
+`benches/sql/selectivity.sql` sweeps **predicate selectivity** (50% → 1%, the
+range `ntile(100)` can express exactly) and reports **recall@10** and **QPS**
+for:
 
 - Brindle (γ-dense + predicate-aware),
 - pgvector post-filter,
@@ -351,7 +352,9 @@ plots **recall@10** and **QPS** for:
 
 The deliverable is a chart in the README showing where predicate-aware traversal
 wins. If it *doesn't* win in some regime, we say so — that honesty is worth more
-than a marketing number.
+than a marketing number. It does not win everywhere: see
+[BENCHMARKS.md](BENCHMARKS.md) § "Filtered search across selectivity", which
+reports the uncorrelated case where pgvector's iterative scan is ahead.
 
 ## References
 

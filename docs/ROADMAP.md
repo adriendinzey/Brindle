@@ -28,7 +28,7 @@ Legend: ✅ done · 🚧 in progress · ⬜ planned
 - ✅ Soft delete + `VACUUM` integration (`ambulkdelete`, `amvacuumcleanup`)
 - ✅ Measured baseline against pgvector — [BENCHMARKS.md](BENCHMARKS.md)
 
-## Phase 2 — Filter-aware search (the differentiator) 🚧
+## Phase 2 — Filter-aware search (the differentiator) ✅
 *"Predicate-aware ANN: high recall under selective filters."* — see [FILTERING.md](FILTERING.md)
 
 - ✅ γ-dense edge construction (`gamma` build param)
@@ -40,7 +40,8 @@ Legend: ✅ done · 🚧 in progress · ⬜ planned
 - ✅ Predicate-aware expansion with ACORN-style bridging
 - ✅ Reaching matching regions the query is not in — a filter correlated with
   vector position used to return nothing at all
-- ⬜ Selectivity sweep proving recall vs pgvector post-filter / iterative scan
+- ✅ Selectivity sweep vs pgvector post-filter / iterative scan —
+  [BENCHMARKS.md](BENCHMARKS.md), chart in the README
 
 ## Phase 3 — Durable storage 🚧
 *"Crash-safe index in Postgres buffer pages + WAL."*
