@@ -7,7 +7,7 @@ This document is the **contract** for the storage implementation. Everything the
 implementation needs to decide about *bytes on pages* is decided here; what is
 left open is listed in [§ 12](#12-left-to-the-implementation).
 
-Status: **specification** (format version 2). The shipping code still uses the
+Status: **specification** (format version 4). The shipping code still uses the
 interim blob format described in [§ 2](#2-what-this-replaces).
 
 ---
@@ -48,7 +48,7 @@ is no longer current:
 block 0   metapage: magic, version, blob length, generation
 block 1   ┐
 block 2   │  one byte stream, chunked at the page boundary:
-  ...     │  [graph codec][node-id → heap-TID table]
+  ...     │  [graph codec][node-id → heap-TID table][vectorless rows]
 block N   ┘
 ```
 
@@ -157,17 +157,18 @@ never wrote.
 Fixed offsets, little-endian, exactly as the blob metapage and the graph codec
 already store their scalars.
 
-**The paged metapage is version 3, not 2.** The blob format took 2 when it grew
-a generation counter, so a paged reader that claimed 2 would find a 24-byte blob
-metapage announcing the version it was looking for and parse 80 bytes out of it —
-which is precisely the misparse the version field exists to prevent. The number
-has to move whenever either format changes shape, and only one of them can hold
-a given value.
+**The paged metapage is version 4.** The blob format took 2 when it grew a
+generation counter and 3 when it grew the table of rows that have attributes but
+no vector, so a paged reader claiming either would find a 24-byte blob metapage
+announcing the version it was looking for and parse 80 bytes out of it — which
+is precisely the misparse the version field exists to prevent. The number has to
+move whenever either format changes shape, and only one of them can hold a given
+value; this design's number moves with the blob's until the blob is gone.
 
 ```
 offset size field                notes
   0     4   magic               0x4252_4E44 "BRND"   ─┐ same offsets as the blob
-  4     4   version             3                    ─┘ format, so the check works
+  4     4   version             4                    ─┘ format, so the check works
   8     1   metric              Metric::code()
   9     1   flags               reserved, zero
  10     2   reserved
@@ -847,7 +848,7 @@ rebuilt with `REINDEX`.**
 - The metapage's `version` field is what detects it: an index in an older format
   fails with an error naming the format it was written in and telling the user to
   `REINDEX INDEX <name>` (or `REINDEX TABLE`), rather than misparsing a blob as a
-  metapage. The blob format is at 2 and this design takes 3 — every format that
+  metapage. The blob format is at 3 and this design takes 4 — every format that
   has ever been written needs its own number, or the check silently passes on the
   wrong layout.
 - That check works only because the two formats agree on where to look, which is
@@ -869,6 +870,16 @@ node-id → heap-TID table (heap TIDs are inline now), the whole-image rewrite o
 insert, and the read lock scans took over the image. The graph's own
 `to_bytes`/`from_bytes` codec is not part of this — it is useful for tests and
 debugging, and keeping or dropping it is the implementation's call.
+
+**What does not disappear: the rows that have attributes but no vector.** A
+`NULL` embedding cannot be placed in the graph or ranked, but this index is not
+registered as partial, so PostgreSQL believes it covers every row in the table —
+and an unordered index scan that omits those rows returns fewer rows than a
+sequential scan of the same query. That is a wrong answer, not a recall trade.
+The blob format carries them in a third section beside the graph; this design
+must give them a home of its own (their own page chain is the obvious one, since
+nothing addresses them by node id). Where they live is the implementation's
+call; that they live somewhere is not.
 
 ---
 

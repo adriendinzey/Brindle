@@ -117,6 +117,10 @@ CREATE OPERATOR CLASS real_array_l2_ops
 struct BuildState {
     hnsw: Hnsw,
     heap_tids: Vec<TidPair>,
+    /// Rows with attributes but no vector. They cannot go in the graph, and the
+    /// index is not partial, so dropping them would make an unordered scan
+    /// return fewer rows than a sequential scan of the same query.
+    unrankable: Vec<storage::UnrankableRow>,
     kind: VectorKind,
 }
 
@@ -172,7 +176,12 @@ unsafe extern "C" fn build_callback(
     // does not outlive ambuild's stack frame.
     let state = &mut *state.cast::<BuildState>();
     if *isnull {
-        return; // NULL vectors are not indexed; a distance scan can't rank them
+        // No vector to place in the graph or to rank — but the row still exists
+        // and still has attributes, and this index claims to cover it. Keep it
+        // beside the graph so an unordered scan can return it.
+        let row = attrs::row_from_datums(index, values, isnull);
+        state.unrankable.push((item_pointer_get_both(*tid), row));
+        return;
     }
     // SAFETY: values[0]/isnull[0] is the vector — key column 1 — and we just
     // checked it is not null. Any further key columns are filterable
@@ -208,6 +217,7 @@ unsafe extern "C" fn ambuild(
     let mut state = BuildState {
         hnsw: Hnsw::new(build_params(index)),
         heap_tids: Vec::new(),
+        unrankable: Vec::new(),
         kind: opclass::index_kind(index),
     };
 
@@ -224,8 +234,12 @@ unsafe extern "C" fn ambuild(
         core::ptr::null_mut(),
     );
 
-    let index_tuples = state.heap_tids.len() as f64;
-    let blob = storage::encode_index(&state.hnsw, &state.heap_tids);
+    // Every row this index holds, not just the ones in the graph: this becomes
+    // pg_class.reltuples for the index, and amvacuumcleanup reports the heap's
+    // count for a non-partial index -- so counting only graph nodes would make
+    // the number flip depending on which ran last.
+    let index_tuples = (state.heap_tids.len() + state.unrankable.len()) as f64;
+    let blob = storage::encode_index(&state.hnsw, &state.heap_tids, &state.unrankable);
     // SAFETY: CREATE INDEX/REINDEX hands ambuild a freshly created, exclusively
     // locked relfilenode, so the main fork is empty as write_index_blob requires.
     storage::write_index_blob(index, &blob, pg_sys::ForkNumber::MAIN_FORKNUM);
@@ -246,7 +260,7 @@ unsafe extern "C" fn ambuildempty(index: pg_sys::Relation) {
     // The init fork of an unlogged index: an empty graph, so the index is
     // valid (and empty) after a crash resets the main fork from it.
     let hnsw = Hnsw::new(build_params(index));
-    let blob = storage::encode_index(&hnsw, &[]);
+    let blob = storage::encode_index(&hnsw, &[], &[]);
     // SAFETY: Postgres calls ambuildempty right after creating the (empty)
     // init fork of the exclusively locked new index, as write_index_blob
     // requires.
@@ -293,14 +307,20 @@ unsafe extern "C" fn aminsert(
     _index_unchanged: bool,
     _index_info: *mut pg_sys::IndexInfo,
 ) -> bool {
+    // A NULL vector has nothing to place in the graph, but the row still exists
+    // and this index is not partial, so it is staged for the side table rather
+    // than dropped — see `storage::UnrankableRow`.
+    //
     // SAFETY: values[0]/isnull[0] is the vector — key column 1 — and any further
     // key columns are filterable attributes, read below.
-    if *isnull {
-        return false; // NULL vectors are not indexed; a distance scan can't rank them
-    }
-    // The column's type decides how the datum is read, exactly as it does for a
-    // build — reading a vector as an array would reinterpret its header.
-    let vector = f32_vec_from_datum(opclass::index_kind(index), *values);
+    let vector = if *isnull {
+        None
+    } else {
+        // The column's type decides how the datum is read, exactly as it does
+        // for a build — reading a vector as an array would reinterpret its
+        // header.
+        Some(f32_vec_from_datum(opclass::index_kind(index), *values))
+    };
 
     // SAFETY: `index` is the open index relation Postgres locked for this
     // insert, and `heap_tid` points at the ItemPointerData of the tuple being
@@ -346,9 +366,10 @@ unsafe extern "C" fn ambulkdelete(
         storage::IMAGE_LOCK_BLOCK,
         pg_sys::ExclusiveLock as i32,
     );
-    let (mut hnsw, tids) = storage::load_index(index);
+    let (mut hnsw, tids, mut unrankable) = storage::load_index(index);
 
     let tombstoned_before = hnsw.deleted_count();
+    let unrankable_before = unrankable.len();
     for (id, &(block, offset)) in tids.iter().enumerate() {
         let mut tid = pg_sys::ItemPointerData::default();
         item_pointer_set_all(&mut tid, block, offset);
@@ -361,9 +382,21 @@ unsafe extern "C" fn ambulkdelete(
         }
     }
 
+    // The same question for the rows that never entered the graph. They have no
+    // node to tombstone, so they are dropped outright — nothing refers to them
+    // by position.
+    unrankable.retain(|&((block, offset), _)| {
+        let mut tid = pg_sys::ItemPointerData::default();
+        item_pointer_set_all(&mut tid, block, offset);
+        // SAFETY: as above — VACUUM's own callback and state, and a tuple id
+        // that lives for the call.
+        !is_dead(&mut tid, callback_state)
+    });
+
     let removed = hnsw.deleted_count() - tombstoned_before;
-    if removed > 0 {
-        storage::rewrite_index_blob(index, &storage::encode_index(&hnsw, &tids));
+    let unrankable_removed = unrankable_before - unrankable.len();
+    if removed > 0 || unrankable_removed > 0 {
+        storage::rewrite_index_blob(index, &storage::encode_index(&hnsw, &tids, &unrankable));
     }
     pg_sys::UnlockPage(
         index,
@@ -381,8 +414,9 @@ unsafe extern "C" fn ambulkdelete(
     }
     result.num_pages =
         pg_sys::RelationGetNumberOfBlocksInFork(index, pg_sys::ForkNumber::MAIN_FORKNUM);
-    result.num_index_tuples = hnsw.live_len() as f64;
-    result.tuples_removed += removed as f64;
+    // Both counts span the whole index, for the reason in `ambuild`.
+    result.num_index_tuples = (hnsw.live_len() + unrankable.len()) as f64;
+    result.tuples_removed += (removed + unrankable_removed) as f64;
     result.into_pg()
 }
 
@@ -603,7 +637,7 @@ mod tests {
 
     /// The persisted graph and heap-pointer table of an index, read back the
     /// way every future reader will read them.
-    fn load_persisted(index: &str) -> (Hnsw, Vec<TidPair>) {
+    fn load_persisted(index: &str) -> (Hnsw, Vec<TidPair>, Vec<storage::UnrankableRow>) {
         // Inserts are applied to a graph held for the transaction and written
         // back when it ends, so reading the stored image means ending that
         // deferral first. Doing it here puts the flush under test rather than
@@ -669,7 +703,7 @@ mod tests {
 
         // SAFETY: the index exists and PgRelation keeps it open across both
         // calls; the blob is a well-formed encoding of the graph beside it.
-        let (restored, tids) = unsafe {
+        let (restored, tids, _) = unsafe {
             let relation = PgRelation::open_with_name("t_tail_idx").expect("open index");
             let mut small = Hnsw::new(HnswParams::default());
             for i in 0..5u32 {
@@ -680,7 +714,7 @@ mod tests {
             let small_tids: Vec<TidPair> = (0..5).map(|i| (0u32, i as u16 + 1)).collect();
             storage::rewrite_index_blob(
                 relation.as_ptr(),
-                &storage::encode_index(&small, &small_tids),
+                &storage::encode_index(&small, &small_tids, &[]),
             );
             storage::load_index(relation.as_ptr())
         };
@@ -716,19 +750,25 @@ mod tests {
     #[pg_test]
     fn built_graph_round_trips_through_pages() {
         create_fixture("t_rt", 100);
-        // NULL vectors must be skipped, not break the build.
+        // NULL vectors must stay out of the graph without breaking the build --
+        // and must still reach the index, since it claims to cover them.
         Spi::run("INSERT INTO t_rt SELECT i, NULL FROM generate_series(101, 105) i")
             .expect("insert nulls");
         Spi::run("CREATE INDEX t_rt_idx ON t_rt USING brindle (embedding)").expect("create index");
 
         // SAFETY: freshly created index; AccessShare via PgRelation keeps it open.
         let index = unsafe { PgRelation::open_with_name("t_rt_idx") }.expect("open index");
-        let (restored, tids) = unsafe { storage::load_index(index.as_ptr()) };
+        let (restored, tids, unrankable) = unsafe { storage::load_index(index.as_ptr()) };
 
+        assert_eq!(
+            unrankable.len(),
+            5,
+            "the NULL-vector rows are in the index, just not in the graph"
+        );
         assert_eq!(
             restored.len(),
             100,
-            "only the 100 non-NULL rows are indexed"
+            "only the 100 non-NULL rows are in the graph"
         );
         assert_eq!(tids.len(), 100);
         assert!(tids.iter().all(|&(_, off)| off >= 1));
@@ -784,7 +824,7 @@ mod tests {
         Spi::run("INSERT INTO t_ins_vec VALUES (51, '[3,9,6,1]'::brindle_vector)")
             .expect("insert after build");
 
-        let (hnsw, tids) = load_persisted("t_ins_vec_idx");
+        let (hnsw, tids, _) = load_persisted("t_ins_vec_idx");
         assert_eq!(hnsw.len(), 51, "the new row joined the graph");
         let (dist, id) = nearest(&hnsw, &[3.0, 9.0, 6.0, 1.0]);
         assert_eq!(dist, 0.0, "the inserted vector is its own nearest neighbor");
@@ -798,7 +838,7 @@ mod tests {
             .expect("create index");
         insert_fixture_rows("t_ins", 101, 105);
 
-        let (hnsw, tids) = load_persisted("t_ins_idx");
+        let (hnsw, tids, _) = load_persisted("t_ins_idx");
         assert_eq!(hnsw.len(), 105, "the five new rows joined the graph");
         assert_eq!(tids.len(), 105);
 
@@ -844,15 +884,26 @@ mod tests {
     }
 
     #[pg_test]
-    fn insert_skips_null_vectors() {
+    fn insert_keeps_a_null_vector_out_of_the_graph_but_in_the_index() {
         create_fixture("t_ins_null", 20);
         Spi::run("CREATE INDEX t_ins_null_idx ON t_ins_null USING brindle (embedding)")
             .expect("create index");
         Spi::run("INSERT INTO t_ins_null VALUES (21, NULL)").expect("insert");
 
-        let (hnsw, tids) = load_persisted("t_ins_null_idx");
+        let (hnsw, tids, unrankable) = load_persisted("t_ins_null_idx");
         assert_eq!(hnsw.len(), 20, "a NULL vector must not become a node");
         assert_eq!(tids.len(), 20);
+        // Out of the graph is right; out of the index is the bug. This index has
+        // no attribute columns, so the row is carried as a TID and an empty row.
+        assert_eq!(
+            unrankable.len(),
+            1,
+            "the NULL-vector row must still be in the index, beside the graph"
+        );
+        assert!(
+            unrankable[0].1.is_empty(),
+            "an index with no attribute columns stores no attribute values"
+        );
     }
 
     #[pg_test]
@@ -864,7 +915,7 @@ mod tests {
 
         // An index built over no rows has no dimensionality yet; the first
         // insert is what fixes it.
-        let (hnsw, tids) = load_persisted("t_ins_empty_idx");
+        let (hnsw, tids, _) = load_persisted("t_ins_empty_idx");
         assert_eq!(hnsw.dim(), 4);
         assert_eq!(hnsw.len(), 1);
         assert_eq!(tids.len(), 1);
@@ -895,7 +946,7 @@ mod tests {
             "60 more 64-dim vectors must have needed more pages than {pages_after_build}"
         );
 
-        let (hnsw, tids) = load_persisted("t_ins_grow_idx");
+        let (hnsw, tids, _) = load_persisted("t_ins_grow_idx");
         assert_eq!(hnsw.len(), 90);
         assert_eq!(tids.len(), 90);
         // Every heap pointer still addresses the row whose vector its node holds
@@ -999,7 +1050,7 @@ mod tests {
 
         // SAFETY: freshly created index; AccessShare via PgRelation keeps it open.
         let index = unsafe { PgRelation::open_with_name("t_toast_build_idx") }.expect("open");
-        let (graph, tids) = unsafe { storage::load_index(index.as_ptr()) };
+        let (graph, tids, _) = unsafe { storage::load_index(index.as_ptr()) };
         assert_eq!(graph.len() as i64, ROWS);
         assert_eq!(tids.len() as i64, ROWS);
 
@@ -1064,7 +1115,7 @@ mod tests {
 
         // SAFETY: freshly created index; AccessShare via PgRelation keeps it open.
         let index = unsafe { PgRelation::open_with_name(&format!("{table}_idx")) }.expect("open");
-        let (graph, _tids) = unsafe { storage::load_index(index.as_ptr()) };
+        let (graph, _tids, _) = unsafe { storage::load_index(index.as_ptr()) };
         graph
     }
 
@@ -1165,7 +1216,7 @@ mod tests {
             .expect("create index");
         // SAFETY: freshly created index; AccessShare via PgRelation keeps it open.
         let index = unsafe { PgRelation::open_with_name("t_default_array_idx") }.expect("open");
-        let (graph, _tids) = unsafe { storage::load_index(index.as_ptr()) };
+        let (graph, _tids, _) = unsafe { storage::load_index(index.as_ptr()) };
         assert_eq!(graph.metric(), Metric::L2);
     }
 
@@ -1178,7 +1229,7 @@ mod tests {
         Spi::run("CREATE INDEX t_vac_idx ON t_vac USING brindle (embedding)")
             .expect("create index");
 
-        let (_, tids) = load_persisted("t_vac_idx");
+        let (_, tids, _) = load_persisted("t_vac_idx");
         let doomed: Vec<TidPair> = tids
             .iter()
             .copied()
@@ -1189,7 +1240,7 @@ mod tests {
         Spi::run("DELETE FROM t_vac WHERE id <= 3").expect("delete");
         assert_eq!(bulk_delete("t_vac_idx", doomed.clone()), 3.0);
 
-        let (hnsw, tids) = load_persisted("t_vac_idx");
+        let (hnsw, tids, _) = load_persisted("t_vac_idx");
         assert_eq!(hnsw.len(), 60, "tombstones keep their slot in the graph");
         assert_eq!(hnsw.live_len(), 57);
         for row in 1..=3 {
@@ -1202,7 +1253,7 @@ mod tests {
 
         // A row inserted afterwards is indexed as usual, alongside the tombstones.
         Spi::run("INSERT INTO t_vac VALUES (61, ARRAY[2,9,6,1]::real[])").expect("insert");
-        let (hnsw, tids) = load_persisted("t_vac_idx");
+        let (hnsw, tids, _) = load_persisted("t_vac_idx");
         assert_eq!(hnsw.len(), 61);
         assert_eq!(hnsw.live_len(), 58);
         let (dist, id) = nearest(&hnsw, &[2.0, 9.0, 6.0, 1.0]);
@@ -1217,7 +1268,7 @@ mod tests {
             .expect("create index");
 
         assert_eq!(bulk_delete("t_vac_live_idx", Vec::new()), 0.0);
-        let (hnsw, _) = load_persisted("t_vac_live_idx");
+        let (hnsw, _, _) = load_persisted("t_vac_live_idx");
         assert_eq!(hnsw.live_len(), 20);
         assert_eq!(hnsw.deleted_count(), 0);
     }

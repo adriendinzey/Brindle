@@ -173,11 +173,23 @@ impl ScanSearch {
         storage::flush_pending_for(index);
         let handle = storage::cached_index(index);
         let matched = handle.graph().matching(predicate);
-        self.results.reserve(matched.len());
+        self.results
+            .reserve(matched.len() + handle.unrankable().len());
         for id in matched {
             match handle.tids().get(id) {
                 Some(&tid) => self.results.push(tid),
                 None => return Err(ScanError::UnmappedNode(id)),
+            }
+        }
+        // Rows with attributes but no vector are not in the graph and never can
+        // be. They are still rows this index claims to cover, and this scan
+        // promises *every* matching one — omitting them returned fewer rows than
+        // a sequential scan of the same query, which is a wrong answer rather
+        // than a recall trade. The predicate is applied to them exactly as it is
+        // to a node's attribute row.
+        for (tid, attrs) in handle.unrankable() {
+            if predicate.matches(attrs) {
+                self.results.push(*tid);
             }
         }
         Ok(())

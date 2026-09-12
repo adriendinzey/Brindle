@@ -177,6 +177,27 @@ versions may break).
   proportional to the index (2353 node expansions at n = 20 000 against a 1024
   allowance). Closing that is a decision about plain HNSW recall rather than
   about filtering.
+- **Fixed: an index scan could return fewer rows than a sequential scan of the
+  same query.** A row whose indexed vector is `NULL` cannot go in the graph —
+  there is nothing to place or to rank — and was skipped outright. But the index
+  is not registered as partial, so PostgreSQL believes it covers every row in the
+  table, and a plan that used it silently came back short: on 400 rows plus three
+  with a `NULL` embedding, `SELECT count(*) ... WHERE bucket = 7` returned 43 by
+  sequential scan and 40 through the index. That is a wrong answer rather than a
+  recall trade.
+
+  Those rows are now stored beside the graph with their attribute values, and a
+  scan that returns every matching row consults them, applying the predicate
+  exactly as it does to a row in the graph. `INSERT`, `VACUUM` and rollback treat
+  them like any other indexed row.
+
+  **A ranked scan still omits them, by design.** A `NULL` vector has no distance,
+  so it has no place in an `ORDER BY embedding <-> $1` result; an ordered scan is
+  already bounded by `brindle.ef_search` and documented as returning at most that
+  many rows. Leaving unrankable rows out of a ranking is consistent with that.
+  The unordered path is different in kind: its whole purpose is to return every
+  matching row.
+
 - **A transaction's inserts are written back to the index once, when it ends,
   rather than once per row.** Every write rewrites the whole stored image, so
   doing that per row made a bulk load quadratic in the table; `INSERT ... SELECT`
@@ -259,14 +280,15 @@ versions may break).
   scan in a backend still pays the full cost, as does the first after any write
   invalidates the copy, so a connection that issues one query and disconnects
   sees no benefit.
-- **The on-disk page layout is now version 2, and an index written by an earlier
+- **The on-disk page layout is now version 3, and an index written by an earlier
   build must be rebuilt with `REINDEX`.** (Distinct from the graph codec version
   named below — they are separate numbers in separate headers, which is worth
   knowing when reading an error message.) The metapage carries a generation
   counter, which is how a backend tells whether the copy it holds is still the
   index — including when another connection wrote to it, which Postgres does not
-  otherwise announce. Reading such an index reports the format it was written in
-  and names `REINDEX`.
+  otherwise announce; and the image carries the rows that have no vector, for the
+  reason in the completeness fix above. Reading an older index reports the format
+  it was written in and names `REINDEX`.
 - The stored graph codec now carries each row's filterable attribute values
   (codec version 2). Codec version 1 payloads are rejected rather than read as
   attribute-free, because that would let a filtered scan silently return no rows
