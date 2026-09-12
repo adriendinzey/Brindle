@@ -97,6 +97,81 @@ def check(nums):
     return bad
 
 
+def log_tables(log):
+    """The harness's own tables, keyed by what each cell describes.
+
+    Parsing these is the difference between checking a claim and checking a
+    coincidence. An earlier version asked only "does this number appear in the
+    log", which a 3-decimal recall can satisfy by colliding with an unrelated
+    latency -- an injected 0.899 in place of a measured 0.940 passed, because
+    0.899 was some other cell's millisecond figure.
+    """
+    recall, lat = {}, {}
+    for shape, marker in (("local", "CORRELATED label"),
+                          ("spread", "uncorrelated label")):
+        if marker not in log:
+            continue
+        blk = log.split(marker, 1)[1].split("rows)", 1)[0]
+        for line in blk.split("\n"):
+            m = re.match(r"\s*(\d+)\s*\|\s*(\d+)\s*\|\s*([\d.]+)\s*\|"
+                         r"\s*([\d.]+)\s*\|\s*([\d.]+)", line)
+            if m:
+                sel, ef, b, pp, pi = m.groups()
+                for engine, v in (("brindle", b), ("pgv_post", pp), ("pgv_iter", pi)):
+                    recall[(shape, int(sel), int(ef), engine)] = Decimal(v)
+    if "=== median latency" in log:
+        for line in log.split("=== median latency", 1)[1].split("\n"):
+            m = re.match(r"\s*(\w+)\s*\|\s*(\d+)\s*\|\s*(\d*)\s*\|\s*(\w+)"
+                         r"\s*\|\s*([\d.]+)", line)
+            if m:
+                shape, sel, ef, engine, ms = m.groups()
+                lat[(shape, int(sel), int(ef) if ef.strip() else None, engine)] = Decimal(ms)
+    if "the exact arm" in log:
+        blk = log.split("the exact arm", 1)[1].split("rows)", 1)[0]
+        for line in blk.split("\n"):
+            m = re.match(r"\s*(\w+)\s*\|\s*(\d+)\s*\|\s*([\d.]+)\s*\|\s*([\d.]+)", line)
+            if m:
+                shape, sel, rc, ms = m.groups()
+                recall[(shape, int(sel), None, "exact")] = Decimal(rc)
+                lat[(shape, int(sel), None, "exact")] = Decimal(ms)
+    return recall, lat
+
+
+def tables_agree(log):
+    """Every published table cell against the cell the harness printed."""
+    recall, lat = log_tables(log)
+    if not recall:
+        return ["the log carries no result tables; is it a completed run?"]
+    bench = open("docs/BENCHMARKS.md").read()
+    bad = []
+    for heading, shape in (("### Correlated predicate", "local"),
+                           ("### Uncorrelated predicate", "spread")):
+        i = bench.index(heading)
+        seg = bench[i:bench.index("###", i + 5)]
+        for sel, ef, rest in re.findall(r"^\| (\d+)% \| (\d+) \|(.+)$", seg, re.M):
+            cells = [c.strip().replace("**", "") for c in rest.split("|")]
+            for engine, cell in zip(("brindle", "pgv_iter", "pgv_post", "exact"), cells):
+                if not cell or cell == '"':
+                    continue
+                key = (shape, int(sel), None if engine == "exact" else int(ef), engine)
+                parts = [x.strip() for x in cell.split("/")]
+                for want_txt, table in ((parts[0], recall),
+                                        (parts[1].replace("ms", "").strip()
+                                         if len(parts) > 1 else None, lat)):
+                    if want_txt is None:
+                        continue
+                    got = table.get(key)
+                    if got is None:
+                        bad.append(f"BENCHMARKS {shape} {sel}%/ef{ef} {engine}: "
+                                   "no such cell in the run")
+                        continue
+                    q = Decimal(1).scaleb(-len(want_txt.split(".")[1]))
+                    if got.quantize(q, rounding=ROUND_HALF_UP) != Decimal(want_txt):
+                        bad.append(f"BENCHMARKS {shape} {sel}%/ef{ef} {engine}: "
+                                   f"published {want_txt}, run measured {got}")
+    return bad
+
+
 def chart_agrees(path="docs/assets/selectivity.svg"):
     """Check the committed chart against the committed correlated table.
 
@@ -178,7 +253,7 @@ def main():
               "that is not a run log", file=sys.stderr)
         return 2
 
-    bad = check(nums) + chart_agrees()
+    bad = check(nums) + tables_agree(open(sys.argv[1]).read()) + chart_agrees()
     if bad:
         print("\n".join(bad))
         print(f"\n{len(bad)} figure(s) do not come from this run.")
