@@ -97,6 +97,45 @@ def check(nums):
     return bad
 
 
+def chart_agrees(path="docs/assets/selectivity.svg"):
+    """Check the committed chart against the committed correlated table.
+
+    The chart has twice been committed a run behind the tables it illustrates --
+    once plotting pgvector at 0.077 while the table three lines below said 0.117,
+    in Brindle's favour. Both times a reviewer caught it by inverting the
+    polyline coordinates. `chart.py` now records what it plotted, so this is a
+    lookup rather than a reconstruction.
+    """
+    svg = open(path).read()
+    m = re.search(r"<!-- plotted ([^>]+?) -->", svg)
+    if not m:
+        return [f"{path}: carries no record of what it plotted; regenerate it"]
+    plotted = {}
+    for item in m.group(1).split(";"):
+        engine, sel, recall, _p50 = item.split(":")
+        plotted[(engine, int(sel))] = Decimal(recall)
+
+    bench = open("docs/BENCHMARKS.md").read()
+    i = bench.index("### Correlated predicate")
+    rows = re.findall(r"^\| (\d+)% \| (\d+) \|(.+)$",
+                      bench[i:bench.index("###", i + 5)], re.M)
+    bad = []
+    for sel, ef, rest in rows:
+        if int(ef) != 64:
+            continue
+        cells = [c.strip().replace("**", "") for c in rest.split("|")]
+        for engine, cell in zip(("brindle", "pgv_iter", "pgv_post", "exact"), cells):
+            want = Decimal(cell.split("/")[0].strip())
+            got = plotted.get((engine, int(sel)))
+            if got is None:
+                bad.append(f"{path}: no {engine} point at {sel}% — the chart is "
+                           "missing a series the table has")
+            elif got.quantize(Decimal("0.001")) != want:
+                bad.append(f"{path}: plots {engine} at {sel}% as {got}, table says "
+                           f"{want} — the chart is from a different run")
+    return bad
+
+
 def self_test():
     """The matcher, against cases this file has actually got wrong."""
     nums = {0.193, 3.196, 0.953, 4.057, 0.117}
@@ -139,7 +178,7 @@ def main():
               "that is not a run log", file=sys.stderr)
         return 2
 
-    bad = check(nums)
+    bad = check(nums) + chart_agrees()
     if bad:
         print("\n".join(bad))
         print(f"\n{len(bad)} figure(s) do not come from this run.")

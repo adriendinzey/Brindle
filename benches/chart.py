@@ -155,6 +155,14 @@ def main():
         if lx > W - 200:
             lx, ly = PAD_L, ly + 16
 
+    # A machine-readable record of what was plotted. The chart has twice been
+    # committed a run behind the tables it illustrates, and that was caught both
+    # times by hand-inverting the polyline coordinates. This lets
+    # benches/verify_writeup.py do it instead.
+    out.append("<!-- plotted "
+               + ";".join(f"{r['engine']}:{r['sel']}:{r['recall']:.4f}:{r['p50_ms']:.4f}"
+                          for r in sorted(data, key=lambda r: (r["engine"], -r["sel"])))
+               + " -->")
     out.append("</svg>")
     with open(dst, "w") as fh:
         fh.write("\n".join(out) + "\n")
