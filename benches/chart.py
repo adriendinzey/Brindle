@@ -160,7 +160,7 @@ def main():
     # times by hand-inverting the polyline coordinates. This lets
     # benches/verify_writeup.py do it instead.
     out.append("<!-- plotted "
-               + ";".join(f"{r['engine']}:{r['sel']}:{r['recall']:.4f}:{r['p50_ms']:.4f}"
+               + ";".join(f"{r['engine']}:{r['sel']}:{r['recall']:.4f}:{r['p50_ms']:.3f}"
                           for r in sorted(data, key=lambda r: (r["engine"], -r["sel"])))
                + " -->")
     out.append("</svg>")

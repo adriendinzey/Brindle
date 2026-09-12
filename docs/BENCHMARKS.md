@@ -543,8 +543,8 @@ When matching rows are spread through every neighbourhood, iterative scan is
 excellent and the two indexes are hard to separate: against it Brindle wins four
 of the eight cells above and loses four. It is ahead at the default `ef_search`
 at 10%, 5% and 50%; iterative scan is ahead at 1% with the default beam
-(0.953<!--spread,1,64,pgv_iter,recall--> against 0.893<!--spread,1,64,brindle,recall-->) and reaches 1.000 at the wide beam where Brindle
-sits a hair below. Brindle is also the slower arm at 1% with a wide beam,
+(0.953<!--spread,1,64,pgv_iter,recall--> against 0.893<!--spread,1,64,brindle,recall-->) and reaches 1.000<!--spread,5,256,pgv_iter,recall--> at the wide beam where
+Brindle sits a hair below. Brindle is also the slower arm at 1% with a wide beam,
 4.06<!--spread,1,256,brindle,ms--> ms against 3.68<!--spread,1,256,pgv_iter,ms-->, and at 5% with a wide beam.
 
 An earlier draft of this paragraph said Brindle "loses more of this table than it
@@ -574,7 +574,8 @@ A *moderately* selective correlated filter is the hardest shape: the matching
 set is large enough (5 000–10 000 rows) that the beam fills with rows that match
 but are not near, and the search stops with its budget nominally spent. At 1%
 the matching region is small and tight enough to cover; at 50% most of a query's
-true neighbours already match. All three converge to ~0.98 by `ef_search` 4096.
+true neighbours already match. All three are within a couple of points of the
+exact answer by `ef_search` 4096, as the ladder above shows.
 
 That the curve keeps rising is itself load-bearing. Until recently it did not:
 a selective filter fragmented the matching subgraph and traversal explored one
@@ -609,8 +610,9 @@ and § 2(d).
   figures further up). For a connection that issues one filtered query and goes
   away, scanning the table is the faster answer. The comparison above is a
   long-lived connection's; paged storage is what would make it everyone's.
-- 30 query vectors per point, one connection, warm. Latency moves a few percent
-  between runs; recall is deterministic on Brindle's side and moves on
+- 30 query vectors per point, one connection, warm. Latency moves between runs:
+  a percent or two on the larger figures, and up to about 12% on the sub-2 ms
+  cells, where a tenth of a millisecond is a large share of the total; recall is deterministic on Brindle's side and moves on
   pgvector's, whose build is randomised (see the note further up).
 - The same `-march=native` and per-backend-memory asymmetries described in the
   unfiltered comparison apply here unchanged.

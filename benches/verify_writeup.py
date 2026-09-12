@@ -45,7 +45,12 @@ RATIO = re.compile(r"\d+(?:\.\d+)?\s*(?:x|×)")
 # Not measurements of an engine: a definitional ceiling, a build parameter, a
 # correlation coefficient. Each still has to be right, but no table cell
 # produces them.
-STRUCTURAL = {"1.000", "1.0", "0.98", "0.997", "0.993"}
+# Values that no table cell produces: a build parameter, and the exact arm's
+# definitional 1.000. Deliberately short. An earlier version also listed 0.98,
+# 0.997 and 0.993 -- 0.98 was exempting pgvector's *measured* wide-beam recall,
+# which is a measurement wearing a definition's clothes, and the other two
+# matched no prose at all and would have silently waved through a future figure.
+STRUCTURAL = {"1.0"}
 
 CROSS_RUN = {
     "0.057": "pgvector rebuild range, low end, observed on an earlier run",
@@ -55,6 +60,7 @@ CROSS_RUN = {
     "0.773": "relaxed_order at an open budget, from the scan-budget table",
     "0.53":  "the ef_search ceiling before the fragmentation fix, quoted from it",
     "0.004": "ctid/label correlation, measured once against the live fixture",
+    "1.000": "the other half of that correlation pair, and the exact arm's ceiling",
     "0.803": "the in-place re-run that produced a different graph, by design",
 }
 
@@ -99,7 +105,7 @@ def check(nums):
                 # skip ratios like "8.1x" / "44×"
                 if RATIO.match(line[m.start():m.start() + len(tok) + 3]):
                     continue
-                if tok in CROSS_RUN:
+                if kind == "prose" and tok in CROSS_RUN:
                     continue
                 if kind == "prose" and tok in STRUCTURAL:
                     continue
@@ -176,7 +182,15 @@ def log_tables(log):
 
 
 def tables_agree(log):
-    """Every published table cell against the cell the harness printed."""
+    """BENCHMARKS.md's two predicate tables, cell by cell, against the harness.
+
+    Scope, stated because overstating it is the mistake this file keeps making:
+    this covers the Correlated and Uncorrelated tables in `docs/BENCHMARKS.md`
+    only. The README's headline table, the scan-budget table and the ef_search
+    ladder are *not* checked cell-by-cell -- they fall back to the weaker
+    "some measurement rounds to this" test in `check()`. Extending it means
+    giving those tables the same shape of key.
+    """
     recall, lat = log_tables(log)
     if not recall:
         return ["the log carries no result tables; is it a completed run?"]
@@ -225,8 +239,8 @@ def chart_agrees(path="docs/assets/selectivity.svg"):
         return [f"{path}: carries no record of what it plotted; regenerate it"]
     plotted = {}
     for item in m.group(1).split(";"):
-        engine, sel, recall, _p50 = item.split(":")
-        plotted[(engine, int(sel))] = Decimal(recall)
+        engine, sel, recall, p50 = item.split(":")
+        plotted[(engine, int(sel))] = (Decimal(recall), Decimal(p50))
 
     bench = open("docs/BENCHMARKS.md").read()
     i = bench.index("### Correlated predicate")
@@ -238,14 +252,21 @@ def chart_agrees(path="docs/assets/selectivity.svg"):
             continue
         cells = [c.strip().replace("**", "") for c in rest.split("|")]
         for engine, cell in zip(("brindle", "pgv_iter", "pgv_post", "exact"), cells):
-            want = Decimal(cell.split("/")[0].strip())
             got = plotted.get((engine, int(sel)))
             if got is None:
                 bad.append(f"{path}: no {engine} point at {sel}% — the chart is "
                            "missing a series the table has")
-            elif got.quantize(Decimal("0.001")) != want:
-                bad.append(f"{path}: plots {engine} at {sel}% as {got}, table says "
-                           f"{want} — the chart is from a different run")
+                continue
+            parts = [x.strip().replace("ms", "").strip() for x in cell.split("/")]
+            for idx, txt in enumerate(parts[:2]):
+                if not txt:
+                    continue
+                q = Decimal(1).scaleb(-len(txt.split(".")[1])) if "." in txt else Decimal(1)
+                if got[idx].quantize(q, rounding=ROUND_HALF_UP) != Decimal(txt):
+                    what = "recall" if idx == 0 else "latency"
+                    bad.append(f"{path}: plots {engine} {what} at {sel}% as "
+                               f"{got[idx]}, table says {txt} — the chart is from "
+                               "a different run")
     return bad
 
 
@@ -269,6 +290,11 @@ def self_test():
         if got != want:
             ok = False
         print(f"  {flag} {tok:>6} -> {got!s:5} (expected {want!s:5}) {why}")
+    # The citation resolver and the table/chart comparisons are exercised by
+    # mutation rather than here -- see the commit history for the substitutions
+    # each was checked against. What this covers is `matches()`, which is where
+    # the two silent failures lived.
+    #
     # the bug that made the first version vacuous: a near-empty log must not pass
     if matches("0.963", measured("total 0 rows")):
         print("  FAIL a near-empty log still satisfies a figure")
