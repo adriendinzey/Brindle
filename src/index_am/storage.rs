@@ -31,6 +31,10 @@ pub enum PayloadError {
     Truncated,
     /// Extra bytes follow the encoded payload.
     TrailingBytes,
+    /// The payload is the right length but does not decode -- a bad attribute
+    /// tag, say. Distinguished from [`PayloadError::Truncated`] because the two
+    /// point at different causes: a short read against a damaged one.
+    Corrupt(&'static str),
 }
 
 impl std::fmt::Display for PayloadError {
@@ -38,6 +42,7 @@ impl std::fmt::Display for PayloadError {
         match self {
             PayloadError::Truncated => write!(f, "index payload is truncated"),
             PayloadError::TrailingBytes => write!(f, "index payload has trailing bytes"),
+            PayloadError::Corrupt(what) => write!(f, "index payload is corrupt: {what}"),
         }
     }
 }
@@ -65,11 +70,16 @@ pub type UnrankableRow = (TidPair, Vec<AttrValue>);
 /// full copy of it. `tids[i]` is the heap address of graph node `i` (ids are
 /// dense, in insertion order).
 pub fn encode_index(hnsw: &Hnsw, tids: &[TidPair], unrankable: &[UnrankableRow]) -> Vec<u8> {
-    // Every section, or the first byte past the hint reallocates and copies the
-    // whole image -- which for this format is the whole index.
-    let mut out = Vec::with_capacity(
-        16 + hnsw.serialized_len_hint() + tids.len() * 6 + 8 + unrankable.len() * 14,
-    );
+    // Every section *and* its contents, or the first byte past the hint
+    // reallocates and copies the whole image -- which for this format is the
+    // whole index. A side-table entry is 14 bytes of framing plus its attribute
+    // values, which are 9 bytes each at their widest.
+    let unrankable_hint: usize = unrankable
+        .iter()
+        .map(|(_, attrs)| 14 + attrs.len() * 9)
+        .sum();
+    let mut out =
+        Vec::with_capacity(16 + hnsw.serialized_len_hint() + tids.len() * 6 + 8 + unrankable_hint);
     let len_pos = out.len();
     out.extend_from_slice(&0u64.to_le_bytes()); // graph-length placeholder
     let graph_start = out.len();
@@ -139,7 +149,10 @@ fn read_unrankable<S: GraphBytes + ?Sized>(
             .map_err(|_| PayloadError::Truncated)?;
         let block = u32::from_le_bytes([tid[0], tid[1], tid[2], tid[3]]);
         let offset = u16::from_le_bytes([tid[4], tid[5]]);
-        let attrs = crate::hnsw::read_attr_row(src).map_err(|_| PayloadError::Truncated)?;
+        let attrs = crate::hnsw::read_attr_row(src).map_err(|e| match e {
+            HnswDecodeError::Invalid(what) => PayloadError::Corrupt(what),
+            _ => PayloadError::Truncated,
+        })?;
         rows.push(((block, offset), attrs));
     }
     Ok(rows)

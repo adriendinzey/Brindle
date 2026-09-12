@@ -750,19 +750,25 @@ mod tests {
     #[pg_test]
     fn built_graph_round_trips_through_pages() {
         create_fixture("t_rt", 100);
-        // NULL vectors must be skipped, not break the build.
+        // NULL vectors must stay out of the graph without breaking the build --
+        // and must still reach the index, since it claims to cover them.
         Spi::run("INSERT INTO t_rt SELECT i, NULL FROM generate_series(101, 105) i")
             .expect("insert nulls");
         Spi::run("CREATE INDEX t_rt_idx ON t_rt USING brindle (embedding)").expect("create index");
 
         // SAFETY: freshly created index; AccessShare via PgRelation keeps it open.
         let index = unsafe { PgRelation::open_with_name("t_rt_idx") }.expect("open index");
-        let (restored, tids, _) = unsafe { storage::load_index(index.as_ptr()) };
+        let (restored, tids, unrankable) = unsafe { storage::load_index(index.as_ptr()) };
 
+        assert_eq!(
+            unrankable.len(),
+            5,
+            "the NULL-vector rows are in the index, just not in the graph"
+        );
         assert_eq!(
             restored.len(),
             100,
-            "only the 100 non-NULL rows are indexed"
+            "only the 100 non-NULL rows are in the graph"
         );
         assert_eq!(tids.len(), 100);
         assert!(tids.iter().all(|&(_, off)| off >= 1));
@@ -878,15 +884,26 @@ mod tests {
     }
 
     #[pg_test]
-    fn insert_skips_null_vectors() {
+    fn insert_keeps_a_null_vector_out_of_the_graph_but_in_the_index() {
         create_fixture("t_ins_null", 20);
         Spi::run("CREATE INDEX t_ins_null_idx ON t_ins_null USING brindle (embedding)")
             .expect("create index");
         Spi::run("INSERT INTO t_ins_null VALUES (21, NULL)").expect("insert");
 
-        let (hnsw, tids, _) = load_persisted("t_ins_null_idx");
+        let (hnsw, tids, unrankable) = load_persisted("t_ins_null_idx");
         assert_eq!(hnsw.len(), 20, "a NULL vector must not become a node");
         assert_eq!(tids.len(), 20);
+        // Out of the graph is right; out of the index is the bug. This index has
+        // no attribute columns, so the row is carried as a TID and an empty row.
+        assert_eq!(
+            unrankable.len(),
+            1,
+            "the NULL-vector row must still be in the index, beside the graph"
+        );
+        assert!(
+            unrankable[0].1.is_empty(),
+            "an index with no attribute columns stores no attribute values"
+        );
     }
 
     #[pg_test]

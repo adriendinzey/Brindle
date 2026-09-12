@@ -173,7 +173,8 @@ impl ScanSearch {
         storage::flush_pending_for(index);
         let handle = storage::cached_index(index);
         let matched = handle.graph().matching(predicate);
-        self.results.reserve(matched.len());
+        self.results
+            .reserve(matched.len() + handle.unrankable().len());
         for id in matched {
             match handle.tids().get(id) {
                 Some(&tid) => self.results.push(tid),

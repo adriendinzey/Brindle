@@ -125,6 +125,51 @@ BEGIN
     END IF;
 END $$;
 
+-- The ordered path deliberately does the opposite, and that decision is pinned
+-- here rather than left to a comment. A NULL vector has no distance, so a row
+-- carrying one has no position in an `ORDER BY embedding <-> $1` result; letting
+-- one into a ranked stream would be an ordering violation, and `amgettuple` sets
+-- `xs_recheckorderby = false`, so nothing above the AM would repair it.
+--
+-- The LIMIT must exceed the number of rows that *can* be ranked (40 in bucket
+-- 7), or the assertion is vacuous: unrankable rows would be appended after the
+-- ranked ones, and a LIMIT that fills from the ranked ones alone never reaches
+-- them. Confirmed by mutation -- at LIMIT 20 this passes with the ordered path
+-- deliberately broken.
+DO $$
+DECLARE ranked int[]; unrankable int[]; line text; plan text := '';
+BEGIN
+    SET LOCAL enable_seqscan = off;
+    FOR line IN EXECUTE
+        'EXPLAIN SELECT id FROM nv WHERE bucket = 7
+          ORDER BY embedding <-> ARRAY[350.0, 351.0]::real[] LIMIT 100' LOOP
+        plan := plan || line || E'\n';
+    END LOOP;
+    IF plan NOT LIKE '%nv_idx%' OR plan NOT LIKE '%Order By%' THEN
+        RAISE EXCEPTION
+            'this is not an ordered index scan, so it proves nothing:%',
+            E'\n' || plan;
+    END IF;
+
+    SELECT array_agg(id) INTO ranked FROM (
+        SELECT id FROM nv WHERE bucket = 7
+         ORDER BY embedding <-> ARRAY[350.0, 351.0]::real[] LIMIT 100
+    ) q;
+    IF ranked IS NULL THEN
+        RAISE EXCEPTION
+            'the ordered scan returned nothing, so the assertion below would '
+            'pass whatever the index did with the NULL-vector rows';
+    END IF;
+
+    SELECT array_agg(id) INTO unrankable
+    FROM unnest(ranked) AS id WHERE id >= 900;
+    IF unrankable IS NOT NULL THEN
+        RAISE EXCEPTION
+            'a ranked scan returned %, which have no vector and therefore no '
+            'distance to be ordered by', unrankable;
+    END IF;
+END $$;
+
 -- A second backend must see them too.
 --
 -- Re-running the count in *this* session would prove nothing: the first block
