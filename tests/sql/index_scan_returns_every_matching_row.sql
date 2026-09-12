@@ -42,6 +42,23 @@ BEGIN
     END IF;
 END $$;
 
+-- The index reports how many entries it holds, and CREATE INDEX writes that to
+-- pg_class.reltuples. A row with no vector is still an entry, so a count of
+-- graph nodes alone tells the planner the index is smaller than it is -- and
+-- disagrees with what amvacuumcleanup reports for this same non-partial index on
+-- the first VACUUM, making the number flip depending on which ran last.
+DO $$
+DECLARE stated real; live bigint;
+BEGIN
+    SELECT reltuples INTO stated FROM pg_class WHERE relname = 'nv_idx';
+    SELECT count(*) INTO live FROM nv;
+    IF stated <> live THEN
+        RAISE EXCEPTION
+            'the index reported % entries for a table of % rows -- the rows with '
+            'no vector are in the index but not in its count', stated, live;
+    END IF;
+END $$;
+
 DO $$
 DECLARE seq_rows bigint; idx_rows bigint; line text; plan text := '';
 BEGIN
@@ -108,20 +125,37 @@ BEGIN
     END IF;
 END $$;
 
--- They must survive a round trip through the stored index, not just live in the
--- in-memory copy the building session happens to hold.
+-- A second backend must see them too.
+--
+-- Re-running the count in *this* session would prove nothing: the first block
+-- above already decoded the stored image, nothing has written since, so the
+-- cached copy answers and no page is touched. An earlier version of this case
+-- did exactly that and asserted nothing.
+--
+-- This reads through a connection with no cached copy and no staging buffer of
+-- its own, which is what an ordinary reader is. It shares the decode path with
+-- the block above rather than reaching past it, so it is breadth, not a second
+-- independent signal; the staged-and-replayed paths are covered by
+-- `staged_null_vector_rows_follow_the_transaction`.
+CREATE EXTENSION IF NOT EXISTS dblink;
+
 DO $$
-DECLARE idx_rows bigint; seq_rows bigint;
+DECLARE conn text; idx_rows bigint; seq_rows bigint;
 BEGIN
-    SET LOCAL enable_indexscan = off;
-    SET LOCAL enable_seqscan = on;
+    conn := 'dbname=' || current_database() ||
+            ' port=' || current_setting('port') ||
+            ' host=' || (string_to_array(current_setting('unix_socket_directories'), ','))[1];
+
     SELECT count(*) INTO seq_rows FROM nv WHERE bucket = 7;
-    SET LOCAL enable_seqscan = off;
-    SET LOCAL enable_indexscan = on;
-    SELECT count(*) INTO idx_rows FROM nv WHERE bucket = 7;
+
+    SELECT n INTO idx_rows FROM dblink(conn,
+        $inner$SET enable_seqscan = off;
+               SELECT count(*) FROM nv WHERE bucket = 7$inner$) AS t(n bigint);
+
     IF idx_rows <> seq_rows THEN
         RAISE EXCEPTION
-            'after reload the index returns % rows against %', idx_rows, seq_rows;
+            'a second backend reading the stored image sees % rows against %',
+            idx_rows, seq_rows;
     END IF;
 END $$;
 
@@ -146,12 +180,36 @@ BEGIN
 END $$;
 
 -- ...and must disappear when the row does.
+--
+-- Counting after the DELETE would pass whether or not VACUUM dropped the entry:
+-- Postgres rechecks heap visibility for every TID an index scan returns, so a
+-- stale one is silently discarded and the count is identical either way. The
+-- observable failure is the one `vacuum_frees_line_pointers_safely` is built
+-- around: VACUUM recycles the line pointer, a new row lands in the freed slot,
+-- and a stale entry then resolves to that live row -- a wrong answer the
+-- visibility recheck cannot catch. So: delete, vacuum, reclaim the slot with a
+-- row in a *different* bucket, and look for it coming back for bucket 7.
 DELETE FROM nv WHERE id = 904;
 VACUUM nv;
 
+-- Enough rows to claim the freed slot, none of them in bucket 7.
+INSERT INTO nv SELECT i, 3, ARRAY[i::real, (i + 1)::real]
+FROM generate_series(9000, 9019) i;
+
 DO $$
-DECLARE idx_rows bigint; seq_rows bigint;
+DECLARE bad int[]; idx_rows bigint; seq_rows bigint;
 BEGIN
+    SET LOCAL enable_seqscan = off;
+    SELECT array_agg(id) INTO bad FROM (
+        SELECT id FROM nv WHERE bucket = 7
+    ) q WHERE id >= 9000;
+    IF bad IS NOT NULL THEN
+        RAISE EXCEPTION
+            'the index returned % for bucket 7 -- a stale entry for the deleted '
+            'NULL-vector row resolved to whatever reclaimed its line pointer',
+            bad;
+    END IF;
+
     SET LOCAL enable_indexscan = off;
     SET LOCAL enable_seqscan = on;
     SELECT count(*) INTO seq_rows FROM nv WHERE bucket = 7;

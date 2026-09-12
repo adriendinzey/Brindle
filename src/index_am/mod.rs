@@ -234,7 +234,11 @@ unsafe extern "C" fn ambuild(
         core::ptr::null_mut(),
     );
 
-    let index_tuples = state.heap_tids.len() as f64;
+    // Every row this index holds, not just the ones in the graph: this becomes
+    // pg_class.reltuples for the index, and amvacuumcleanup reports the heap's
+    // count for a non-partial index -- so counting only graph nodes would make
+    // the number flip depending on which ran last.
+    let index_tuples = (state.heap_tids.len() + state.unrankable.len()) as f64;
     let blob = storage::encode_index(&state.hnsw, &state.heap_tids, &state.unrankable);
     // SAFETY: CREATE INDEX/REINDEX hands ambuild a freshly created, exclusively
     // locked relfilenode, so the main fork is empty as write_index_blob requires.
@@ -390,7 +394,8 @@ unsafe extern "C" fn ambulkdelete(
     });
 
     let removed = hnsw.deleted_count() - tombstoned_before;
-    if removed > 0 || unrankable.len() != unrankable_before {
+    let unrankable_removed = unrankable_before - unrankable.len();
+    if removed > 0 || unrankable_removed > 0 {
         storage::rewrite_index_blob(index, &storage::encode_index(&hnsw, &tids, &unrankable));
     }
     pg_sys::UnlockPage(
@@ -409,8 +414,9 @@ unsafe extern "C" fn ambulkdelete(
     }
     result.num_pages =
         pg_sys::RelationGetNumberOfBlocksInFork(index, pg_sys::ForkNumber::MAIN_FORKNUM);
-    result.num_index_tuples = hnsw.live_len() as f64;
-    result.tuples_removed += removed as f64;
+    // Both counts span the whole index, for the reason in `ambuild`.
+    result.num_index_tuples = (hnsw.live_len() + unrankable.len()) as f64;
+    result.tuples_removed += (removed + unrankable_removed) as f64;
     result.into_pg()
 }
 

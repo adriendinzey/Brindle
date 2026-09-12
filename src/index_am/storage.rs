@@ -65,7 +65,11 @@ pub type UnrankableRow = (TidPair, Vec<AttrValue>);
 /// full copy of it. `tids[i]` is the heap address of graph node `i` (ids are
 /// dense, in insertion order).
 pub fn encode_index(hnsw: &Hnsw, tids: &[TidPair], unrankable: &[UnrankableRow]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(16 + hnsw.serialized_len_hint() + tids.len() * 6);
+    // Every section, or the first byte past the hint reallocates and copies the
+    // whole image -- which for this format is the whole index.
+    let mut out = Vec::with_capacity(
+        16 + hnsw.serialized_len_hint() + tids.len() * 6 + 8 + unrankable.len() * 14,
+    );
     let len_pos = out.len();
     out.extend_from_slice(&0u64.to_le_bytes()); // graph-length placeholder
     let graph_start = out.len();
@@ -115,8 +119,8 @@ fn append_unrankable(out: &mut Vec<u8>, rows: &[UnrankableRow]) {
 ///
 /// Like [`read_tid_table`], the reservation is bounded by what the source can
 /// still supply rather than by the declared count, so a corrupt length cannot
-/// turn into a large allocation. Each entry is at least 14 bytes: six of TID and
-/// eight of attribute-row length.
+/// turn into a large allocation. Each entry is at least 14 bytes on the wire:
+/// six of TID and eight of attribute-row length.
 fn read_unrankable<S: GraphBytes + ?Sized>(
     src: &mut S,
 ) -> Result<Vec<UnrankableRow>, PayloadError> {
@@ -124,7 +128,11 @@ fn read_unrankable<S: GraphBytes + ?Sized>(
     if src.remaining() / 14 < count {
         return Err(PayloadError::Truncated);
     }
-    let mut rows = Vec::with_capacity(count);
+    // Clamped against the resident size as well as the wire size: an entry is 14
+    // bytes on the wire but 32 resident, so the count check alone would let a
+    // corrupt length reserve more than twice what the source can supply. This is
+    // the second clamp `read_attr_row` makes, for the same reason.
+    let mut rows = Vec::with_capacity(count.min(src.remaining() / 32));
     let mut tid = [0u8; 6];
     for _ in 0..count {
         src.read_exact(&mut tid)
@@ -686,6 +694,20 @@ pub unsafe fn load_index_with_generation(
         error!("brindle: {}", PayloadError::TrailingBytes);
     }
     pg_sys::UnlockPage(index, IMAGE_LOCK_BLOCK, pg_sys::ShareLock as i32);
+    // A row short of a column is not a decode error, and that is the problem:
+    // `Predicate::matches` reads a missing column as "does not match", so such a
+    // row would be dropped from the one scan that promises every matching row --
+    // silently reintroducing the wrong answer this side table exists to fix. The
+    // graph's rows are covered by the codec version for the same reason; these
+    // are covered here.
+    let arity = super::attrs::count(index);
+    if let Some(((block, offset), row)) = unrankable.iter().find(|(_, row)| row.len() != arity) {
+        error!(
+            "brindle: corrupted index: row ({block},{offset}) carries {} attribute values, \
+             but the index has {arity} attribute columns",
+            row.len()
+        );
+    }
     if hnsw.len() != tids.len() {
         error!(
             "brindle: corrupted index: {} graph nodes but {} heap pointers",
@@ -882,19 +904,15 @@ impl IndexHandle {
 }
 
 /// Rough resident size of a decoded graph, for comparison against the ceiling.
-fn cached_bytes(hnsw: &Hnsw, tids: &Vec<TidPair>, unrankable: &[UnrankableRow]) -> usize {
+fn cached_bytes(hnsw: &Hnsw, tids: &Vec<TidPair>, unrankable: &Vec<UnrankableRow>) -> usize {
     // Capacity rather than length, matching `resident_bytes`: an under-estimate
-    // would let the cache sit over its ceiling.
-    // The side table is counted the same way the graph's attribute rows are:
-    // by capacity, since an under-estimate would let the cache exceed its
-    // ceiling.
-    let unrankable_bytes: usize = unrankable
-        .iter()
-        .map(|(_, attrs)| {
-            core::mem::size_of::<UnrankableRow>()
-                + attrs.capacity() * core::mem::size_of::<AttrValue>()
-        })
-        .sum();
+    // would let the cache sit over its ceiling. That applies to the side table's
+    // spine and to each row's attribute values alike.
+    let unrankable_bytes: usize = unrankable.capacity() * core::mem::size_of::<UnrankableRow>()
+        + unrankable
+            .iter()
+            .map(|(_, attrs)| attrs.capacity() * core::mem::size_of::<AttrValue>())
+            .sum::<usize>();
     hnsw.resident_bytes() + tids.capacity() * core::mem::size_of::<TidPair>() + unrankable_bytes
 }
 
@@ -1042,14 +1060,14 @@ struct PendingWrite {
     /// absolute index recorded against one base silently means something else
     /// against the next. A count does not move.
     ///
+    /// A *pair* of counts — graph rows and vectorless rows — because a
+    /// transaction stages both kinds, and `ROLLBACK TO` has to leave exactly
+    /// those of both kinds that predate its savepoint. One number cannot say
+    /// where that line falls in two sequences.
+    ///
     /// Shorter than the subtransaction depth whenever one opened with nothing
     /// staged: no `PendingWrite` existed to record it. The `unwrap_or` in the
     /// abort arm is what covers that.
-    /// Per open subtransaction: how many graph rows *and* how many vectorless
-    /// rows were staged when it began. A pair rather than a count because a
-    /// transaction stages both kinds and `ROLLBACK TO` has to leave exactly the
-    /// rows of both kinds that predate its savepoint — one number cannot say
-    /// where that line falls in two sequences.
     marks: Vec<(usize, usize)>,
     /// Set by a subtransaction abort: staged rows past this many are rolled back
     /// and must not reach the index. Also a count, for the reason above.
@@ -1079,15 +1097,36 @@ thread_local! {
     /// return immediately when there is nothing pending.
     static CALLBACKS_REGISTERED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
-/// Apply one row to the transaction's pending graph, loading it on first use.
-///
-/// # Safety
-/// `index` must be an open brindle index relation this backend may write.
-/// Stage one row for write-back at the end of the transaction.
+
+impl PendingWrite {
+    /// The graph node ids this transaction staged, as opposed to the ones it
+    /// loaded. Ids are dense insertion order, so the ones from `base_n` up are
+    /// exactly this transaction's.
+    fn staged_nodes(&self) -> core::ops::Range<usize> {
+        self.base_n..self.hnsw.len()
+    }
+
+    /// The vectorless rows this transaction staged, as opposed to the ones it
+    /// loaded.
+    ///
+    /// Named rather than open-coded at each call site because the two sequences
+    /// are sliced in five places and an `extend` of the whole vector reads as
+    /// correct: it silently re-appends the rows the image already holds, which
+    /// duplicates them on every replay.
+    fn staged_unrankable(&self) -> &[UnrankableRow] {
+        &self.unrankable[self.base_unrankable..]
+    }
+}
+
+/// Stage one row for write-back at the end of the transaction, loading the
+/// stored image on first use.
 ///
 /// `vector` is `None` for a row whose indexed column is NULL: it cannot enter
 /// the graph, but the index is not partial and still claims to cover it, so it
 /// is staged into the side table instead of dropped.
+///
+/// # Safety
+/// `index` must be an open brindle index relation this backend may write.
 pub unsafe fn pending_insert(
     index: pg_sys::Relation,
     vector: Option<Vec<f32>>,
@@ -1321,17 +1360,18 @@ fn flush_locked(write: Option<PendingWrite>) {
             // lock was deliberately not held across the transaction, so this is
             // the expected outcome of that choice rather than a surprise.
             let (mut hnsw, mut tids, mut unrankable) = load_index(rel);
-            for id in write.base_n..write.hnsw.len() {
+            for id in write.staged_nodes() {
                 let vector = write.hnsw.vector(id).to_vec();
                 let attrs = write.hnsw.attrs(id).to_vec();
                 apply_one(&mut hnsw, tids.len(), vector, attrs);
                 tids.push(write.tids[id]);
             }
-            // The vectorless rows this transaction staged replay the same way:
-            // whatever is already on the other backend's image stays, and ours
-            // is appended. They carry their own TIDs, so no id remapping is
-            // needed the way the graph's are.
-            unrankable.extend(write.unrankable.iter().cloned());
+            // The vectorless rows replay the same way, and `staged_unrankable`
+            // is doing the same work as `base_n` above: the loaded image already
+            // holds the rows this transaction started from, so appending the
+            // whole vector would duplicate every one of them. They carry their
+            // own TIDs, so no id remapping is needed the way the graph's are.
+            unrankable.extend_from_slice(write.staged_unrankable());
             encode_index(&hnsw, &tids, &unrankable)
         };
         rewrite_index_blob(rel, &blob);
@@ -1551,10 +1591,7 @@ unsafe extern "C" fn subxact_callback(
 
 /// Move one write's savepoint bookkeeping across a subtransaction boundary.
 fn apply_mark_event(write: &mut PendingWrite, event: pg_sys::SubXactEvent::Type) {
-    let staged = (
-        write.tids.len() - write.base_n,
-        write.unrankable.len() - write.base_unrankable,
-    );
+    let staged = (write.staged_nodes().len(), write.staged_unrankable().len());
     match event {
         pg_sys::SubXactEvent::SUBXACT_EVENT_START_SUB => {
             // Clamped by any rewind not yet carried out: between an abort and
@@ -1623,10 +1660,12 @@ fn settle_pending() {
         })
         .collect();
     // The vectorless rows staged before the savepoint survive with the rest.
+    // `take` rather than a slice: a mark is clamped to what was staged when it
+    // was recorded, and a panic here would be in a path that has just finished
+    // rolling something back.
     let surviving_unrankable: Vec<UnrankableRow> = write
-        .unrankable
+        .staged_unrankable()
         .iter()
-        .skip(write.base_unrankable)
         .take(mark.1)
         .cloned()
         .collect();
