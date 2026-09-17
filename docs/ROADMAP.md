@@ -60,8 +60,12 @@ Legend: ✅ done · 🚧 in progress · ⬜ planned
 *"Unified lexical + semantic ranking with RRF."*
 
 - ✅ Reciprocal Rank Fusion in the pure core, with tests
-- ⬜ `brindle_hybrid(query_text, query_vec, k, rrf_k)` fusing vector rank +
-  Postgres `tsvector` rank via RRF — **no SQL surface yet**
+- ✅ `brindle_hybrid(relation, id_column, vector_column, text_column, query_text,
+  query_vec, ...)` — a set-returning function fusing a Brindle vector search with
+  a Postgres full-text search via RRF. The distance metric is read from the
+  vector index's operator class (so the ORDER BY matches the index), the lexical
+  side takes a `tsvector` or a raw text column, and results come back as
+  `(id, score, vector_rank, text_rank)`.
 - ⬜ Worked RAG example in `examples/`
 - ⬜ (stretch) better lexical scoring than `ts_rank`
 

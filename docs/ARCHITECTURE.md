@@ -231,15 +231,39 @@ SELECT id FROM listings
 WHERE tenant_id = 42 AND price < 50
 ORDER BY embedding <=> $1 LIMIT 10;
 
--- Not built: hybrid. `fusion.rs` implements the RRF half; this surface does not
--- exist yet.
-SELECT * FROM brindle_hybrid(
-  query_text => 'wireless headphones',
-  query_vec  => $1,
-  k          => 10,
-  rrf_k      => 60
+-- Works today: hybrid search. `brindle_hybrid` runs a vector search and a
+-- Postgres full-text search over one table and fuses their ranks with RRF
+-- (`fusion.rs`). It names the table and columns explicitly; the distance metric
+-- is read from the vector column's index operator class, so the ORDER BY always
+-- matches the index. `text_column` may be a `tsvector` or a raw text column.
+-- It returns each row's id, fused score, and its rank within each source
+-- (NULL when a source did not surface it), so you can see which signal carried
+-- a result. Join the id back to your table to fetch documents.
+CREATE TABLE docs (
+    id int PRIMARY KEY, body text, tsv tsvector, embedding brindle_vector
 );
+CREATE INDEX ON docs USING brindle (embedding brindle_vector_cosine_ops);
+SELECT d.id, h.score
+FROM brindle_hybrid(
+       relation      => 'docs',
+       id_column     => 'id',
+       vector_column => 'embedding',
+       text_column   => 'tsv',
+       query_text    => 'wireless headphones',
+       query_vec     => $1,
+       k             => 10,       -- rows returned (default 10)
+       n             => NULL,     -- per-side depth before fusing (default max(4k, 40));
+                                  --   the vector side is also capped by brindle.ef_search,
+                                  --   so raise that GUC to realize a larger n
+       rrf_k         => 60,       -- RRF damping constant (default 60)
+       config        => NULL      -- text-search config (default: the database's)
+     ) h
+JOIN docs d ON d.id = h.id
+ORDER BY h.score DESC;
 ```
+
+`id_column` must be **unique** — fusion keys on the id, so two rows sharing one
+would collapse into a single result.
 
 ## 7. Non-goals (scope discipline)
 
