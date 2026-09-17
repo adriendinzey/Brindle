@@ -19,6 +19,7 @@ pub mod filter;
 pub mod fusion;
 pub mod guc;
 pub mod hnsw;
+pub mod hybrid;
 pub mod index_am;
 pub mod pg_vector;
 pub mod vector;
