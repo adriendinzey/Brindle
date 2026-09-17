@@ -13,9 +13,10 @@ Run it to regenerate the INSERT block in `setup.sql`:
     python3 embed.py > /tmp/rows.sql
 
 To use *real* embeddings instead, replace `embed()` with a call to an embedding
-model (e.g. sentence-transformers) and widen the `brindle_vector` column to that
-model's dimensionality — the SQL and queries are otherwise unchanged. That step
-is optional; the checked-in vectors above make the example self-contained.
+model (e.g. sentence-transformers) and insert its vectors. `brindle_vector` has
+no fixed width, so no schema change is needed — the rows in one index just have
+to share a dimensionality — and the SQL and queries are otherwise unchanged. That
+step is optional; the checked-in vectors above make the example self-contained.
 """
 
 # The semantic axes. A product's embedding is its weight on each, in this order.

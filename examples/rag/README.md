@@ -26,7 +26,9 @@ Then, in the `psql` session it opens (its working directory is the repo root):
 ```
 
 Already have Brindle installed in your own database? Point `psql` at it and run
-the same two files.
+the same two files. Note that `setup.sql` begins with `DROP TABLE IF EXISTS
+products` so it can be re-run cleanly — rename the table in both files first if
+that name is already taken in your database.
 
 ## The data
 
@@ -35,18 +37,20 @@ semantic signal), and structured columns to filter on:
 
 | column | type | role |
 |---|---|---|
-| `category_id` | `int` | filter — `1` Audio · `2` Outdoor · `3` Kitchen · `4` Office |
+| `category_id` | `int` | filter (equality) — `1` Audio · `2` Outdoor · `3` Kitchen · `4` Office |
 | `price` | `float8` | filter (range) |
 | `rating`, `in_stock` | `real`, `bool` | more filter columns to play with |
 | `description` | `text` | full-text side of the hybrid search |
 | `embedding` | `brindle_vector` | vector side |
 
 The Brindle index puts the vector first and the filter columns next to it — as
-**key** columns, which is what lets a `WHERE` reach the graph traversal:
+**key** columns, which is what lets a `WHERE` reach the graph traversal. All four
+filter types Brindle supports appear here — integer, float and boolean:
 
 ```sql
 CREATE INDEX products_embedding_idx
-    ON products USING brindle (embedding brindle_vector_cosine_ops, category_id, price);
+    ON products USING brindle
+    (embedding brindle_vector_cosine_ops, category_id, price, rating, in_stock);
 ```
 
 ### About the embeddings
@@ -63,9 +67,11 @@ So `Sport Wireless Earbuds` is `[0.7, 0.8, 0.1, 0.5, 0, 0, 0.8, 0.7]` — strong
 audio / wearable / fitness / wireless. Cosine distance over this space behaves
 like semantic similarity while staying small and reproducible. [`embed.py`](embed.py)
 is the source of truth for the vectors and prints the `INSERT` block in
-`setup.sql`. To use a real embedding model instead, swap the vectors for its
-output and widen the column to its dimensionality — the queries are unchanged.
-That step is optional; the checked-in vectors keep this example dependency-free.
+`setup.sql`. To use a real embedding model instead, insert its vectors in place
+of these — `brindle_vector` has no fixed width, so nothing in the schema changes;
+the rows in one index just have to share a dimensionality. The queries are
+otherwise unchanged. That step is optional; the checked-in vectors keep this
+example dependency-free.
 
 ---
 

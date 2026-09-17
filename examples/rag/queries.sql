@@ -48,8 +48,9 @@ LIMIT 5;
 -- rugged outdoor gear ([outdoor/water/fitness]). Reciprocal Rank Fusion combines
 -- the two rankings, so a row both signals like beats a row only one likes:
 --   * Trail Running Vest is the single NEAREST vector, but matches no words.
---   * Studio Wireless Headphones is the best WORD match, but is semantically far.
---   * Rugged Wireless Headphones is good on BOTH — and wins.
+--   * Studio Wireless Headphones matches the words, but is semantically far.
+--   * Rugged Wireless Headphones is strong on BOTH (top word match + a solid
+--     vector) — and wins, though it leads neither list on the vector side.
 -- vector_rank / text_rank show which signal(s) surfaced each row (NULL = missed).
 SELECT h.rank,
        p.id,
@@ -66,3 +67,7 @@ FROM brindle_hybrid(
      ) WITH ORDINALITY AS h(id, score, vector_rank, text_rank, rank)
 JOIN products p ON p.id = h.id
 ORDER BY h.rank;
+
+
+-- Leave the session as we found it (the seqscan override was only for the demo).
+RESET enable_seqscan;
