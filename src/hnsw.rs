@@ -155,7 +155,7 @@ impl Default for HnswParams {
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct Cand {
     dist: f32,
-    id: usize,
+    id: NodeRef,
 }
 
 impl Eq for Cand {}
@@ -297,7 +297,7 @@ impl Traversal {
 /// It also carries the [`Traversal`] the whole search shares, since every step
 /// that touches the beam also draws on an allowance or moves a counter.
 struct Beam<'t> {
-    visited: HashSet<usize>,
+    visited: HashSet<NodeRef>,
     frontier: BinaryHeap<Reverse<Cand>>,
     results: BinaryHeap<Cand>,
     ef: usize,
@@ -362,6 +362,128 @@ fn xorshift64(state: &mut u64) -> u64 {
 #[inline]
 fn next_f64(state: &mut u64) -> f64 {
     (xorshift64(state) >> 11) as f64 / ((1u64 << 53) as f64)
+}
+
+/// A node's identity as the storage layer hands it to the algorithm: an opaque
+/// handle the core never interprets. The in-memory graph passes its dense
+/// `usize` ids through it; a paged store packs a `(block, offset)` address into
+/// it. `u64` so either fits, and so a visited set can hash it directly.
+pub type NodeRef = u64;
+
+/// A ranked search result: `(distance, node)` pairs, nearest first.
+pub type Ranking = Vec<(f32, NodeRef)>;
+
+/// The build parameters and derived degree caps a [`GraphStore`] surfaces to the
+/// generic search and insert, so neither reaches into a concrete graph's fields.
+///
+/// The caps are recomputed from `m`/`gamma` by one function, so a stored graph
+/// and a fresh one can never disagree about them.
+#[derive(Debug, Clone, Copy)]
+pub struct GraphParams {
+    pub metric: Metric,
+    pub m: usize,
+    /// Degree cap above layer 0.
+    pub m_cap: usize,
+    /// Degree cap at layer 0.
+    pub m0_cap: usize,
+    pub ef_construction: usize,
+    /// Component count, fixed by the first indexed vector; 0 while empty.
+    pub dim: usize,
+}
+
+impl GraphParams {
+    /// The degree cap for `layer`: layer 0 is denser than the layers above it.
+    #[inline]
+    fn max_degree(&self, layer: usize) -> usize {
+        if layer == 0 {
+            self.m0_cap
+        } else {
+            self.m_cap
+        }
+    }
+}
+
+/// Read access to an HNSW graph, whatever stores it.
+///
+/// The generic search ([`search_generic`]) and insert ([`insert_into`]) are
+/// written once over this trait and run over both the in-memory arrays (their
+/// unit tests and benchmarks) and buffer pages (the index in Postgres). Nothing
+/// here names a buffer, a page or a relation, so the core stays Postgres-free.
+///
+/// [`GraphStore::distance`] returns a number rather than lending out a `&[f32]`
+/// deliberately: a paged store pins a page, computes the distance against its
+/// bytes in place, and unpins before returning, so a buffer pin never outlives
+/// the call. Callers pass scratch buffers (`out`) in for the same reason — to
+/// keep the distance path allocation-free.
+pub trait GraphStore {
+    /// The store's own error type, bounded by `From<HnswError>` because the
+    /// generic algorithm rejects an empty vector or a dimension mismatch on its
+    /// own account, before it ever reaches the store.
+    type Error: From<HnswError>;
+
+    fn params(&self) -> GraphParams;
+
+    /// The entry point and its layer (the graph's top layer), or `None` when the
+    /// graph is empty.
+    fn entry(&self) -> Option<(NodeRef, usize)>;
+
+    fn is_deleted(&self, node: NodeRef) -> Result<bool, Self::Error>;
+
+    /// Replace `out` with `node`'s neighbors at `layer`.
+    fn neighbors(
+        &self,
+        node: NodeRef,
+        layer: usize,
+        out: &mut Vec<NodeRef>,
+    ) -> Result<(), Self::Error>;
+
+    /// Distance from `query` to `node`'s vector, in the metric's internal form.
+    fn distance(&self, query: &[f32], node: NodeRef) -> Result<f32, Self::Error>;
+
+    /// Copy `node`'s vector into `out`, for when it must outlive a page pin — the
+    /// neighbor-selection heuristic compares candidates to each other, so it
+    /// needs one node's vector held while distances to others are computed.
+    fn load_vector(&self, node: NodeRef, out: &mut Vec<f32>) -> Result<(), Self::Error>;
+
+    /// Replace `out` with `node`'s attribute row (empty if it has none).
+    fn attrs(&self, node: NodeRef, out: &mut Vec<AttrValue>) -> Result<(), Self::Error>;
+}
+
+/// Write access, for building and inserting. Split from [`GraphStore`] so a
+/// read-only scan need not name a mutable store.
+pub trait GraphStoreMut: GraphStore {
+    /// What the boundary stores beside a node that the core never reads — a heap
+    /// TID for the paged store, `()` for the in-memory one.
+    type Payload;
+
+    /// Draw the next node's level from the index's persistent PRNG, advancing it.
+    fn next_level(&mut self) -> Result<usize, Self::Error>;
+
+    /// Reserve a node at `level` with its vector, attribute row and payload, plus
+    /// an empty neighbor list per layer. On return the node exists and nothing
+    /// references it yet.
+    fn add_node(
+        &mut self,
+        level: usize,
+        vector: &[f32],
+        attrs: &[AttrValue],
+        payload: Self::Payload,
+    ) -> Result<NodeRef, Self::Error>;
+
+    /// Replace `node`'s neighbor list at `layer`. The only edge-write primitive:
+    /// adding a back-edge and pruning a full list are both this call.
+    fn set_neighbors(
+        &mut self,
+        node: NodeRef,
+        layer: usize,
+        neighbors: &[NodeRef],
+    ) -> Result<(), Self::Error>;
+
+    /// Make `node` the entry point at `level`. Only ever raises the top layer.
+    fn set_entry(&mut self, node: NodeRef, level: usize) -> Result<(), Self::Error>;
+
+    /// Set or clear a node's tombstone.
+    fn set_deleted(&mut self, node: NodeRef, deleted: bool) -> Result<(), Self::Error>;
 }
 
 /// In-memory HNSW graph.
@@ -606,18 +728,6 @@ impl Hnsw {
         self.link_counts[self.layer_base[id] as usize + layer] = ids.len() as u32;
     }
 
-    /// Append one neighbor to node `id`'s list at `layer`, returning the new
-    /// length. The slot run is one wider than the degree cap, so an append onto
-    /// a full list still fits and the caller prunes immediately after.
-    fn push_neighbor(&mut self, id: usize, layer: usize, neighbor: u32) -> usize {
-        let idx = self.layer_base[id] as usize + layer;
-        let count = self.link_counts[idx] as usize;
-        let start = self.layer_slot(id, layer);
-        self.links[start + count] = neighbor;
-        self.link_counts[idx] = (count + 1) as u32;
-        count + 1
-    }
-
     /// Append a node's storage across the flat arrays and return its id.
     ///
     /// Node ids and layer offsets are stored as `u32`, which caps a graph at
@@ -657,14 +767,6 @@ impl Hnsw {
         (-r.ln() * self.ml).floor() as usize
     }
 
-    /// Whether `predicate` requires the predicate-aware traversal path. Both
-    /// `None` and the match-all predicate take the plain HNSW path, so adding
-    /// filtering support left unfiltered search bit-for-bit unchanged.
-    #[inline]
-    fn is_filtered(predicate: Option<&Predicate>) -> bool {
-        !matches!(predicate, None | Some(Predicate::All))
-    }
-
     /// Whether node `id` satisfies `predicate` — vacuously true without one.
     #[inline]
     fn node_matches(&self, id: usize, predicate: Option<&Predicate>) -> bool {
@@ -695,303 +797,6 @@ impl Hnsw {
             .collect()
     }
 
-    /// Score `id` and fold it into `beam`, unless it was already considered or
-    /// is too far to improve on the results already held. Reports whether it
-    /// actually joined the frontier.
-    fn visit(
-        &self,
-        query: &[f32],
-        id: usize,
-        predicate: Option<&Predicate>,
-        beam: &mut Beam,
-    ) -> Result<bool, HnswError> {
-        if !beam.visited.insert(id) {
-            return Ok(false);
-        }
-        let d = self.metric.distance(query, self.vector(id))?;
-        beam.tr.cost.distances += 1;
-        if beam.results.len() < beam.ef || d < beam.farthest() {
-            beam.push(Cand { dist: d, id }, self.admissible(id, predicate));
-            return Ok(true);
-        }
-        Ok(false)
-    }
-
-    /// Fold `id`'s neighbors into `beam`.
-    ///
-    /// Unfiltered this is plain HNSW: every neighbor is a candidate. Under a
-    /// predicate only matching neighbors can be answers, and a selective
-    /// predicate can leave a node with none at all — the matching subgraph
-    /// fragments and greedy search dead-ends. ACORN's fix, implemented here:
-    /// when the neighbor list yields fewer than `m` matching nodes, hop *over*
-    /// the non-matching neighbors and take *their* neighbors instead, so
-    /// traversal crosses filtered-out regions rather than stopping at them.
-    ///
-    /// Two bounds keep that from degenerating into a breadth-first sweep: one
-    /// expansion reaches at most two hops (a node arrived at across a bridge is
-    /// not itself bridged over *within that expansion*, though it expands
-    /// normally once popped), and at most `m` bridges are taken per node,
-    /// stopping early as soon as `m` matching neighbors have been produced. Each
-    /// expansion is therefore bounded work; what terminates the search itself is
-    /// `visited` — a node joins the frontier only on first sight.
-    ///
-    /// Two hops is not always far enough — under a very selective predicate a
-    /// node can have no match anywhere in its two-hop neighborhood. Rather than
-    /// return nothing at all, such a node routes on through its non-matching
-    /// neighbors (which still can never be returned), limited by the search's
-    /// detour allowance.
-    ///
-    /// Bridging trades predicate evaluations for distance computations: a
-    /// two-hop node is scored only if it matches, and inline attributes are
-    /// tested without touching a vector. The detour is the exception — it scores
-    /// non-matching neighbors precisely in order to walk through them.
-    fn expand(
-        &self,
-        query: &[f32],
-        id: usize,
-        layer: usize,
-        predicate: Option<&Predicate>,
-        beam: &mut Beam,
-        bridges: &mut Vec<usize>,
-    ) -> Result<bool, HnswError> {
-        let neighbors = self.neighbors(id, layer);
-        if !Self::is_filtered(predicate) {
-            for &n in neighbors {
-                self.visit(query, n as usize, predicate, beam)?;
-            }
-            return Ok(false);
-        }
-
-        // Both bounds scale with the graph's own base degree, so bridging costs
-        // a small multiple of the work an unfiltered expansion already does.
-        let target = self.m;
-        let max_bridges = self.m;
-
-        // The non-matching neighbors are collected as they are classified rather
-        // than re-tested on a second pass; `bridges` is owned by the enclosing
-        // layer search, so it is reused across expansions instead of allocating.
-        bridges.clear();
-        let mut matching = 0usize;
-        for &n in neighbors {
-            let n = n as usize;
-            if self.node_matches(n, predicate) {
-                matching += 1;
-                self.visit(query, n, predicate, beam)?;
-            } else if bridges.len() < max_bridges {
-                bridges.push(n);
-            }
-        }
-
-        for &bridge in bridges.iter() {
-            if matching >= target {
-                break;
-            }
-            for &nn in self.neighbors(bridge, layer) {
-                if matching >= target {
-                    break;
-                }
-                let nn = nn as usize;
-                if self.node_matches(nn, predicate) {
-                    matching += 1;
-                    self.visit(query, nn, predicate, beam)?;
-                }
-            }
-        }
-
-        if matching == 0 {
-            // Stranded: nothing matches within two hops. Walk on through the
-            // non-matching nodes themselves.
-            self.bridge_out(query, id, layer, predicate, beam)?;
-            return Ok(true);
-        }
-        // It found something, so it has no reason to leave its neighbourhood —
-        // unless the walk later ends short. The caller records it for that.
-        Ok(false)
-    }
-
-    /// Enqueue `id`'s neighbors regardless of the predicate, so the search can
-    /// walk *through* a region it can never return.
-    ///
-    /// The allowance is charged per node *enqueued*, not per call: it is popping
-    /// one of these that costs a two-hop scan, so charging once per call would
-    /// let a single unit queue a whole neighbor list — γ² work per unit, and the
-    /// denser the graph the worse the bill. Reports whether anything was
-    /// actually queued, which is how the caller knows it is making progress.
-    fn bridge_out(
-        &self,
-        query: &[f32],
-        id: usize,
-        layer: usize,
-        predicate: Option<&Predicate>,
-        beam: &mut Beam,
-    ) -> Result<bool, HnswError> {
-        let mut queued = false;
-        for &n in self.neighbors(id, layer) {
-            if beam.tr.detours == 0 {
-                break;
-            }
-            if self.visit(query, n as usize, predicate, beam)? {
-                beam.tr.detours -= 1;
-                beam.tr.cost.detours += 1;
-                queued = true;
-            }
-        }
-        Ok(queued)
-    }
-
-    /// Greedy beam search within one layer (HNSW SEARCH-LAYER). Returns up to `ef`
-    /// nearest candidates to `query`, ascending by distance.
-    ///
-    /// With a predicate, only matching nodes are returned and the `ef` budget is
-    /// spent on those alone; [`Hnsw::expand`] covers how traversal still reaches
-    /// them across non-matching regions.
-    fn search_layer(
-        &self,
-        query: &[f32],
-        entry_points: &[usize],
-        ef: usize,
-        layer: usize,
-        predicate: Option<&Predicate>,
-        tr: &mut Traversal,
-    ) -> Result<Vec<Cand>, HnswError> {
-        let filtered = Self::is_filtered(predicate);
-        let mut beam = Beam::new(ef, tr);
-        // Scratch for `expand`'s bridge list, hoisted here so the filtered path
-        // allocates once per layer search rather than once per expansion.
-        let mut bridges: Vec<usize> = Vec::new();
-
-        for &ep in entry_points {
-            if beam.visited.insert(ep) {
-                let d = self.metric.distance(query, self.vector(ep))?;
-                beam.tr.cost.distances += 1;
-                // A seed routes even when tombstoned or non-matching: it may be
-                // the only way into the region that does match.
-                beam.push(Cand { dist: d, id: ep }, self.admissible(ep, predicate));
-            }
-        }
-
-        loop {
-            while let Some(Reverse(c)) = beam.frontier.pop() {
-                // A filtered search admits only matching nodes, so a result set
-                // that is not yet full means the budget is still unspent and its
-                // farthest entry is no cutoff. Unfiltered, the original rule
-                // stands and existing graphs and query results reproduce
-                // exactly.
-                if c.dist > beam.farthest() && (!filtered || beam.results.len() >= ef) {
-                    break;
-                }
-                if filtered {
-                    if beam.tr.expansions == 0 {
-                        break;
-                    }
-                    beam.tr.expansions -= 1;
-                }
-                beam.tr.cost.expansions += 1;
-                let bridged =
-                    self.expand(query, c.id, layer, predicate, &mut beam, &mut bridges)?;
-                if filtered && !bridged {
-                    beam.deferred.push(c);
-                }
-            }
-
-            // The walk ended with the heap unfilled. Under a selective
-            // predicate that means the matching subgraph fragmented: with one
-            // node in twenty matching and ~2m neighbors each, a matching node
-            // often has one or two matching neighbors and they are each
-            // other's, so the search explored one small component and ran out
-            // of frontier. Nothing above notices, because every expansion found
-            // a match and so never bridged — and raising `ef_search` does not
-            // help, since the frontier empties long before the budget does.
-            //
-            // So go back to those expansions and bridge out of them, nearest
-            // first. This is deliberately a *last resort* rather than a looser
-            // rule up in `expand`: bridging whenever the heap is unfilled also
-            // works, and pays on every selective query instead of only the
-            // stranded ones — measured on 20 000 rows at 128 dimensions, 3.8-4.4x
-            // the latency at 1% selectivity. This form is free wherever the heap
-            // fills: the counters and recall there are identical to not having
-            // it at all.
-            //
-            // Layer 0 only. The layers above it are navigation and the descent's
-            // probe for a foothold, whose results are seeds rather than answers
-            // — one is enough, and an unfilled heap there means nothing. They
-            // also share a single detour allowance across the whole descent, so
-            // a rescue up there could drain the pot and leave the layers below
-            // unable to bridge at all, which is the starvation
-            // `Traversal::refill_detours` exists to prevent.
-            if layer != 0 || !filtered || beam.results.len() >= ef || beam.tr.detours == 0 {
-                break;
-            }
-            let mut deferred = core::mem::take(&mut beam.deferred);
-            if deferred.is_empty() {
-                break;
-            }
-            // Nearest the query first: the allowance is bounded and usually runs
-            // out inside one rescue round, so where it is spent decides what the
-            // round is worth.
-            deferred.sort_unstable();
-            let mut progressed = false;
-            for cand in deferred {
-                if beam.tr.detours == 0 {
-                    break;
-                }
-                progressed |= self.bridge_out(query, cand.id, layer, predicate, &mut beam)?;
-            }
-            // Each node is rescued at most once — `take` empties the list — and
-            // the allowance only falls, so this terminates.
-            if !progressed {
-                break;
-            }
-        }
-
-        let mut out = beam.results.into_vec();
-        out.sort_unstable();
-        Ok(out)
-    }
-
-    /// Malkov's neighbor-selection heuristic (Alg. 4): prefer candidates closer to
-    /// the base than to any already-selected neighbor (keeps the graph diverse and
-    /// navigable), backfilling with the nearest leftovers up to `m`.
-    fn select_neighbors_heuristic(
-        &self,
-        candidates: &[Cand],
-        m: usize,
-    ) -> Result<Vec<usize>, HnswError> {
-        let mut sorted = candidates.to_vec();
-        sorted.sort_unstable(); // ascending by distance to the base
-        let mut selected: Vec<usize> = Vec::with_capacity(m);
-
-        for cand in &sorted {
-            if selected.len() >= m {
-                break;
-            }
-            let mut keep = true;
-            for &r in &selected {
-                let d = self.metric.distance(self.vector(cand.id), self.vector(r))?;
-                if d < cand.dist {
-                    keep = false;
-                    break;
-                }
-            }
-            if keep {
-                selected.push(cand.id);
-            }
-        }
-
-        if selected.len() < m {
-            for cand in &sorted {
-                if selected.len() >= m {
-                    break;
-                }
-                if !selected.contains(&cand.id) {
-                    selected.push(cand.id);
-                }
-            }
-        }
-
-        Ok(selected)
-    }
-
     /// Insert a vector with no filterable attributes, returning its node id.
     /// Equivalent to [`Hnsw::insert_with_attrs`] with an empty row.
     pub fn insert(&mut self, vector: Vec<f32>) -> Result<usize, HnswError> {
@@ -1008,100 +813,8 @@ impl Hnsw {
         vector: Vec<f32>,
         attrs: Vec<AttrValue>,
     ) -> Result<usize, HnswError> {
-        if vector.is_empty() {
-            return Err(HnswError::EmptyVector);
-        }
-        // Refused on the way in, not only on the way back. The decoder caps the
-        // dimension it will accept, because it sizes a buffer from that field
-        // before anything relates it to the payload's length — so a graph that
-        // took a wider vector would serialize to something it could never read
-        // back, and the index built from it would be unreadable rather than
-        // merely wrong. The two limits are the same number for that reason.
-        if vector.len() > HnswParams::MAX_DIM {
-            return Err(HnswError::DimensionTooLarge {
-                got: vector.len(),
-                max: HnswParams::MAX_DIM,
-            });
-        }
-        if self.dim == 0 {
-            self.dim = vector.len();
-        } else if vector.len() != self.dim {
-            return Err(HnswError::DimensionMismatch {
-                expected: self.dim,
-                got: vector.len(),
-            });
-        }
-
-        let level = self.random_level();
-        let id = self.push_node(&vector, attrs, level + 1)?;
-
-        let entry = match self.entry_point {
-            None => {
-                self.entry_point = Some(id);
-                self.max_layer = level;
-                return Ok(id);
-            }
-            Some(e) => e,
-        };
-
-        let query = self.vector(id).to_vec();
-        let max_layer = self.max_layer;
-        let mut ep_ids = vec![entry];
-        // Build never filters, so no allowance is ever drawn on; the counters
-        // ride along because one layer search serves both paths.
-        let mut build = Traversal::unfiltered();
-
-        // Greedy descent from the top down to just above the new node's level.
-        if max_layer > level {
-            for lc in ((level + 1)..=max_layer).rev() {
-                let w = self.search_layer(&query, &ep_ids, 1, lc, None, &mut build)?;
-                if let Some(nearest) = w.first() {
-                    ep_ids = vec![nearest.id];
-                }
-            }
-        }
-
-        // Connect at each layer from min(level, max_layer) down to 0.
-        let start = level.min(max_layer);
-        for lc in (0..=start).rev() {
-            let w =
-                self.search_layer(&query, &ep_ids, self.ef_construction, lc, None, &mut build)?;
-            let max_deg = self.max_degree(lc);
-            let selected = self.select_neighbors_heuristic(&w, max_deg)?;
-
-            let chosen: Vec<u32> = selected.iter().map(|&n| n as u32).collect();
-            self.set_neighbors(id, lc, &chosen);
-            for &n in &selected {
-                // Append then prune, which is why a slot run is one wider than
-                // the cap: the pruned set is chosen from the same candidates the
-                // nested layout considered, so the resulting graph is identical.
-                let len = self.push_neighbor(n, lc, id as u32);
-                if len > max_deg {
-                    let nbase = self.vector(n).to_vec();
-                    let mut cands = Vec::with_capacity(len);
-                    for &nn in self.neighbors(n, lc) {
-                        let nn = nn as usize;
-                        let d = self.metric.distance(&nbase, self.vector(nn))?;
-                        cands.push(Cand { dist: d, id: nn });
-                    }
-                    let kept = self.select_neighbors_heuristic(&cands, max_deg)?;
-                    let kept: Vec<u32> = kept.into_iter().map(|x| x as u32).collect();
-                    self.set_neighbors(n, lc, &kept);
-                }
-            }
-
-            ep_ids = w.iter().map(|c| c.id).collect();
-            if ep_ids.is_empty() {
-                ep_ids = vec![entry];
-            }
-        }
-
-        if level > self.max_layer {
-            self.max_layer = level;
-            self.entry_point = Some(id);
-        }
-
-        Ok(id)
+        let node = insert_into(self, &vector, &attrs, ())?;
+        Ok(node as usize)
     }
 
     /// Approximate k-nearest-neighbor search. Returns up to `k` `(distance, id)`
@@ -1172,75 +885,11 @@ impl Hnsw {
         ef_search: usize,
         predicate: Option<&Predicate>,
     ) -> Result<(Vec<(f32, usize)>, SearchCost), HnswError> {
-        let entry = match self.entry_point {
-            Some(e) => e,
-            None => return Ok((Vec::new(), SearchCost::default())),
-        };
-        if k == 0 {
-            return Ok((Vec::new(), SearchCost::default()));
-        }
-        if query.len() != self.dim {
-            return Err(HnswError::DimensionMismatch {
-                expected: self.dim,
-                got: query.len(),
-            });
-        }
-
-        let filtered = Self::is_filtered(predicate);
-        let ef = ef_search.max(k);
-        let mut tr = if filtered {
-            Traversal::for_ef(ef)
-        } else {
-            Traversal::unfiltered()
-        };
-        let mut ep_ids = vec![entry];
-        let mut seeds: Vec<usize> = Vec::new();
-        let mut probe: Vec<usize> = Vec::new();
-
-        for lc in (1..=self.max_layer).rev() {
-            // Navigation is the same walk with or without a predicate: greedy,
-            // unfiltered, one entry point down to the next layer. Filtering it
-            // would change where an unfiltered search lands, and the answer to
-            // "which node is nearest the query" does not depend on the filter.
-            let w = self.search_layer(query, &ep_ids, 1, lc, None, &mut tr)?;
-            if let Some(nearest) = w.first() {
-                ep_ids.clear();
-                ep_ids.push(nearest.id);
-            }
-            if filtered {
-                // ...but *where to start looking* very much does. A predicate
-                // correlated with position leaves the query in a region where
-                // nothing matches, and layer 0 cannot cross that: one hop there
-                // covers one node's spacing, so reaching a region tens of nodes
-                // away costs a budget proportional to the area in between.
-                //
-                // The upper layers are built for exactly this — sparser, so a
-                // hop covers far more ground — which makes them the cheap place
-                // to look for a foothold in the matching set. Each layer probes
-                // from the node navigation just reached plus whatever the layer
-                // above found, and hands what it finds down; layer 0 starts
-                // inside the matching region rather than tens of hops from it.
-                //
-                // One foothold per layer: measured, carrying 2, 4 or 8 down
-                // changes recall on that fixture not at all and costs a little
-                // more, because what the probe has to get right is *which
-                // region*, and the layer below re-probes from wherever it lands.
-                probe.clear();
-                probe.extend_from_slice(&ep_ids);
-                probe.extend_from_slice(&seeds);
-                let found = self.search_layer(query, &probe, 1, lc, predicate, &mut tr)?;
-                seeds.clear();
-                seeds.extend(found.iter().map(|c| c.id));
-            }
-        }
-        ep_ids.extend_from_slice(&seeds);
-        if filtered {
-            tr.refill_detours(ef);
-        }
-
-        let mut w = self.search_layer(query, &ep_ids, ef, 0, predicate, &mut tr)?;
-        w.truncate(k);
-        Ok((w.into_iter().map(|c| (c.dist, c.id)).collect(), tr.cost))
+        let (results, cost) = search_generic(self, query, k, ef_search, predicate)?;
+        Ok((
+            results.into_iter().map(|(d, r)| (d, r as usize)).collect(),
+            cost,
+        ))
     }
 
     /// Exact brute-force k-NN over all stored vectors. Used as the recall ceiling
@@ -1259,12 +908,12 @@ impl Hnsw {
             }
             all.push(Cand {
                 dist: self.metric.distance(query, self.vector(id))?,
-                id,
+                id: id as NodeRef,
             });
         }
         all.sort_unstable();
         all.truncate(k);
-        Ok(all.into_iter().map(|c| (c.dist, c.id)).collect())
+        Ok(all.into_iter().map(|c| (c.dist, c.id as usize)).collect())
     }
 
     /// Roughly how much memory this graph occupies.
@@ -1337,6 +986,679 @@ impl Hnsw {
         *self = fresh;
         Ok(n)
     }
+}
+
+impl GraphStore for Hnsw {
+    type Error = HnswError;
+
+    fn params(&self) -> GraphParams {
+        GraphParams {
+            metric: self.metric,
+            m: self.m,
+            m_cap: self.m_cap,
+            m0_cap: self.m0_cap,
+            ef_construction: self.ef_construction,
+            dim: self.dim,
+        }
+    }
+
+    fn entry(&self) -> Option<(NodeRef, usize)> {
+        // The entry point is by construction a node at the top layer, so its
+        // level is `max_layer`.
+        self.entry_point.map(|e| (e as NodeRef, self.max_layer))
+    }
+
+    fn is_deleted(&self, node: NodeRef) -> Result<bool, HnswError> {
+        Ok(self.deleted[node as usize])
+    }
+
+    fn neighbors(
+        &self,
+        node: NodeRef,
+        layer: usize,
+        out: &mut Vec<NodeRef>,
+    ) -> Result<(), HnswError> {
+        out.clear();
+        out.extend(
+            Hnsw::neighbors(self, node as usize, layer)
+                .iter()
+                .map(|&n| n as NodeRef),
+        );
+        Ok(())
+    }
+
+    fn distance(&self, query: &[f32], node: NodeRef) -> Result<f32, HnswError> {
+        Ok(self.metric.distance(query, self.vector(node as usize))?)
+    }
+
+    fn load_vector(&self, node: NodeRef, out: &mut Vec<f32>) -> Result<(), HnswError> {
+        out.clear();
+        out.extend_from_slice(self.vector(node as usize));
+        Ok(())
+    }
+
+    fn attrs(&self, node: NodeRef, out: &mut Vec<AttrValue>) -> Result<(), HnswError> {
+        out.clear();
+        out.extend_from_slice(Hnsw::attrs(self, node as usize));
+        Ok(())
+    }
+}
+
+impl GraphStoreMut for Hnsw {
+    type Payload = ();
+
+    fn next_level(&mut self) -> Result<usize, HnswError> {
+        Ok(self.random_level())
+    }
+
+    fn add_node(
+        &mut self,
+        level: usize,
+        vector: &[f32],
+        attrs: &[AttrValue],
+        _payload: (),
+    ) -> Result<NodeRef, HnswError> {
+        if self.dim == 0 {
+            self.dim = vector.len();
+        }
+        let id = self.push_node(vector, attrs.to_vec(), level + 1)?;
+        Ok(id as NodeRef)
+    }
+
+    fn set_neighbors(
+        &mut self,
+        node: NodeRef,
+        layer: usize,
+        neighbors: &[NodeRef],
+    ) -> Result<(), HnswError> {
+        let ids: Vec<u32> = neighbors.iter().map(|&n| n as u32).collect();
+        Hnsw::set_neighbors(self, node as usize, layer, &ids);
+        Ok(())
+    }
+
+    fn set_entry(&mut self, node: NodeRef, level: usize) -> Result<(), HnswError> {
+        self.entry_point = Some(node as usize);
+        self.max_layer = level;
+        Ok(())
+    }
+
+    fn set_deleted(&mut self, node: NodeRef, deleted: bool) -> Result<(), HnswError> {
+        self.deleted[node as usize] = deleted;
+        Ok(())
+    }
+}
+
+/// Reusable buffers threaded through the generic search and insert so the hot
+/// loops allocate once per query/insert rather than once per hop. Each field is
+/// a distinct scratch slot, so a caller can hold two of them borrowed at once
+/// (a neighbor list while classifying its attributes, say) without aliasing.
+#[derive(Default)]
+struct Scratch {
+    /// The node currently being expanded — its neighbor list.
+    neighbors: Vec<NodeRef>,
+    /// A bridge node's neighbor list, read while `neighbors` still holds the
+    /// node being expanded.
+    bridge_neighbors: Vec<NodeRef>,
+    /// Non-matching neighbors collected to bridge over.
+    bridges: Vec<NodeRef>,
+    /// A node's attribute row, for a predicate test.
+    attrs: Vec<AttrValue>,
+    /// A base node's vector, held for the node-to-node distances neighbor
+    /// selection needs.
+    base: Vec<f32>,
+    /// A neighbor's current list while a back-edge is added and pruned.
+    cand_neighbors: Vec<NodeRef>,
+    /// Scored candidates handed to the selection heuristic during a prune.
+    pruning: Vec<Cand>,
+}
+
+/// Whether `predicate` requires the predicate-aware traversal path. Both `None`
+/// and the match-all predicate take the plain HNSW path, so filtering support
+/// leaves unfiltered search bit-for-bit unchanged.
+#[inline]
+fn predicate_is_filtered(predicate: Option<&Predicate>) -> bool {
+    !matches!(predicate, None | Some(Predicate::All))
+}
+
+/// Whether `node` satisfies `predicate` — vacuously true without one.
+#[inline]
+fn store_node_matches<S: GraphStore>(
+    store: &S,
+    node: NodeRef,
+    predicate: Option<&Predicate>,
+    attr_buf: &mut Vec<AttrValue>,
+) -> Result<bool, S::Error> {
+    match predicate {
+        None => Ok(true),
+        Some(p) => {
+            store.attrs(node, attr_buf)?;
+            Ok(p.matches(attr_buf.as_slice()))
+        }
+    }
+}
+
+/// Whether `node` may be *returned*: live, and satisfying the predicate. Routing
+/// through it is a separate, laxer question.
+#[inline]
+fn store_admissible<S: GraphStore>(
+    store: &S,
+    node: NodeRef,
+    predicate: Option<&Predicate>,
+    attr_buf: &mut Vec<AttrValue>,
+) -> Result<bool, S::Error> {
+    Ok(!store.is_deleted(node)? && store_node_matches(store, node, predicate, attr_buf)?)
+}
+
+/// Score `node` and fold it into `beam`, unless it was already considered or is
+/// too far to improve on the results already held. Reports whether it joined the
+/// frontier.
+fn visit<S: GraphStore>(
+    store: &S,
+    query: &[f32],
+    node: NodeRef,
+    predicate: Option<&Predicate>,
+    beam: &mut Beam,
+    attr_buf: &mut Vec<AttrValue>,
+) -> Result<bool, S::Error> {
+    if !beam.visited.insert(node) {
+        return Ok(false);
+    }
+    let d = store.distance(query, node)?;
+    beam.tr.cost.distances += 1;
+    if beam.results.len() < beam.ef || d < beam.farthest() {
+        let admissible = store_admissible(store, node, predicate, attr_buf)?;
+        beam.push(Cand { dist: d, id: node }, admissible);
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+/// Fold `node`'s neighbors into `beam`.
+///
+/// Unfiltered this is plain HNSW: every neighbor is a candidate. Under a
+/// predicate only matching neighbors can be answers, and a selective predicate
+/// can leave a node with none at all — the matching subgraph fragments and
+/// greedy search dead-ends. ACORN's fix, implemented here: when the neighbor
+/// list yields fewer than `m` matching nodes, hop *over* the non-matching
+/// neighbors and take *their* neighbors instead, so traversal crosses
+/// filtered-out regions rather than stopping at them.
+///
+/// Two bounds keep that from degenerating into a breadth-first sweep: one
+/// expansion reaches at most two hops, and at most `m` bridges are taken per
+/// node, stopping as soon as `m` matching neighbors have been produced. Two hops
+/// is not always far enough — under a very selective predicate a node can have no
+/// match anywhere in its two-hop neighborhood, so such a node routes on through
+/// its non-matching neighbors, limited by the search's detour allowance.
+///
+/// Node ids are read out of the scratch buffers by index rather than borrowed
+/// across the calls to [`visit`], so one scratch slot can be read while another
+/// is written without aliasing.
+#[allow(clippy::too_many_arguments)]
+fn expand<S: GraphStore>(
+    store: &S,
+    query: &[f32],
+    node: NodeRef,
+    layer: usize,
+    predicate: Option<&Predicate>,
+    m: usize,
+    beam: &mut Beam,
+    scratch: &mut Scratch,
+) -> Result<bool, S::Error> {
+    store.neighbors(node, layer, &mut scratch.neighbors)?;
+
+    if !predicate_is_filtered(predicate) {
+        for i in 0..scratch.neighbors.len() {
+            let n = scratch.neighbors[i];
+            visit(store, query, n, predicate, beam, &mut scratch.attrs)?;
+        }
+        return Ok(false);
+    }
+
+    // Both bounds scale with the graph's own base degree, so bridging costs a
+    // small multiple of the work an unfiltered expansion already does.
+    let target = m;
+    let max_bridges = m;
+
+    scratch.bridges.clear();
+    let mut matching = 0usize;
+    for i in 0..scratch.neighbors.len() {
+        let n = scratch.neighbors[i];
+        if store_node_matches(store, n, predicate, &mut scratch.attrs)? {
+            matching += 1;
+            visit(store, query, n, predicate, beam, &mut scratch.attrs)?;
+        } else if scratch.bridges.len() < max_bridges {
+            scratch.bridges.push(n);
+        }
+    }
+
+    let mut bi = 0;
+    while bi < scratch.bridges.len() && matching < target {
+        let bridge = scratch.bridges[bi];
+        bi += 1;
+        store.neighbors(bridge, layer, &mut scratch.bridge_neighbors)?;
+        let mut j = 0;
+        while j < scratch.bridge_neighbors.len() && matching < target {
+            let nn = scratch.bridge_neighbors[j];
+            j += 1;
+            if store_node_matches(store, nn, predicate, &mut scratch.attrs)? {
+                matching += 1;
+                visit(store, query, nn, predicate, beam, &mut scratch.attrs)?;
+            }
+        }
+    }
+
+    if matching == 0 {
+        // Stranded: nothing matches within two hops. Walk on through the
+        // non-matching nodes themselves (`scratch.neighbors` still holds them —
+        // only the bridge scan touched `bridge_neighbors`).
+        bridge_out(
+            store,
+            query,
+            predicate,
+            beam,
+            &scratch.neighbors,
+            &mut scratch.attrs,
+        )?;
+        return Ok(true);
+    }
+    // It found something, so it has no reason to leave its neighbourhood — unless
+    // the walk later ends short. The caller records it for that.
+    Ok(false)
+}
+
+/// Enqueue every one of `neighbors` regardless of the predicate, so the search
+/// can walk *through* a region it can never return. The allowance is charged per
+/// node *enqueued*, not per call. Reports whether anything was queued.
+fn bridge_out<S: GraphStore>(
+    store: &S,
+    query: &[f32],
+    predicate: Option<&Predicate>,
+    beam: &mut Beam,
+    neighbors: &[NodeRef],
+    attr_buf: &mut Vec<AttrValue>,
+) -> Result<bool, S::Error> {
+    let mut queued = false;
+    for &n in neighbors {
+        if beam.tr.detours == 0 {
+            break;
+        }
+        if visit(store, query, n, predicate, beam, attr_buf)? {
+            beam.tr.detours -= 1;
+            beam.tr.cost.detours += 1;
+            queued = true;
+        }
+    }
+    Ok(queued)
+}
+
+/// Greedy beam search within one layer (HNSW SEARCH-LAYER). Returns up to `ef`
+/// nearest candidates to `query`, ascending by distance. With a predicate, only
+/// matching nodes are returned and the `ef` budget is spent on those alone;
+/// [`expand`] covers how traversal still reaches them across non-matching
+/// regions.
+#[allow(clippy::too_many_arguments)]
+fn search_layer<S: GraphStore>(
+    store: &S,
+    query: &[f32],
+    entry_points: &[NodeRef],
+    ef: usize,
+    layer: usize,
+    predicate: Option<&Predicate>,
+    tr: &mut Traversal,
+    scratch: &mut Scratch,
+    m: usize,
+) -> Result<Vec<Cand>, S::Error> {
+    let filtered = predicate_is_filtered(predicate);
+    let mut beam = Beam::new(ef, tr);
+
+    for &ep in entry_points {
+        if beam.visited.insert(ep) {
+            let d = store.distance(query, ep)?;
+            beam.tr.cost.distances += 1;
+            // A seed routes even when tombstoned or non-matching: it may be the
+            // only way into the region that does match.
+            let admissible = store_admissible(store, ep, predicate, &mut scratch.attrs)?;
+            beam.push(Cand { dist: d, id: ep }, admissible);
+        }
+    }
+
+    loop {
+        while let Some(Reverse(c)) = beam.frontier.pop() {
+            // A filtered search admits only matching nodes, so a result set that
+            // is not yet full means the budget is still unspent and its farthest
+            // entry is no cutoff. Unfiltered, the original rule stands.
+            if c.dist > beam.farthest() && (!filtered || beam.results.len() >= ef) {
+                break;
+            }
+            if filtered {
+                if beam.tr.expansions == 0 {
+                    break;
+                }
+                beam.tr.expansions -= 1;
+            }
+            beam.tr.cost.expansions += 1;
+            let bridged = expand(store, query, c.id, layer, predicate, m, &mut beam, scratch)?;
+            if filtered && !bridged {
+                beam.deferred.push(c);
+            }
+        }
+
+        // The walk ended with the heap unfilled. Under a selective predicate that
+        // means the matching subgraph fragmented; go back to the expansions that
+        // found a match without bridging and bridge out of them, nearest first.
+        // Layer 0 only — the layers above are navigation, whose unfilled heap
+        // means nothing, and they share a detour allowance a rescue could drain.
+        if layer != 0 || !filtered || beam.results.len() >= ef || beam.tr.detours == 0 {
+            break;
+        }
+        let mut deferred = core::mem::take(&mut beam.deferred);
+        if deferred.is_empty() {
+            break;
+        }
+        deferred.sort_unstable();
+        let mut progressed = false;
+        for cand in deferred {
+            if beam.tr.detours == 0 {
+                break;
+            }
+            store.neighbors(cand.id, layer, &mut scratch.neighbors)?;
+            progressed |= bridge_out(
+                store,
+                query,
+                predicate,
+                &mut beam,
+                &scratch.neighbors,
+                &mut scratch.attrs,
+            )?;
+        }
+        if !progressed {
+            break;
+        }
+    }
+
+    let mut out = beam.results.into_vec();
+    out.sort_unstable();
+    Ok(out)
+}
+
+/// Malkov's neighbor-selection heuristic (Alg. 4): prefer candidates closer to
+/// the base than to any already-selected neighbor (keeps the graph diverse and
+/// navigable), backfilling with the nearest leftovers up to `m`.
+///
+/// `base_buf` holds one candidate's vector while it is compared to the selected
+/// set — the reason [`GraphStore::load_vector`] exists.
+fn select_neighbors_heuristic<S: GraphStore>(
+    store: &S,
+    candidates: &[Cand],
+    m: usize,
+    base_buf: &mut Vec<f32>,
+) -> Result<Vec<NodeRef>, S::Error> {
+    let mut sorted = candidates.to_vec();
+    sorted.sort_unstable(); // ascending by distance to the base
+    let mut selected: Vec<NodeRef> = Vec::with_capacity(m);
+
+    for cand in &sorted {
+        if selected.len() >= m {
+            break;
+        }
+        let mut keep = true;
+        // A candidate with nothing yet selected is kept without a comparison, so
+        // its vector is only loaded once the selected set is non-empty.
+        if !selected.is_empty() {
+            store.load_vector(cand.id, base_buf)?;
+            for &r in &selected {
+                let d = store.distance(base_buf, r)?;
+                if d < cand.dist {
+                    keep = false;
+                    break;
+                }
+            }
+        }
+        if keep {
+            selected.push(cand.id);
+        }
+    }
+
+    if selected.len() < m {
+        for cand in &sorted {
+            if selected.len() >= m {
+                break;
+            }
+            if !selected.contains(&cand.id) {
+                selected.push(cand.id);
+            }
+        }
+    }
+
+    Ok(selected)
+}
+
+/// Add `new_neighbor` to `node`'s list at `layer`, pruning back to the degree cap
+/// if the list overflows — the back-edge half of an insert. Reads the current
+/// list, appends, and either writes it back or prunes the overflowed set with the
+/// same heuristic the forward edges use, so the resulting graph is identical to
+/// building the list nested.
+fn add_back_edge<S: GraphStoreMut>(
+    store: &mut S,
+    node: NodeRef,
+    layer: usize,
+    new_neighbor: NodeRef,
+    max_deg: usize,
+    scratch: &mut Scratch,
+) -> Result<(), S::Error> {
+    store.neighbors(node, layer, &mut scratch.cand_neighbors)?;
+    scratch.cand_neighbors.push(new_neighbor);
+    if scratch.cand_neighbors.len() > max_deg {
+        store.load_vector(node, &mut scratch.base)?;
+        scratch.pruning.clear();
+        for i in 0..scratch.cand_neighbors.len() {
+            let nn = scratch.cand_neighbors[i];
+            let d = store.distance(&scratch.base, nn)?;
+            scratch.pruning.push(Cand { dist: d, id: nn });
+        }
+        let kept = select_neighbors_heuristic(store, &scratch.pruning, max_deg, &mut scratch.base)?;
+        store.set_neighbors(node, layer, &kept)?;
+    } else {
+        store.set_neighbors(node, layer, &scratch.cand_neighbors)?;
+    }
+    Ok(())
+}
+
+/// Approximate k-NN search over any [`GraphStore`]. Returns up to `k`
+/// `(distance, node)` pairs, nearest first; `predicate` restricts results to
+/// matching nodes while still routing through non-matching ones. This is the one
+/// implementation of the search, run over both the in-memory graph and the paged
+/// one.
+pub fn search_generic<S: GraphStore>(
+    store: &S,
+    query: &[f32],
+    k: usize,
+    ef_search: usize,
+    predicate: Option<&Predicate>,
+) -> Result<(Ranking, SearchCost), S::Error> {
+    let (entry, entry_level) = match store.entry() {
+        Some(e) => e,
+        None => return Ok((Vec::new(), SearchCost::default())),
+    };
+    if k == 0 {
+        return Ok((Vec::new(), SearchCost::default()));
+    }
+    let params = store.params();
+    if query.len() != params.dim {
+        return Err(HnswError::DimensionMismatch {
+            expected: params.dim,
+            got: query.len(),
+        }
+        .into());
+    }
+
+    let filtered = predicate_is_filtered(predicate);
+    let ef = ef_search.max(k);
+    let mut tr = if filtered {
+        Traversal::for_ef(ef)
+    } else {
+        Traversal::unfiltered()
+    };
+    let mut scratch = Scratch::default();
+    let m = params.m;
+    let mut ep_ids = vec![entry];
+    let mut seeds: Vec<NodeRef> = Vec::new();
+    let mut probe: Vec<NodeRef> = Vec::new();
+
+    for lc in (1..=entry_level).rev() {
+        // Navigation is the same greedy, unfiltered walk with or without a
+        // predicate: the answer to "which node is nearest" does not depend on the
+        // filter.
+        let w = search_layer(store, query, &ep_ids, 1, lc, None, &mut tr, &mut scratch, m)?;
+        if let Some(nearest) = w.first() {
+            ep_ids.clear();
+            ep_ids.push(nearest.id);
+        }
+        if filtered {
+            // ...but *where to start looking* does: each upper layer is probed for
+            // a node that matches, so layer 0 starts inside the matching region
+            // rather than tens of hops from it. See `docs/FILTERING.md` § 2.
+            probe.clear();
+            probe.extend_from_slice(&ep_ids);
+            probe.extend_from_slice(&seeds);
+            let found = search_layer(
+                store,
+                query,
+                &probe,
+                1,
+                lc,
+                predicate,
+                &mut tr,
+                &mut scratch,
+                m,
+            )?;
+            seeds.clear();
+            seeds.extend(found.iter().map(|c| c.id));
+        }
+    }
+    ep_ids.extend_from_slice(&seeds);
+    if filtered {
+        tr.refill_detours(ef);
+    }
+
+    let mut w = search_layer(
+        store,
+        query,
+        &ep_ids,
+        ef,
+        0,
+        predicate,
+        &mut tr,
+        &mut scratch,
+        m,
+    )?;
+    w.truncate(k);
+    Ok((w.into_iter().map(|c| (c.dist, c.id)).collect(), tr.cost))
+}
+
+/// Insert a vector, its attribute row and the store's payload into any
+/// [`GraphStoreMut`], returning the new node. The one implementation of HNSW
+/// insertion, run over both the in-memory graph and the paged one: level
+/// assignment, descent, per-layer beam search, neighbor selection and back-edge
+/// pruning. `Hnsw::insert` is a thin wrapper over it.
+pub fn insert_into<S: GraphStoreMut>(
+    store: &mut S,
+    vector: &[f32],
+    attrs: &[AttrValue],
+    payload: S::Payload,
+) -> Result<NodeRef, S::Error> {
+    if vector.is_empty() {
+        return Err(HnswError::EmptyVector.into());
+    }
+    // Refused on the way in, not only on the way back: a graph that accepted a
+    // wider vector could serialize to something it could never read back.
+    if vector.len() > HnswParams::MAX_DIM {
+        return Err(HnswError::DimensionTooLarge {
+            got: vector.len(),
+            max: HnswParams::MAX_DIM,
+        }
+        .into());
+    }
+    let params = store.params();
+    if params.dim != 0 && vector.len() != params.dim {
+        return Err(HnswError::DimensionMismatch {
+            expected: params.dim,
+            got: vector.len(),
+        }
+        .into());
+    }
+
+    let level = store.next_level()?;
+    let id = store.add_node(level, vector, attrs, payload)?;
+
+    let (entry, entry_level) = match store.entry() {
+        None => {
+            store.set_entry(id, level)?;
+            return Ok(id);
+        }
+        Some(e) => e,
+    };
+
+    let m = params.m;
+    let ef_construction = params.ef_construction;
+    let mut scratch = Scratch::default();
+    // Build never filters, so no allowance is ever drawn on; the counters ride
+    // along because one layer search serves both paths.
+    let mut build = Traversal::unfiltered();
+    let mut ep_ids = vec![entry];
+
+    // Greedy descent from the top down to just above the new node's level.
+    if entry_level > level {
+        for lc in ((level + 1)..=entry_level).rev() {
+            let w = search_layer(
+                store,
+                vector,
+                &ep_ids,
+                1,
+                lc,
+                None,
+                &mut build,
+                &mut scratch,
+                m,
+            )?;
+            if let Some(nearest) = w.first() {
+                ep_ids = vec![nearest.id];
+            }
+        }
+    }
+
+    // Connect at each layer from min(level, entry_level) down to 0.
+    let start = level.min(entry_level);
+    for lc in (0..=start).rev() {
+        let w = search_layer(
+            store,
+            vector,
+            &ep_ids,
+            ef_construction,
+            lc,
+            None,
+            &mut build,
+            &mut scratch,
+            m,
+        )?;
+        let max_deg = params.max_degree(lc);
+        let selected = select_neighbors_heuristic(store, &w, max_deg, &mut scratch.base)?;
+        store.set_neighbors(id, lc, &selected)?;
+        for &n in &selected {
+            add_back_edge(store, n, lc, id, max_deg, &mut scratch)?;
+        }
+
+        ep_ids = w.iter().map(|c| c.id).collect();
+        if ep_ids.is_empty() {
+            ep_ids = vec![entry];
+        }
+    }
+
+    if level > entry_level {
+        store.set_entry(id, level)?;
+    }
+
+    Ok(id)
 }
 
 /// Errors from decoding a graph serialized by [`Hnsw::to_bytes`].
