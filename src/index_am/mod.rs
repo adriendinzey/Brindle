@@ -12,6 +12,11 @@
 pub mod attrs;
 pub mod opclass;
 pub mod options;
+// The durable paged byte format (docs/STORAGE.md §3). Its codecs are not yet
+// referenced — the buffer-backed GraphStore that uses them lands in the next
+// change — so the whole module is allowed to be dead until then.
+#[allow(dead_code)]
+pub mod page;
 pub mod scan;
 pub mod storage;
 
