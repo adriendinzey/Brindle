@@ -87,7 +87,7 @@ jobs:
           tar -C "target/release/brindle-pg${{ matrix.pg }}" -czf "${NAME}.tar.gz" .
           echo "name=${NAME}.tar.gz" >> "$GITHUB_OUTPUT"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: ${{ steps.tar.outputs.name }}
           path: ${{ steps.tar.outputs.name }}
