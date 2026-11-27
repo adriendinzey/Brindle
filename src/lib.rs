@@ -22,6 +22,7 @@ pub mod hnsw;
 pub mod hybrid;
 pub mod index_am;
 pub mod pg_vector;
+pub mod quantize;
 pub mod vector;
 
 ::pgrx::pg_module_magic!();
