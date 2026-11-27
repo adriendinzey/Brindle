@@ -24,6 +24,31 @@ jobs:
           components: rustfmt
       - run: cargo fmt --all -- --check
 
+  # The algorithms have no Postgres dependency, so they get a lane with no PGDG
+  # install and no cargo-pgrx build. It is also the only job that runs their
+  # unit tests: `cargo pgrx test` below tests the extension package alone.
+  core:
+    name: clippy + test (core)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: core
+
+      # --all-targets so the criterion benches are compiled and linted too:
+      # otherwise a dependency bump that breaks a bench still shows a green tick.
+      - name: Clippy
+        run: cargo clippy -p brindle-core --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test -p brindle-core
+
   test:
     name: clippy + test (pg${{ matrix.pg }})
     runs-on: ubuntu-latest
@@ -80,11 +105,10 @@ jobs:
       - name: Clear cached pgrx test cluster
         run: rm -rf target/test-pgdata
 
-      # --all-targets so benches and test modules are linted too, not just the
-      # lib: without it `benches/` is never compiled here at all, so a dependency
-      # bump that breaks the bench still shows a green tick. pg_test additionally
-      # pulls in the SQL test modules, which `cargo pgrx test` compiles but which
-      # nothing lints.
+      # --all-targets so test modules are linted too, not just the lib. pg_test
+      # additionally pulls in the SQL test modules, which `cargo pgrx test`
+      # compiles but which nothing lints. This lints the extension package only;
+      # the core crate is linted in its own lane above.
       - name: Clippy
         run: cargo clippy --all-targets --no-default-features --features pg${{ matrix.pg }},pg_test -- -D warnings
 

@@ -1,10 +1,22 @@
-[package]
-name = "brindle"
+# The root package is the pgrx extension; `cargo pgrx` and the release workflow
+# run from here. The algorithms it wraps live in the Postgres-free core crate.
+[workspace]
+members = ["crates/brindle-core"]
+
+# One version for both crates: the core has no life outside this extension.
+[workspace.package]
 version = "0.0.1"
 edition = "2021"
-description = "Filter-aware, hybrid vector search for PostgreSQL"
 license = "PostgreSQL"
 repository = "https://github.com/adriendinzey/Brindle"
+
+[package]
+name = "brindle"
+description = "Filter-aware, hybrid vector search for PostgreSQL"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
 readme = "README.md"
 
 [lints.rust]
@@ -35,24 +47,11 @@ pg17 = ["pgrx/pg17", "pgrx-tests/pg17"]
 pg_test = []
 
 [dependencies]
+brindle-core = { path = "crates/brindle-core" }
 pgrx = "=0.12.9"
 
 [dev-dependencies]
 pgrx-tests = "=0.12.9"
-# `cargo_bench_support` is required for the harness to run under `cargo bench`;
-# it is part of criterion's default features, which we otherwise drop to avoid
-# pulling in `plotters`/`rayon` for these tiny kernels.
-criterion = { version = "0.5", default-features = false, features = [
-    "cargo_bench_support",
-] }
-
-[[bench]]
-name = "distance"
-harness = false
-
-[[bench]]
-name = "graph_decode"
-harness = false
 
 [profile.dev]
 panic = "unwind"

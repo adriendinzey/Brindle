@@ -485,8 +485,8 @@ implementation unchanged.
 Note what this means for sequencing: **this is a change to the pure core, not
 only to the boundary.** The algorithm is untouched — what changes is that it
 reads and writes through a trait instead of through its own fields — but the
-edit lands in `src/hnsw.rs`, and the storage implementation has to budget for
-it.
+edit lands in `crates/brindle-core/src/hnsw.rs`, and the storage implementation
+has to budget for it.
 
 The core stays `pgrx`-free throughout: `NodeRef` is an opaque `u64`, `Payload`
 is an associated type the core never inspects, and nothing in either trait

@@ -148,7 +148,7 @@ EOF
   echo
   echo "next:"
   echo "  cd $wt_dir"
-  echo "  cargo test                 # pure-core, isolated build dir"
+  echo "  cargo test -p brindle-core # pure-core, isolated build dir"
   echo "  scripts/pgx.sh test pg$PG_MAJOR   # pgrx tests, isolated Postgres"
 }
 

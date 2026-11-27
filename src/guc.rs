@@ -30,8 +30,8 @@ const MIN_CACHE_MAX_MB: i32 = 0;
 const MAX_CACHE_MAX_MB: i32 = 65_536;
 
 /// Backing storage for `brindle.ef_search`. The boot value matches
-/// [`crate::hnsw::HnswParams::default`]'s `ef_construction`, so an untuned
-/// session searches with the same budget the graph was built at.
+/// [`brindle_core::hnsw::HnswParams::default`]'s `ef_construction`, so an
+/// untuned session searches with the same budget the graph was built at.
 static EF_SEARCH: GucSetting<i32> = GucSetting::<i32>::new(DEFAULT_EF_SEARCH);
 
 const DEFAULT_EF_SEARCH: i32 = 64;

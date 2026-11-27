@@ -2,8 +2,9 @@
 //!
 //! One varlena per value: the standard 4-byte header, a dimension count, then
 //! the components as `f32`. The payload therefore starts at a fixed offset and
-//! is read as a plain `&[f32]`, so the distance kernels in [`crate::distance`]
-//! see the stored bytes directly — no per-call copy, no deserialization.
+//! is read as a plain `&[f32]`, so the distance kernels in
+//! [`brindle_core::distance`] see the stored bytes directly — no per-call copy,
+//! no deserialization.
 //!
 //! The layout deliberately matches pgvector's `vector` (`dim` as an `int16`
 //! followed by two padding bytes), and the text form is pgvector's `[1,2,3]`,
@@ -24,7 +25,8 @@ use pgrx::pgrx_sql_entity_graph::metadata::{
 use pgrx::prelude::*;
 use pgrx::{varlena, Array, FromDatum, IntoDatum};
 
-use crate::distance;
+use brindle_core::distance;
+
 use crate::or_error;
 
 /// Name of the type in SQL.
@@ -39,7 +41,7 @@ pub const MAX_DIM: usize = 16_000;
 // the way back, using the core's own limit. If these two drifted apart, one side
 // would accept what the other could not read — an index that builds and is then
 // unusable, which is the failure this pairing exists to prevent.
-const _: () = assert!(MAX_DIM == crate::hnsw::HnswParams::MAX_DIM);
+const _: () = assert!(MAX_DIM == brindle_core::hnsw::HnswParams::MAX_DIM);
 
 /// Header of a `brindle_vector` value. The components follow it contiguously.
 #[repr(C)]

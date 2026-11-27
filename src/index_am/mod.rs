@@ -1,8 +1,8 @@
 //! The brindle Index Access Method: `CREATE INDEX ... USING brindle`.
 //!
 //! Boundary layer only — it adapts the Postgres AM callback ABI to the pure
-//! [`crate::hnsw`] core. `ambuild` scans the heap into an in-memory graph and
-//! persists it through [`storage`] using the build parameters [`options`]
+//! [`brindle_core::hnsw`] core. `ambuild` scans the heap into an in-memory graph
+//! and persists it through [`storage`] using the build parameters [`options`]
 //! parses from the index's `WITH (...)` clause, `aminsert` extends that stored
 //! graph a tuple at a time, and `ambulkdelete` tombstones what VACUUM reclaims;
 //! [`scan`] answers `ORDER BY` distance queries from it. The metric a build
@@ -21,7 +21,8 @@ use pgrx::itemptr::{item_pointer_get_both, item_pointer_set_all};
 use pgrx::prelude::*;
 use pgrx::{pg_guard, pg_sys, Array, FromDatum, PgBox};
 
-use crate::hnsw::{Hnsw, HnswParams};
+use brindle_core::hnsw::{Hnsw, HnswParams};
+
 use crate::pg_vector;
 use opclass::VectorKind;
 use options::build_params;
@@ -577,9 +578,10 @@ mod tests {
     use pgrx::prelude::*;
     use pgrx::{pg_guard, pg_sys, PgRelation};
 
-    use crate::hnsw::{Hnsw, HnswParams};
+    use brindle_core::hnsw::{Hnsw, HnswParams};
+    use brindle_core::vector::Metric;
+
     use crate::index_am::storage::{self, TidPair};
-    use crate::vector::Metric;
 
     /// The deterministic 4-dim vector the SQL fixtures build for row `i`.
     fn fixture_vector(i: i64) -> Vec<f32> {

@@ -1,0 +1,23 @@
+[package]
+name = "brindle-core"
+description = "Brindle's algorithms — distance kernels, HNSW, filter predicates, rank fusion — with no Postgres dependency"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dev-dependencies]
+# `cargo_bench_support` is required for the harness to run under `cargo bench`;
+# it is part of criterion's default features, which we otherwise drop to avoid
+# pulling in `plotters`/`rayon` for these tiny kernels.
+criterion = { version = "0.5", default-features = false, features = [
+    "cargo_bench_support",
+] }
+
+[[bench]]
+name = "distance"
+harness = false
+
+[[bench]]
+name = "graph_decode"
+harness = false

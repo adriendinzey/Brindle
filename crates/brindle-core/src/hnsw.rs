@@ -1705,11 +1705,11 @@ const ATTR_TAG_FLOAT: u8 = 2;
 
 /// Append one attribute row, length-prefixed.
 ///
-/// Shared with the index layer, which keeps a side table of rows that have
-/// attributes but no vector (see `index_am::storage`). Two copies of this would
-/// let the graph's encoding and the side table's drift apart, and they are read
-/// back by the same decoder.
-pub(crate) fn write_attr_row(out: &mut Vec<u8>, row: &[AttrValue]) {
+/// Shared with the extension's index layer, which keeps a side table of rows
+/// that have attributes but no vector (`brindle::index_am::storage`). Two
+/// copies of this would let the graph's encoding and the side table's drift
+/// apart, and they are read back by the same decoder.
+pub fn write_attr_row(out: &mut Vec<u8>, row: &[AttrValue]) {
     out.extend_from_slice(&(row.len() as u64).to_le_bytes());
     for value in row {
         match value {
@@ -1727,9 +1727,7 @@ pub(crate) fn write_attr_row(out: &mut Vec<u8>, row: &[AttrValue]) {
 }
 
 /// Read one length-prefixed attribute row written by [`write_attr_row`].
-pub(crate) fn read_attr_row<S: GraphBytes + ?Sized>(
-    r: &mut S,
-) -> Result<Vec<AttrValue>, HnswDecodeError> {
+pub fn read_attr_row<S: GraphBytes + ?Sized>(r: &mut S) -> Result<Vec<AttrValue>, HnswDecodeError> {
     let count = r.read_len()?;
     // Every value costs at least a tag byte, so a count exceeding what is left
     // is corrupt -- checked before reserving, like every other count in this

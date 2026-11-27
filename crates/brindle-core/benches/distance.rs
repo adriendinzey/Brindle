@@ -13,15 +13,14 @@
 //! load or fold the computation away; the returned `Result` is handed back to
 //! criterion (which `black_box`es it) for the same reason.
 //!
-//! Because Brindle is a single pgrx crate, this bench links the extension crate
-//! and therefore needs a `pg*` feature to compile. Run it inside WSL with the
-//! pgrx toolchain:
+//! The kernels live in the Postgres-free core crate, so this needs no `pg*`
+//! feature and no `pg_config`:
 //!
 //! ```bash
-//! cargo bench --no-default-features --features pg17
+//! cargo bench -p brindle-core --bench distance
 //! ```
 
-use brindle::distance::{cosine_distance, inner_product, l2_squared};
+use brindle_core::distance::{cosine_distance, inner_product, l2_squared};
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 
 /// Embedding dimensions representative of common models.

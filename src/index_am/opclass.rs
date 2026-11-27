@@ -28,7 +28,7 @@
 use pgrx::prelude::*;
 use pgrx::{pg_sys, FromDatum};
 
-use crate::vector::Metric;
+use brindle_core::vector::Metric;
 
 /// Support-function number of the proc reporting an operator class's metric.
 pub const METRIC_PROC_NUM: u16 = 2;

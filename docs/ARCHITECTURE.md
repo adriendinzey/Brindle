@@ -85,11 +85,14 @@ fine for tiny result sets and catastrophic for large ones. The principled fix is
 
 ### Layering principle
 
-The **core** crate logic (distance, graph algorithms, fusion) is written as
-*pure Rust over plain slices*, with no `pgrx`/Postgres types. Only the **binding
-layer** touches Postgres. This is deliberate:
+The **core** logic (distance, graph algorithms, filtering, fusion) is its own
+crate, `brindle-core`, written as *pure Rust over plain slices* with no
+`pgrx`/Postgres dependency at all. Only the **binding layer** — the `brindle`
+extension crate — touches Postgres. This is deliberate:
 
-- the hard algorithmic code is unit-testable with `cargo test` (fast, no Postgres),
+- the hard algorithmic code is unit-testable with `cargo test -p brindle-core`
+  (no `pg_config`, no database), and the crate boundary enforces the rule rather
+  than convention,
 - the SIMD hot loops can be benchmarked in isolation with `criterion`,
 - the Postgres-specific surface stays thin and auditable.
 
@@ -165,18 +168,24 @@ private ~89 MB copy of the index.
 
 ## 5. Module map
 
-As built. The pure core is the top level; `index_am/` is the Postgres boundary.
+As built. A Cargo workspace of two crates: the repository root is the `brindle`
+pgrx extension (the Postgres boundary — `cargo pgrx` runs from here), and
+`crates/brindle-core` is the pure core it depends on.
 
 ```
-src/
-  lib.rs            # pg_module_magic, extension entry, #[pg_extern] surface
-  distance.rs       # pure distance kernels + unit tests
-  vector.rs         # metric selection / validation over slices
-  pg_vector.rs      # the brindle_vector type: layout, I/O, operators
-  hnsw.rs           # graph, build, layered search, γ-dense edges,
+crates/brindle-core/  # pure core: no pgrx, plain `cargo test -p brindle-core`
+  src/
+    distance.rs     # distance kernels + unit tests
+    vector.rs       # metric selection / validation over slices
+    hnsw.rs         # graph, build, layered search, γ-dense edges,
                     #   predicate-aware traversal, codec
-  filter.rs         # predicate model: equality + numeric ranges, AND
-  fusion.rs         # RRF over ranked lists
+    filter.rs       # predicate model: equality + numeric ranges, AND
+    fusion.rs       # RRF over ranked lists
+  benches/          # criterion micro-benchmarks (distance, graph decode)
+src/                # the extension: Postgres boundary only
+  lib.rs            # pg_module_magic, extension entry, #[pg_extern] surface
+  pg_vector.rs      # the brindle_vector type: layout, I/O, operators
+  hybrid.rs         # brindle_hybrid(): vector + full-text ranks fused by RRF
   guc.rs            # session GUCs: brindle.ef_search, brindle.cache_max_mb
   index_am/
     mod.rs          # IndexAmRoutine wiring, ambuild, aminsert, vacuum
@@ -185,11 +194,12 @@ src/
     scan.rs         # ambeginscan/amgettuple/amrescan/amendscan
     attrs.rs        # scan keys → predicate atoms; inline attribute rows
     storage.rs      # the stored index image, paging, and the backend cache
-benches/            # criterion micro-benchmarks (distance, graph decode)
+benches/sql/        # SQL benchmarks run against a live index
+tests/sql/          # SQL tests against a committed database
 ```
 
-Not built, and where they will go when they are: `quantize.rs` (RaBitQ, Phase 5)
-and the hybrid SQL surface that `fusion.rs` feeds (Phase 4). `hnsw.rs` is one
+Not built, and where it will go when it is: `quantize.rs` (RaBitQ, Phase 5), in
+`crates/brindle-core/src/`. `hnsw.rs` is one
 module rather than the `hnsw/` package this section used to predict — splitting
 it is worth doing when it stops being navigable, not before.
 
@@ -277,8 +287,8 @@ filtering + hybrid, not breadth.
 
 ## 8. Testing & validation strategy
 
-- **Unit tests** (`cargo test`) on pure core logic: distance correctness vs a
-  naive reference, graph invariants, RRF math.
+- **Unit tests** (`cargo test -p brindle-core`) on pure core logic: distance
+  correctness vs a naive reference, graph invariants, RRF math.
 - **`pg_test`** integration tests (pgrx) for the SQL surface and the index AM.
 - **Recall harness** (Phase 5): standard datasets (SIFT, GIST, a filtered
   benchmark), reporting recall@k vs QPS — *no performance claim ships without a
