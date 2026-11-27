@@ -69,10 +69,15 @@ Legend: ✅ done · 🚧 in progress · ⬜ planned
 - ⬜ Worked RAG example in `examples/`
 - ⬜ (stretch) better lexical scoring than `ts_rank`
 
-## Phase 5 — Quantization + benchmarks ⬜
+## Phase 5 — Quantization + benchmarks 🚧
 *"Memory-efficient and measured."*
 
-- ⬜ **RaBitQ** (1-bit) with exact re-rank, then extended B-bit RaBitQ
+- ✅ **RaBitQ** (1-bit) quantizer core with exact re-rank: sign bits 32× smaller
+  than `f32` (28× at 768-d once each code's 12 bytes of correction factors are
+  counted), and recall@10 ≥ 0.95 of an exact scan on clustered test data at
+  the default re-rank depth — isotropic Gaussian data needs a deeper re-rank
+- ⬜ Codes stored in the index and used during graph traversal
+- ⬜ Extended B-bit RaBitQ
 - ⬜ `ann-benchmarks`-style harness: recall@k vs QPS on SIFT/GIST + a filtered set
 - ⬜ Results charts in README (vs pgvector); reproducible scripts
 - ⬜ SIMD distance kernels + runtime dispatch

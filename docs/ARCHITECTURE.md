@@ -78,7 +78,7 @@ fine for tiny result sets and catastrophic for large ones. The principled fix is
 │  Core (pure Rust, no Postgres deps — unit-testable)         │
 │   • vector type / views over f32 (later f16, int8)          │
 │   • distance kernels: L2², cosine, inner product (SIMD)     │
-│   • quantization: scalar → binary (Phase 5)                 │
+│   • quantization: RaBitQ codes + exact re-rank              │
 │   • RRF fusion                                              │
 └─────────────────────────────────────────────────────────────┘
 ```
@@ -177,6 +177,9 @@ src/
                     #   predicate-aware traversal, codec
   filter.rs         # predicate model: equality + numeric ranges, AND
   fusion.rs         # RRF over ranked lists
+  hybrid.rs         # brindle_hybrid(): vector + full-text ranks fused by RRF
+  quantize.rs       # RaBitQ (1-bit) and 8-bit scalar codes, distance
+                    #   estimators, exact re-rank
   guc.rs            # session GUCs: brindle.ef_search, brindle.cache_max_mb
   index_am/
     mod.rs          # IndexAmRoutine wiring, ambuild, aminsert, vacuum
@@ -188,8 +191,9 @@ src/
 benches/            # criterion micro-benchmarks (distance, graph decode)
 ```
 
-Not built, and where they will go when they are: `quantize.rs` (RaBitQ, Phase 5)
-and the hybrid SQL surface that `fusion.rs` feeds (Phase 4). `hnsw.rs` is one
+`quantize.rs` is the quantizer core only — nothing in the index stores or
+searches codes yet; that needs the paged storage of Phase 3, so the graph can
+keep codes resident and fetch full vectors only to re-rank. `hnsw.rs` is one
 module rather than the `hnsw/` package this section used to predict — splitting
 it is worth doing when it stops being navigable, not before.
 
