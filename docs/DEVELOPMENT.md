@@ -38,8 +38,8 @@ cargo pgrx init        # downloads & compiles supported Postgres versions (slow,
 git clone https://github.com/adriendinzey/Brindle.git ~/code/brindle   # ext4, not /mnt/*
 cd ~/code/brindle
 
-cargo test                  # fast: pure-Rust core logic (no Postgres)
-cargo pgrx test pg17        # integration tests against a managed Postgres
+cargo test -p brindle-core  # fast: pure-Rust core logic (no Postgres, no pgrx)
+cargo pgrx test pg17        # the extension's integration tests, managed Postgres
 scripts/sql_test.sh         # SQL tests against a real, committed database
 cargo pgrx run  pg17        # build + install + open psql with brindle loaded
 ```
@@ -141,7 +141,7 @@ up **three** layers of isolation automatically. Then just work in that directory
 
 ```bash
 cd ~/code/brindle-wt/<slug>
-cargo test                  # pure-core — isolated build dir, parallel-safe
+cargo test -p brindle-core  # pure-core — isolated build dir, parallel-safe
 scripts/pgx.sh test pg17    # pgrx/SQL tests — isolated Postgres, parallel-safe
 ```
 
@@ -188,14 +188,16 @@ that CI and review gate:
 5. After merge: `scripts/worktree.sh rm <slug>`.
 
 To enforce step 4 on GitHub (require a PR + passing CI + up-to-date branch, and block
-force-push/deletion of `main`) — **already applied on this repo**:
+force-push/deletion of `main`) — applied on this repo; **re-run it whenever a CI job is
+added to the required checks**, since GitHub keeps only the list it was last given:
 
 ```bash
 gh api -X PUT repos/adriendinzey/Brindle/branches/main/protection \
   -H "Accept: application/vnd.github+json" --input - <<'JSON'
 {
   "required_status_checks": { "strict": true,
-    "contexts": ["rustfmt", "clippy + test (pg16)", "clippy + test (pg17)"] },
+    "contexts": ["rustfmt", "clippy + test (core)",
+                 "clippy + test (pg16)", "clippy + test (pg17)"] },
   "enforce_admins": false,
   "required_pull_request_reviews": { "required_approving_review_count": 0 },
   "restrictions": null,
@@ -211,4 +213,6 @@ JSON
 > maintainer. CI-green + up-to-date is the real gate. `enforce_admins:false` keeps an
 > owner escape hatch if a required check name ever drifts; set it to `true` to force
 > *everyone* (you included) through the PR path. Required checks must match the CI job
-> names exactly: `rustfmt`, `clippy + test (pg16)`, `clippy + test (pg17)`.
+> names exactly: `rustfmt`, `clippy + test (core)`, `clippy + test (pg16)`,
+> `clippy + test (pg17)`. The core lane must be among them: it is the only job that
+> runs the `brindle-core` unit tests.

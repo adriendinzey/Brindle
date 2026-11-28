@@ -21,8 +21,8 @@ use core::ffi::c_char;
 use pgrx::pg_sys;
 use pgrx::prelude::*;
 
-use crate::filter::AttrValue;
-use crate::hnsw::{GraphBytes, Hnsw, HnswDecodeError};
+use brindle_core::filter::AttrValue;
+use brindle_core::hnsw::{GraphBytes, Hnsw, HnswDecodeError};
 
 /// Errors from decoding the blob payload framing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -121,7 +121,7 @@ fn append_unrankable(out: &mut Vec<u8>, rows: &[UnrankableRow]) {
     for ((block, offset), attrs) in rows {
         out.extend_from_slice(&block.to_le_bytes());
         out.extend_from_slice(&offset.to_le_bytes());
-        crate::hnsw::write_attr_row(out, attrs);
+        brindle_core::hnsw::write_attr_row(out, attrs);
     }
 }
 
@@ -149,7 +149,7 @@ fn read_unrankable<S: GraphBytes + ?Sized>(
             .map_err(|_| PayloadError::Truncated)?;
         let block = u32::from_le_bytes([tid[0], tid[1], tid[2], tid[3]]);
         let offset = u16::from_le_bytes([tid[4], tid[5]]);
-        let attrs = crate::hnsw::read_attr_row(src).map_err(|e| match e {
+        let attrs = brindle_core::hnsw::read_attr_row(src).map_err(|e| match e {
             HnswDecodeError::Invalid(what) => PayloadError::Corrupt(what),
             _ => PayloadError::Truncated,
         })?;
@@ -1752,7 +1752,7 @@ mod tests {
 
     #[test]
     fn encode_index_matches_byte_framing() {
-        use crate::hnsw::{Hnsw, HnswParams};
+        use brindle_core::hnsw::{Hnsw, HnswParams};
 
         // The streaming encoder (graph serialized in place) must produce the
         // exact bytes the byte-based framing does over the same graph.
@@ -1780,7 +1780,7 @@ mod tests {
 
     #[test]
     fn encode_index_empty_graph() {
-        use crate::hnsw::{Hnsw, HnswParams};
+        use brindle_core::hnsw::{Hnsw, HnswParams};
 
         let hnsw = Hnsw::new(HnswParams::default());
         let blob = encode_index(&hnsw, &[], &[]);
@@ -1819,7 +1819,7 @@ mod tests {
     }
     #[test]
     fn round_trip_preserves_rows_that_have_no_vector() {
-        use crate::hnsw::{Hnsw, HnswParams};
+        use brindle_core::hnsw::{Hnsw, HnswParams};
 
         let hnsw = Hnsw::new(HnswParams::default());
         let rows: Vec<UnrankableRow> = vec![
@@ -1835,7 +1835,7 @@ mod tests {
 
     #[test]
     fn a_truncated_side_table_errors_rather_than_panicking() {
-        use crate::hnsw::{Hnsw, HnswParams};
+        use brindle_core::hnsw::{Hnsw, HnswParams};
 
         // The count is attacker-controlled on the decode path, like every other
         // length in this format: it must be bounded by what the payload can
@@ -1853,7 +1853,7 @@ mod tests {
 
     #[test]
     fn a_huge_side_table_count_does_not_reserve_from_it() {
-        use crate::hnsw::{Hnsw, HnswParams};
+        use brindle_core::hnsw::{Hnsw, HnswParams};
 
         // 8 bytes of count claiming a billion rows, with nothing behind it.
         let hnsw = Hnsw::new(HnswParams::default());

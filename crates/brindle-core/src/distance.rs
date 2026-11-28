@@ -2,7 +2,7 @@
 //!
 //! These are **pure Rust over `&[f32]` slices** with no Postgres dependency, so
 //! they can be unit-tested with `cargo test` and benchmarked in isolation. The
-//! pgrx binding layer (`lib.rs`) wraps them and converts errors into Postgres
+//! `brindle` extension crate wraps them and converts errors into Postgres
 //! `ERROR`s at the boundary.
 //!
 //! Loops are written to be autovectorization-friendly (simple `zip` folds) and

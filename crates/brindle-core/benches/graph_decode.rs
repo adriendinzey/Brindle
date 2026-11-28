@@ -11,14 +11,11 @@
 //! performance write-up come from a 100k x 128 run:
 //!
 //! ```bash
-//! cargo bench --bench graph_decode --features pg17
-//! GRAPH_ROWS=100000 GRAPH_DIMS=128 cargo bench --bench graph_decode --features pg17
+//! cargo bench -p brindle-core --bench graph_decode
+//! GRAPH_ROWS=100000 GRAPH_DIMS=128 cargo bench -p brindle-core --bench graph_decode
 //! ```
-//!
-//! Because Brindle is a single pgrx crate, this bench links the extension crate
-//! and therefore needs a `pg*` feature to compile.
 
-use brindle::hnsw::{Hnsw, HnswParams};
+use brindle_core::hnsw::{Hnsw, HnswParams};
 use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
 
 fn env_usize(key: &str, default: usize) -> usize {

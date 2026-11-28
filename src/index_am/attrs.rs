@@ -1,5 +1,5 @@
 //! Filterable attribute columns: the bridge between a SQL `WHERE` clause and
-//! [`crate::filter::Predicate`].
+//! [`brindle_core::filter::Predicate`].
 //!
 //! The vector is key column 1; every key column after it is a *filterable
 //! attribute*, stored inline beside the vector so traversal can test a predicate
@@ -12,7 +12,7 @@
 //! it as an executor `Filter` and the scan is post-filtered. That is the
 //! behaviour this index exists to improve on, so the attributes have to be keys.
 
-use crate::filter::{Atom, AttrValue, Predicate};
+use brindle_core::filter::{Atom, AttrValue, Predicate};
 use pgrx::datum::FromDatum;
 use pgrx::prelude::*;
 use std::ops::Bound;

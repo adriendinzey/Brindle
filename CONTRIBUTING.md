@@ -15,19 +15,21 @@ in [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md).
 The daily loop:
 
 ```bash
-cargo test              # pure-Rust core tests (no Postgres needed)
-cargo pgrx test pg17    # SQL/integration tests against a managed Postgres
-cargo pgrx run  pg17    # build + open psql with the extension loaded
-cargo fmt --all         # formatting (CI enforces --check)
+cargo test -p brindle-core  # pure-Rust core tests (no Postgres needed)
+cargo pgrx test pg17        # SQL/integration tests against a managed Postgres
+cargo pgrx run  pg17        # build + open psql with the extension loaded
+cargo fmt --all             # formatting (CI enforces --check)
+cargo clippy -p brindle-core --all-targets -- -D warnings
 cargo clippy --no-default-features --features pg17 -- -D warnings
 ```
 
 ## Project layout
 
-Algorithms (distance kernels, the HNSW graph, rank fusion) live in pure-Rust
-modules with no Postgres imports, so they're unit-testable without a database;
-the pgrx boundary (`src/lib.rs`) adapts them to SQL. Please keep new algorithmic
-logic in the pure layer. Design rationale:
+Algorithms (distance kernels, the HNSW graph, filter predicates, rank fusion)
+live in the `crates/brindle-core` crate, which has no Postgres dependency, so
+they're unit-testable without a database; the pgrx extension at the repository
+root (`src/`) adapts them to SQL. Please keep new algorithmic logic in the core
+crate. Design rationale:
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) and
 [docs/FILTERING.md](docs/FILTERING.md). Code conventions:
 [docs/CODING_STANDARDS.md](docs/CODING_STANDARDS.md) — highlights: `Result`-based
@@ -44,10 +46,10 @@ hot loops, comments explain *why*, not *what*.
 4. **Open a pull request** and fill in the template. The *files touched* list
    matters — it's how overlap between in-flight PRs gets spotted early.
 5. **CI must be green.** `main` is protected: changes land only via PR; the
-   required checks (`rustfmt`, `clippy + test (pg16)`, `clippy + test (pg17)`)
-   must pass; the branch must be up to date with `main` (rebase rather than
-   merge — linear history is enforced); force-pushes and deletion of `main` are
-   blocked. The maintainer does the merging.
+   required checks (`rustfmt`, `clippy + test (core)`, `clippy + test (pg16)`,
+   `clippy + test (pg17)`) must pass; the branch must be up to date with `main`
+   (rebase rather than merge — linear history is enforced); force-pushes and
+   deletion of `main` are blocked. The maintainer does the merging.
 
 ## Commit messages
 

@@ -39,12 +39,13 @@ use pgrx::itemptr::item_pointer_set_all;
 use pgrx::prelude::*;
 use pgrx::{pg_guard, pg_sys};
 
+use brindle_core::filter::Predicate;
+use brindle_core::hnsw::HnswError;
+
 use super::attrs;
 use super::opclass;
 use super::storage::{self, TidPair};
-use crate::filter::Predicate;
 use crate::guc;
-use crate::hnsw::HnswError;
 
 /// Errors raised while producing scan results.
 #[derive(Debug)]
@@ -1150,7 +1151,7 @@ mod tests {
             search.start(
                 relation.as_ptr(),
                 QUERY.to_vec(),
-                &crate::filter::Predicate::All,
+                &brindle_core::filter::Predicate::All,
             )
         }
         .expect("start");
@@ -1165,7 +1166,7 @@ mod tests {
             search.start(
                 relation.as_ptr(),
                 QUERY.to_vec(),
-                &crate::filter::Predicate::All,
+                &brindle_core::filter::Predicate::All,
             )
         }
         .expect("start");
@@ -1180,7 +1181,7 @@ mod tests {
             search.start(
                 relation.as_ptr(),
                 QUERY.to_vec(),
-                &crate::filter::Predicate::All,
+                &brindle_core::filter::Predicate::All,
             )
         }
         .expect("start");

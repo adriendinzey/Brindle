@@ -7,22 +7,18 @@
 //! ACORN-style filtering, hybrid RRF — lands in later phases, see
 //! `docs/ROADMAP.md`.
 //!
-//! Layering: all algorithmic logic lives in dependency-free modules (e.g.
-//! [`distance`], [`hnsw`]); this file, [`guc`], and [`index_am`] are the thin
-//! pgrx boundary that adapts Postgres types and turns `Result::Err` into a
-//! Postgres `ERROR`.
+//! Layering: all algorithmic logic lives in the Postgres-free [`brindle_core`]
+//! crate (e.g. [`brindle_core::distance`], [`brindle_core::hnsw`]); this crate
+//! — this file, [`guc`], and [`index_am`] — is the thin pgrx boundary that
+//! adapts Postgres types and turns `Result::Err` into a Postgres `ERROR`.
 
+use brindle_core::distance;
 use pgrx::prelude::*;
 
-pub mod distance;
-pub mod filter;
-pub mod fusion;
 pub mod guc;
-pub mod hnsw;
 pub mod hybrid;
 pub mod index_am;
 pub mod pg_vector;
-pub mod vector;
 
 ::pgrx::pg_module_magic!();
 

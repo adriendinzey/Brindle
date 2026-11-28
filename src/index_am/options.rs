@@ -16,7 +16,7 @@ use pgrx::pg_guard;
 use pgrx::pg_sys;
 use pgrx::prelude::*;
 
-use crate::hnsw::HnswParams;
+use brindle_core::hnsw::HnswParams;
 
 /// The parsed `WITH (...)` clause, cached on `Relation.rd_options`.
 ///

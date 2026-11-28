@@ -1,18 +1,18 @@
 //! Hybrid search: fuse vector similarity and full-text relevance with RRF.
 //!
-//! [`brindle_hybrid`] is the SQL surface over [`crate::fusion`]. It runs two
-//! ranked searches over one table — nearest-neighbour by the Brindle index and
-//! lexical relevance by Postgres full-text search — and fuses their *ranks*
+//! [`brindle_hybrid`] is the SQL surface over [`brindle_core::fusion`]. It runs
+//! two ranked searches over one table — nearest-neighbour by the Brindle index
+//! and lexical relevance by Postgres full-text search — and fuses their *ranks*
 //! (not their scores) with Reciprocal Rank Fusion, so a row that both signals
 //! agree on outranks a row only one of them ranks highly.
 //!
 //! # Why the plumbing lives here and the math lives in `fusion`
 //!
-//! The fusion arithmetic is pure and unit-tested in [`crate::fusion`]. This
-//! module is the Postgres boundary: it resolves the caller's table and columns,
-//! issues two `SPI` queries, maps row identities to the `u64` keys fusion
-//! speaks, and turns the fused ranking back into rows. Nothing here re-derives
-//! the fusion math.
+//! The fusion arithmetic is pure and unit-tested in [`brindle_core::fusion`].
+//! This module is the Postgres boundary: it resolves the caller's table and
+//! columns, issues two `SPI` queries, maps row identities to the `u64` keys
+//! fusion speaks, and turns the fused ranking back into rows. Nothing here
+//! re-derives the fusion math.
 //!
 //! # Safety of the dynamic SQL
 //!
@@ -37,7 +37,8 @@ use pgrx::prelude::*;
 use pgrx::spi::{SpiClient, SpiError};
 use pgrx::{IntoDatum, PgOid};
 
-use crate::fusion;
+use brindle_core::fusion;
+
 use crate::pg_vector::{self, BrindleVector, VectorError};
 
 /// Why a hybrid search could not run.

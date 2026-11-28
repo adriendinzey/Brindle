@@ -137,9 +137,16 @@ dependencies = [
 name = "brindle"
 version = "0.0.1"
 dependencies = [
- "criterion",
+ "brindle-core",
  "pgrx",
  "pgrx-tests",
+]
+
+[[package]]
+name = "brindle-core"
+version = "0.0.1"
+dependencies = [
+ "criterion",
 ]
 
 [[package]]
