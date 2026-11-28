@@ -188,7 +188,8 @@ that CI and review gate:
 5. After merge: `scripts/worktree.sh rm <slug>`.
 
 To enforce step 4 on GitHub (require a PR + passing CI + up-to-date branch, and block
-force-push/deletion of `main`) — **already applied on this repo**:
+force-push/deletion of `main`) — applied on this repo; **re-run it whenever a CI job is
+added to the required checks**, since GitHub keeps only the list it was last given:
 
 ```bash
 gh api -X PUT repos/adriendinzey/Brindle/branches/main/protection \

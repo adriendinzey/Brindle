@@ -2380,7 +2380,7 @@ mod tests {
     /// ceiling is set against. Ignored by default.
     ///
     /// ```text
-    /// cargo test --release --features pg17 --lib cached_graph_footprint -- --ignored --nocapture
+    /// cargo test -p brindle-core --release --lib cached_graph_footprint -- --ignored --nocapture
     /// ```
     #[test]
     #[ignore]
@@ -2416,7 +2416,7 @@ mod tests {
     /// Run it after changing the floor, `MAX_LAYER0_DEGREE`, or the stride:
     ///
     /// ```text
-    /// cargo test --release --features pg17 --lib slot_ceiling_margin -- --ignored --nocapture
+    /// cargo test -p brindle-core --release --lib slot_ceiling_margin -- --ignored --nocapture
     /// ```
     ///
     /// The floor was raised to 1 << 22 because 1 << 18 refused real graphs. At
